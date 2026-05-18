@@ -1,58 +1,25 @@
 # yougile-webhook
 
-Принимает вебхуки YouGile, прогоняет их через rule engine и при срабатывании
-правила запускает Claude Code (`claude --dangerously-skip-permissions`) с
-заданным промптом и рабочей директорией.
-
-Базовый сценарий: пишешь `@Agent ...` в чат задачи — на ноуте поднимается
-claude, делает работу, отвечает в том же чате через YouGile MCP. Дополнительные
-сценарии (новая задача в "In progress" → ресерч-агент, и т.п.) описываются
-правилами в `rules.toml`.
-
-**Сессии «как у живого собеседника».** При повторном упоминании в той же
-задаче агент продолжается в **той же claude-сессии** (`--session-id` / `--resume`),
-помнит контекст прошлых ходов, а в промпт автоматически инжектится **история
-чата** (полная — при первом срабатывании; только новые сообщения — далее).
-Хранится это в `state/sessions.json` (gitignored).
+Receive YouGile webhooks and spawn `claude --dangerously-skip-permissions`
+on configurable triggers. Each YouGile task chat maps 1:1 to a persistent
+claude session, so the agent remembers prior turns when re-mentioned.
 
 ```
-YouGile  ──POST──▶  https://<your-public-domain>/yougile/webhook
-                    │
-                    ▼  (любой способ публикации локального порта: FRP / cloudflared / ngrok / nginx на VPS)
-                    ▼
-                    127.0.0.1:9100 (uvicorn, этот сервис)
-                                │
-                                ▼ ищет первое подходящее правило в rules.toml
-                                ▼ если нашёл
-                                ▼
-                    claude --dangerously-skip-permissions -p "<prompt из rule.prompt_file>"
-                    cwd = rule.workdir | $CLAUDE_WORKDIR
+YouGile ──POST──▶ https://your.domain/yougile/webhook
+                      │
+                      ▼ (FRP / cloudflared / ngrok / nginx on a VPS — your choice)
+                      ▼
+                  127.0.0.1:9100  (this service)
+                      │
+                      ▼ first matching rule in rules.toml
+                      ▼
+                  claude --dangerously-skip-permissions
+                  cwd = rule.workdir
+                  --session-id <chatId>   (first time on this chat)
+                  --resume     <chatId>   (subsequent)
 ```
 
-## Структура проекта
-
-| Путь | Что |
-|---|---|
-| `app.py` | FastAPI приёмник + rule engine |
-| `run.sh` | Запуск uvicorn (читает `.env`) |
-| `register_webhook.py` | CLI для подписок YouGile |
-| `rules.example.toml` | Шаблон правил (коммитится) |
-| `rules.toml` | Реальные правила пользователя (**gitignored**) |
-| `prompts/*.example.txt` | Шаблоны промптов (коммитятся) |
-| `prompts/*.txt` | Реальные промпты пользователя (**gitignored**) |
-| `.env.example` / `.env` | Глобальные настройки (`.env` gitignored) |
-| `requirements.txt` | Зависимости (`fastapi`, `uvicorn[standard]`) |
-| `logs/events.jsonl` | Полные входящие вебхуки |
-| `logs/claude.log` | stdout/stderr запущенных claude-процессов |
-| `logs/uvicorn.{log,err}` | Логи uvicorn (пишутся launchd) |
-| `state/chats/<chatId>.json` | Per-chat: `last_message_id`, `first_seen_at`, `updated_at` (**gitignored**) |
-
-Системное (не в репо, по желанию):
-- `~/Library/LaunchAgents/org.local.yougile-webhook.plist` — launchd-автозапуск (есть пример ниже)
-- ваш способ публикации `https://your-domain/yougile/webhook → 127.0.0.1:9100`
-  (FRP / cloudflared / ngrok / nginx на VPS)
-
-## Установка
+## Install
 
 ```bash
 git clone <this-repo>
@@ -60,129 +27,27 @@ cd yougile-webhook
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-cp .env.example .env                                 # отредактировать
-cp rules.example.toml rules.toml                     # отредактировать
+cp .env.example .env
+cp rules.example.toml rules.toml
 cp prompts/chat_mention.example.txt    prompts/chat_mention.txt
 cp prompts/task_in_progress.example.txt prompts/task_in_progress.txt
+# edit .env, rules.toml, and the prompts
 ```
 
-## Конфигурация: rules.toml
+Make `https://your.domain/yougile/webhook` publicly reach `127.0.0.1:9100`
+via whatever you prefer (FRP, cloudflared, ngrok, nginx on a VPS).
 
-Это основной файл настройки логики. Список правил, оцениваются сверху вниз,
-**первое совпавшее срабатывает** — поэтому ставьте более специфичные сверху.
-
-```toml
-[[rules]]
-name = "chat_mention"
-enabled = true
-events = ["chat_message-created"]
-pattern = "@Agent"
-allowed_sender_emails = ["you@example.com"]
-prompt_file = "prompts/chat_mention.txt"
-
-[[rules]]
-name = "task_in_progress"
-enabled = false                                  # включаемый функционал
-events = ["task-created", "task-moved", "task-updated"]
-column_names = ["In progress"]
-allowed_sender_emails = ["you@example.com"]
-prompt_file = "prompts/task_in_progress.txt"
-# workdir = "/path/to/company-root"              # по умолчанию = $CLAUDE_WORKDIR
-# extra_args = "--dangerously-skip-permissions --model sonnet"
-```
-
-Поля правила:
-
-| Поле | Что делает |
-|---|---|
-| `name` | Свободный идентификатор (виден в логах и `/healthz`) |
-| `enabled` | true / false — мгновенное отключение |
-| `events` | Список YouGile event-типов (`chat_message-created`, `task-moved`, `task-created`, `task-updated`, ...) |
-| `pattern` | Опциональный регексп по сериализованному JSON пейлоада |
-| `allowed_sender_emails` | Белый список email отправителей. Резолвится в UUID на старте через `/api-v2/users` |
-| `column_names` | Список названий колонок (например `["In progress"]`). Резолвится в UUID на старте через `/api-v2/columns` |
-| `prompt_file` | Путь к текстовому файлу с промптом. Плейсхолдер `{event_json}` подставляется автоматически |
-| `workdir` | Рабочая директория для claude (override `CLAUDE_WORKDIR`) |
-| `extra_args` | CLI-аргументы для claude (override `CLAUDE_EXTRA_ARGS`) |
-| `column_transition_only` | bool, default `true`. Когда задан `column_names`: срабатывать только если задача реально перешла в колонку (`prevData.columnId != payload.columnId`), а не на каждое `task-updated` пока она там лежит |
-| `session_per_chat` | bool, default `true`. Если включено — claude запускается с `--session-id` (первый раз) или `--resume` (далее), привязанный к UUID чата задачи. Агент сохраняет контекст между упоминаниями. Если выключено — каждый запуск stateless |
-
-Все списки/условия комбинируются по И. Пустое поле = условие неактивно.
-
-### Логика `task_in_progress` (пример)
-
-Правило срабатывает на `task-created` / `task-moved` / `task-updated`, если
-текущий `columnId` в пейлоаде = UUID колонки "In progress". Это покрывает оба
-кейса:
-
-- задача создана сразу в "In progress";
-- задача перемещена в "In progress" из другой колонки.
-
-`task-moved` от YouGile содержит `payload.columnId` = **новый** column, а
-`prevData.columnId` = **старый**. По умолчанию правило стреляет только на
-**реальный переход** (`column_transition_only = true`) — иначе оно бы
-срабатывало на каждое `task-updated` (редактирование заголовка, описания,
-ассайнов), пока задача лежит в In progress.
-
-Промпт `prompts/task_in_progress.txt` — пользовательский. Идея:
-агент запускается из корня компании (где лежат несколько репозиториев), решает
-какие репо релевантны задаче, спавнит лёгкие sub-агенты на каждый репо для
-анализа (`Agent` tool с `Explore`), синтезирует короткую рекомендацию и постит
-её обратно в чат задачи. См. `prompts/task_in_progress.example.txt` как
-отправную точку.
-
-## Конфигурация: .env
-
-Глобальные настройки. `.env.example` обобщённый, `.env` (gitignored) — реальный.
-
-| Переменная | Назначение |
-|---|---|
-| `YOUGILE_API_KEY` | API-ключ YouGile. Нужен и для подписки, и для резолва email/column на старте |
-| `YOUGILE_API_BASE` | По умолчанию `https://yougile.com/api-v2` |
-| `YOUGILE_WEBHOOK_URL` | Внешний URL приёмника. Используется `register_webhook.py` |
-| `YOUGILE_WEBHOOK_EVENT` | Event-фильтр **подписки** YouGile (регексп). Делайте широким: `(chat_message\|task)-.*` или `.*` — реальная фильтрация на стороне rule engine |
-| `YOUGILE_WEBHOOK_CHAT_FILTER` | Опц. server-side regexp по тексту chat_message |
-| `HOST` / `PORT` | Куда биндится uvicorn (по умолчанию `127.0.0.1:9100`) |
-| `CLAUDE_BIN` | Путь к бинарнику claude |
-| `CLAUDE_WORKDIR` | Дефолтная рабочая директория (правила могут переопределить) |
-| `CLAUDE_EXTRA_ARGS` | Дефолтные CLI-аргументы claude |
-| `CLAUDE_MAX_CONCURRENT` | Глобальный лимит одновременных claude (excess → drop с warning) |
-| `RULES_FILE` | По умолчанию `rules.toml` |
-| `SENDER_KEYS` | Какие ключи payload считать «id отправителя» |
-| `COLUMN_KEYS` | Какие ключи payload считать «id колонки» |
-| `CHAT_ID_KEYS` | Какие ключи payload считать «UUID чата/задачи» (по умолчанию `chatId,id`). Используется как ключ к сессии claude |
-| `CHAT_HISTORY_FIRST_TIME_LIMIT` | Сколько последних сообщений тянуть в промпт при ПЕРВОМ срабатывании на чат (default 20) |
-| `CHAT_HISTORY_DELTA_LIMIT` | Сколько НОВЫХ сообщений (с момента предыдущего ответа агента) тянуть на последующих (default 50) |
-
-После правки `.env` или `rules.toml` — перезапуск:
-
-```bash
-launchctl unload  ~/Library/LaunchAgents/org.local.yougile-webhook.plist
-launchctl load -w ~/Library/LaunchAgents/org.local.yougile-webhook.plist
-# или вручную
-pkill -f "uvicorn app:app" ; ./run.sh
-```
-
-## Регистрация подписки в YouGile
-
-```bash
-.venv/bin/python register_webhook.py list                # текущие
-.venv/bin/python register_webhook.py create              # создать по .env
-.venv/bin/python register_webhook.py delete <hook-id>    # удалить
-```
-
-Одна подписка с широким event-regex покрывает все правила сразу.
-
-## Запуск вручную
+## Run
 
 ```bash
 ./run.sh
 curl http://127.0.0.1:9100/healthz
 ```
 
-`/healthz` отдаёт текущее состояние и резолв правил (UUID отправителей и колонок).
+`run.sh` reads `.env` and starts uvicorn. `/healthz` returns the resolved
+rule set so you can see what's wired up.
 
-## Автозапуск (macOS, launchd)
+### Autostart (macOS launchd)
 
 `~/Library/LaunchAgents/org.local.yougile-webhook.plist`:
 
@@ -197,7 +62,6 @@ curl http://127.0.0.1:9100/healthz
     <key>WorkingDirectory</key><string>/PATH/TO/yougile-webhook</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>ThrottleInterval</key><integer>10</integer>
     <key>StandardOutPath</key><string>/PATH/TO/yougile-webhook/logs/uvicorn.log</string>
     <key>StandardErrorPath</key><string>/PATH/TO/yougile-webhook/logs/uvicorn.err</string>
     <key>EnvironmentVariables</key>
@@ -209,24 +73,130 @@ curl http://127.0.0.1:9100/healthz
 </plist>
 ```
 
-`PATH` должен содержать директорию с `claude` CLI — иначе спавнящемуся
-процессу его не найти.
+`PATH` must include the directory of the `claude` CLI, or the spawned
+process won't find it.
 
 ```bash
 launchctl load -w ~/Library/LaunchAgents/org.local.yougile-webhook.plist
 launchctl list | grep yougile-webhook
 ```
 
-## Реальные пейлоады YouGile (для справки)
+## Register the YouGile webhook
+
+One subscription with a broad event regex covers all rules:
+
+```bash
+.venv/bin/python register_webhook.py list                 # current subscriptions
+.venv/bin/python register_webhook.py create               # create from .env
+.venv/bin/python register_webhook.py delete <hook-id>     # delete one
+```
+
+Defaults from `.env.example`:
+
+```
+YOUGILE_WEBHOOK_URL=https://your.public.domain/yougile/webhook
+YOUGILE_WEBHOOK_EVENT=(chat_message|task)-.*
+```
+
+## Configure rules — `rules.toml`
+
+A list of trigger rules, evaluated top to bottom; **first match wins**.
+
+```toml
+[[rules]]
+name = "chat_mention"
+enabled = true
+events = ["chat_message-created"]
+pattern = "@Agent"
+allowed_sender_emails = ["you@example.com"]
+prompt_file = "prompts/chat_mention.txt"
+
+[[rules]]
+name = "task_in_progress"
+enabled = false                                              # toggle when ready
+events = ["task-created", "task-moved", "task-updated"]
+column_names = ["In progress"]
+allowed_sender_emails = ["you@example.com"]
+prompt_file = "prompts/task_in_progress.txt"
+# workdir = "/path/to/your/company-root"                     # override per-rule
+# extra_args = "--dangerously-skip-permissions --model sonnet"
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | Identifier shown in logs and `/healthz`. |
+| `enabled` | `true` / `false`. |
+| `events` | YouGile event types (`chat_message-created`, `task-created`, `task-moved`, `task-updated`, …). |
+| `pattern` | Optional regex over the full event JSON. |
+| `allowed_sender_emails` | Whitelist; resolved to user UUIDs at startup via `/api-v2/users`. Empty = no sender filter (not recommended). |
+| `column_names` | Match `payload.columnId` against the resolved UUIDs of these column titles. |
+| `column_transition_only` | Default `true`. When `column_names` is set, only fire on actual transitions (`prevData.columnId != payload.columnId`). |
+| `session_per_chat` | Default `true`. Runs claude with `--session-id <chatId>` first time, `--resume <chatId>` after. |
+| `prompt_file` | Path to a text file used as the prompt. `{event_json}` and `{chat_history}` are substituted. |
+| `workdir` | Override `CLAUDE_WORKDIR` for this rule. |
+| `extra_args` | Override `CLAUDE_EXTRA_ARGS` for this rule. |
+
+## Configure runtime — `.env`
+
+| Variable | Meaning |
+|---|---|
+| `YOUGILE_API_KEY` | Required. Used by `register_webhook.py` and for resolving emails/columns at startup. |
+| `YOUGILE_API_BASE` | Default `https://yougile.com/api-v2`. |
+| `YOUGILE_WEBHOOK_URL` | Public URL of this receiver. |
+| `YOUGILE_WEBHOOK_EVENT` | Event regex for the YouGile subscription. Keep broad (`(chat_message\|task)-.*` or `.*`). |
+| `HOST` / `PORT` | Bind address (default `127.0.0.1:9100`). |
+| `CLAUDE_BIN` | Path to the `claude` CLI. |
+| `CLAUDE_WORKDIR` | Default workdir for spawned claude processes. |
+| `CLAUDE_EXTRA_ARGS` | Default CLI args. |
+| `CLAUDE_MAX_CONCURRENT` | Hard cap on concurrent claude processes. Excess events are dropped. |
+| `RULES_FILE` | Default `rules.toml`. |
+| `SENDER_KEYS` | Payload keys checked (in order, top-level and nested) for the sender's user UUID. |
+| `COLUMN_KEYS` | Same, for column UUIDs. |
+| `CHAT_ID_KEYS` | Same, for the task/chat UUID used as the claude session id. |
+| `CHAT_HISTORY_FIRST_TIME_LIMIT` | How many recent messages to inject on the first trigger for a chat (default 20). |
+| `CHAT_HISTORY_DELTA_LIMIT` | How many new messages to inject on subsequent triggers (default 50). |
+
+After editing `.env` or `rules.toml`, reload:
+
+```bash
+launchctl unload  ~/Library/LaunchAgents/org.local.yougile-webhook.plist
+launchctl load -w ~/Library/LaunchAgents/org.local.yougile-webhook.plist
+```
+
+## Sessions and chat history
+
+For rules with `session_per_chat = true` (default):
+
+- `session_id = chatId` (the YouGile task UUID).
+- State lives at `state/chats/<chatId>.json` — one tiny file per chat,
+  containing `last_message_id` and timestamps.
+- Existence of that file decides `--resume` vs `--session-id`.
+- The prompt receives chat history via the `{chat_history}` placeholder
+  (full on first run, only new messages on subsequent runs).
+- While claude is running for a chat, new triggers for the SAME chat are
+  dropped with `spawn_reason: chat-busy`. No queue.
+
+To reset a single chat: `rm state/chats/<chatId>.json`. The next trigger
+will start a fresh session and re-inject full history.
+
+## Replying from the agent
+
+YouGile chat does **not** render markdown. The agent prompts already
+instruct claude to reply in plain text and, when richer formatting is
+needed, pass `textHtml` (simple HTML — `<p>`, `<b>`, `<a>`, `<code>`,
+`<br>`) alongside the `text` plain fallback.
+
+## Reference: real YouGile payloads
 
 `chat_message-created`:
+
 ```json
 {
   "event": "chat_message-created",
   "fromUserId": "<user-uuid>",
   "payload": {
     "id": 1779102737006,
-    "chatId": "<task-uuid>",       // == taskId, использовать для ответа
+    "chatId": "<task-uuid>",
     "text": "@Agent ...",
     "reactions": {},
     "properties": {"params": {"chunks": []}}
@@ -236,6 +206,7 @@ launchctl list | grep yougile-webhook
 ```
 
 `task-created`:
+
 ```json
 {
   "event": "task-created",
@@ -254,115 +225,29 @@ launchctl list | grep yougile-webhook
 }
 ```
 
-`task-moved`: то же, что `task-created`, плюс `prevData.columnId` со старой
-колонкой. `payload.columnId` — новая колонка.
+`task-moved` — same as `task-created` plus `prevData.columnId` with the
+previous column.
 
-## Безопасность
+## Files
 
-- `.env` и `rules.toml` содержат API-ключ и почты соответственно — gitignored.
-- `--dangerously-skip-permissions` снимает с claude любые подтверждения. Поэтому
-  `allowed_sender_emails` обязательны — это единственный барьер от того, чтобы
-  случайный участник чата стартанул у вас shell-команды. Держите список
-  минимальным.
-- Промпты с реальной логикой workflow тоже в gitignore — там могут быть
-  внутренние подсказки, ссылки, имена репо.
-- Если используете туннель (FRP/cloudflared/ngrok), его токен — отдельный
-  секрет.
+| Path | Content |
+|---|---|
+| `app.py` | FastAPI receiver and rule engine. |
+| `run.sh` | Loads `.env` and exec's uvicorn. |
+| `register_webhook.py` | CLI to manage YouGile subscriptions. |
+| `rules.example.toml` | Rule template (commit). |
+| `prompts/*.example.txt` | Prompt templates (commit). |
+| `rules.toml`, `prompts/*.txt` | Your real rules and prompts (**gitignored**). |
+| `.env.example` / `.env` | Runtime config (`.env` gitignored). |
+| `state/chats/<chatId>.json` | Per-chat session state (gitignored). |
+| `logs/events.jsonl` | All inbound webhooks. |
+| `logs/claude.log` | Spawned claude stdout/stderr. |
 
-## Сессии и история чата
+## Security
 
-Каждая задача в YouGile (`chatId == taskId`) маппится на claude-сессию
-**один-в-один**: claude-`session_id` это **тот же самый UUID**, что и
-`chatId`. Никакой mapping-таблицы не нужно — соответствие детерминистическое.
-Это удобно и при дебаге (`claude --resume` в интерактивном пикере покажет
-сессии с теми же UUID, что и задачи в YouGile).
-
-State шардирован — один JSON-файл на чат:
-
-```
-state/chats/<task-uuid>.json
-{
-  "first_seen_at": "...",
-  "last_message_id": 1779100000000,
-  "updated_at": "..."
-}
-```
-
-Существование файла `state/chats/<chatId>.json` == «эту задачу мы уже запускали,
-сессия в claude есть, делаем `--resume`». Отсутствие == «впервые, делаем
-`--session-id <chatId>`». Никакого peek-а в `~/.claude` — формат и расположение
-сессий claude нас не касается.
-
-Преимущества per-chat файлов:
-- файл не пухнет с ростом числа задач;
-- независимые записи (read/write на разные чаты не конфликтуют — global lock не нужен);
-- легко переносить / бэкапить / просматривать отдельный чат;
-- atomic writes (`.tmp` → `rename`) — устойчиво к падению посреди записи.
-
-Поток на каждое срабатывание правила с `session_per_chat = true`:
-
-1. Извлекаем `chatId` из пейлоада (порядок ключей: `CHAT_ID_KEYS`).
-2. Берём `chat_lock` неблокирующе. Если claude уже работает по этому чату —
-   событие **дропается** (см. `spawn_reason: chat-busy` в логах). Очереди нет.
-3. Смотрим `state/chats/<chatId>.json`:
-   - **Нет файла** → first turn: тянем последние `CHAT_HISTORY_FIRST_TIME_LIMIT`
-     сообщений из YouGile API, запускаем `claude -p --session-id <chatId>`,
-     сразу пишем state-файл (с `first_seen_at`) — чтобы при крэше во время
-     спавна следующий тригер не сделал double `--session-id`.
-   - **Файл есть** → resume: тянем сообщения с `id > last_message_id` (параметр
-     `since` сдвинут на +1, чтобы не повторять последнее), запускаем
-     `claude -p --resume <chatId>`.
-4. Рендерим промпт. Плейсхолдер `{chat_history}` в шаблоне заменяется на
-   `[ts] sender: text` построчно. Если плейсхолдера нет — блок дописывается
-   в конец промпта.
-5. После завершения процесса обновляем `last_message_id` в state-файле.
-
-### Миграция со старого формата
-
-Если в `state/` лежит старый монолитный `sessions.json` (от прошлых версий),
-при старте он будет автоматически разнесён в `state/chats/*.json`, а оригинал
-переименован в `sessions.json.migrated`.
-
-### Восстановление и edge-cases
-
-- **Удалить весь state** для чата — просто `rm state/chats/<chatId>.json`. На
-  следующее срабатывание агент стартует с нуля в новой сессии.
-- **Удалить claude-сессию** (через сторонний инструмент / переустановка):
-  файл нашего state остаётся, мы попробуем `--resume`, claude вернёт ошибку.
-  Лечение — удалить и наш state-файл (он маленький, см. путь выше).
-- Конфликты «session id already in use» при штатной работе невозможны: один
-  source of truth (наш state-файл), детерминистическая привязка
-  `chatId == session_id`.
-
-Для правил, где сессия не нужна (например, разовые ресерч-агенты, которым не
-нужна память между задачами), ставьте `session_per_chat = false`.
-
-## Дизайн / расширяемость
-
-Rule engine спроектирован так, чтобы добавить новые сценарии не трогая `app.py`:
-
-- **Новый триггер** = новый `[[rules]]` в `rules.toml` + промпт-файл.
-- **Новый тип события YouGile** — просто перечислить в `events`, при условии
-  что соответствующая подписка ловит этот event-тип.
-- **Новый ключ payload** для отправителя / колонки — добавить в `SENDER_KEYS`
-  или `COLUMN_KEYS` в `.env`.
-- **Новые поля фильтрации** (тег, проект, доска, и т.п.) — точечно добавить в
-  `Rule` dataclass и `rule_matches()`.
-- **Альтернативные действия** (не claude, а HTTP-вызов / shell-команда) —
-  можно ввести поле `action` в правило и развести по типам в спавне.
-
-Логика matching: per-rule условия AND, между правилами — first-match-wins.
-Этого достаточно для большинства сценариев; если понадобится «все совпавшие»
-— это правка в `find_matching_rule()` (несколько строк).
-
-## Хвосты / ограничения
-
-- При старте uvicorn однократно стучится в `/users` и `/columns` для резолва.
-  Если API недоступен — relevant правила не сработают, в логах будет warning.
-- При смене whitelist / колонок / промптов нужен рестарт сервиса (всё кешируется в памяти).
-- Параллелизм: при превышении `CLAUDE_MAX_CONCURRENT` событие дропается, очереди нет.
-- YouGile может слать одно и то же логическое действие как `task-moved`, так и
-  как `task-updated` (зависит от способа перемещения). Поэтому правило
-  типовое лучше регистрировать на `["task-created", "task-moved", "task-updated"]`
-  с `column_transition_only = true` (по умолчанию). Лишних срабатываний не будет
-  благодаря сравнению `prevData.columnId` с `payload.columnId`.
+- `--dangerously-skip-permissions` removes all claude confirmations.
+  `allowed_sender_emails` is your only barrier against arbitrary task
+  participants triggering shell commands on your machine. Keep it minimal.
+- `.env`, `rules.toml`, `prompts/*.txt` (non-example) are gitignored. Don't
+  commit them.
+- If you publish via a tunnel, its token is a separate secret.

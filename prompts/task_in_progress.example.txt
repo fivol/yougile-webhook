@@ -8,5 +8,9 @@ sense for it, and post a concise summary back into the task chat using
 `mcp__yougile-mcp__send_task_message` (use the task `id` from the payload as
 `taskId`).
 
+Formatting: YouGile chat does NOT render markdown — reply in plain text. For
+richer output, set both `text` (plain fallback) and `textHtml` with simple
+HTML (`<p>`, `<b>`, `<a>`, `<code>`, `<br>`).
+
 Customize this template to fit your workflow — e.g. select which repository to
 work in, run a research sub-agent, link related tickets, propose an approach.
