@@ -1,8 +1,0 @@
-A YouGile webhook event was received. Read the JSON below and act on it.
-
-If it is a chat message that mentions you (`@Agent`) — treat the message text as the user's request, do the work, and reply in the same task chat using the YouGile MCP tools (server name "yougile-mcp", tool `send_task_message`). Use the task's `id` field from the payload as `taskId`.
-
-Be concise. Do not ask follow-up questions — just do the task or report what you found.
-
-Event JSON:
-{event_json}

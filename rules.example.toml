@@ -1,0 +1,41 @@
+# Trigger rules for the YouGile webhook receiver.
+#
+# Each [[rules]] block is evaluated top-to-bottom; the FIRST match wins.
+# Put the most specific rules at the top.
+#
+# Fields:
+#   name                    free-form id (shown in logs / /healthz)
+#   enabled                 true | false — kill switch
+#   events                  list of YouGile event types (e.g. "chat_message-created", "task-moved")
+#   pattern                 optional regexp matched against the full payload JSON
+#   allowed_sender_emails   list of emails; resolved to UUIDs at startup via /api-v2/users
+#   column_names            list of column titles (e.g. "In progress"); resolved to UUIDs at startup
+#                           — any column with that title across the whole company matches
+#   prompt_file             text file used as the claude prompt; {event_json} is substituted
+#   workdir                 override CLAUDE_WORKDIR for this rule (defaults to the env value)
+#   extra_args              override CLAUDE_EXTRA_ARGS for this rule (e.g. add `--model sonnet`)
+#   column_transition_only  bool (default true). When column_names is set: only fire on actual
+#                           transitions into the column (prevData.columnId != payload.columnId).
+#                           Setting to false will fire on every task event while the task sits
+#                           in the target column — usually too noisy.
+
+# Chat-mention bot: someone writes "@Agent ..." in a task chat.
+[[rules]]
+name = "chat_mention"
+enabled = true
+events = ["chat_message-created"]
+pattern = "@Agent"
+allowed_sender_emails = ["you@example.com"]
+prompt_file = "prompts/chat_mention.txt"
+
+# Auto-kickoff: a task appears in (or is moved into) the "In progress" column.
+# Use this to spawn a short research/proposal agent that posts a summary
+# back into the task chat.
+[[rules]]
+name = "task_in_progress"
+enabled = false                                             # flip to true when prompt is ready
+events = ["task-created", "task-moved", "task-updated"]
+column_names = ["In progress"]
+allowed_sender_emails = ["you@example.com"]
+prompt_file = "prompts/task_in_progress.txt"
+# workdir = "/path/to/your/company-root"                    # uncomment to override the env default

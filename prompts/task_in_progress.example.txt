@@ -1,0 +1,12 @@
+A YouGile task has been created in (or moved to) the "In progress" column.
+
+Event JSON:
+{event_json}
+
+Take a brief look at the task, do whatever short analysis or preparation makes
+sense for it, and post a concise summary back into the task chat using
+`mcp__yougile-mcp__send_task_message` (use the task `id` from the payload as
+`taskId`).
+
+Customize this template to fit your workflow — e.g. select which repository to
+work in, run a research sub-agent, link related tickets, propose an approach.

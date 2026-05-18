@@ -1,0 +1,9 @@
+A YouGile chat message was received that mentions @Agent.
+
+Event JSON:
+{event_json}
+
+Read the message text and act on whatever the user is asking. When you are done,
+reply in the same task chat with `mcp__yougile-mcp__send_task_message`,
+passing `chatId` from the payload as `taskId`. Be concise and skip follow-up
+questions — make a reasonable judgment call and act.

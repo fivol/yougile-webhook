@@ -3,3 +3,8 @@
 logs/
 __pycache__/
 *.pyc
+
+# user-specific rules + prompt files (templates with .example.* are committed)
+rules.toml
+prompts/*.txt
+!prompts/*.example.txt
