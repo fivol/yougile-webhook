@@ -11,7 +11,6 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -368,6 +367,20 @@ def _format_sender(user_id: Optional[str]) -> str:
     return u.get("email") or u.get("realName") or f"user:{user_id[:8]}"
 
 
+def _claude_session_file(workdir: str, session_id: str) -> Path:
+    """Path where claude code stores a session's transcript.
+
+    Claude encodes the workdir by replacing every "/" with "-" and uses the
+    resulting string as the directory name under ~/.claude/projects/.
+    """
+    encoded = workdir.replace("/", "-")
+    return Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+
+
+def claude_session_exists(workdir: str, session_id: str) -> bool:
+    return _claude_session_file(workdir, session_id).exists()
+
+
 def render_chat_history(messages: List[dict]) -> str:
     if not messages:
         return "(no prior messages)"
@@ -475,24 +488,39 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
 
     try:
         if chat_id:
+            # The claude session id IS the YouGile chat/task UUID — deterministic,
+            # so we never need to map it. Whether to --resume or --session-id is
+            # decided by checking claude's on-disk session file directly.
+            session_id = chat_id
+            session_exists = claude_session_exists(rule.workdir, session_id)
             chat_state = get_chat_state(chat_id)
-            session_id = chat_state.get("session_id")
             last_msg_id = chat_state.get("last_message_id")
-            is_first_turn = not session_id
-            if is_first_turn:
-                session_id = str(uuid.uuid4())
+
+            if not session_exists:
+                # First time on this chat in this workdir (or claude state was wiped).
+                # Fetch the recent history afresh; ignore any stale last_message_id.
+                is_first_turn = True
                 history = fetch_chat_messages(
                     chat_id, since=None, limit=CHAT_HISTORY_FIRST_TIME_LIMIT
                 )
+                session_flag = ["--session-id", session_id]
             else:
-                history = fetch_chat_messages(
-                    chat_id, since=last_msg_id, limit=CHAT_HISTORY_DELTA_LIMIT
-                )
+                is_first_turn = False
+                if last_msg_id:
+                    history = fetch_chat_messages(
+                        chat_id, since=last_msg_id, limit=CHAT_HISTORY_DELTA_LIMIT
+                    )
+                else:
+                    # Session exists but our state was wiped — feed recent context.
+                    history = fetch_chat_messages(
+                        chat_id, since=None, limit=CHAT_HISTORY_FIRST_TIME_LIMIT
+                    )
+                session_flag = ["--resume", session_id]
+
             history_text = render_chat_history(history)
             newest_msg_id = max(
                 [int(m["id"]) for m in history if m.get("id")] + [last_msg_id or 0]
             )
-            session_flag = ["--session-id", session_id] if is_first_turn else ["--resume", session_id]
         else:
             session_id = None
             history_text = ""
@@ -513,11 +541,8 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
 
         def on_exit(rc: int) -> None:
             try:
-                if chat_id:
-                    fields: Dict[str, Any] = {"session_id": session_id}
-                    if newest_msg_id:
-                        fields["last_message_id"] = newest_msg_id
-                    update_chat_state(chat_id, **fields)
+                if chat_id and newest_msg_id:
+                    update_chat_state(chat_id, last_message_id=newest_msg_id)
             finally:
                 if chat_lock is not None:
                     chat_lock.release()
