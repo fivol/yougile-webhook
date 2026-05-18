@@ -9,6 +9,12 @@ claude, делает работу, отвечает в том же чате че
 сценарии (новая задача в "In progress" → ресерч-агент, и т.п.) описываются
 правилами в `rules.toml`.
 
+**Сессии «как у живого собеседника».** При повторном упоминании в той же
+задаче агент продолжается в **той же claude-сессии** (`--session-id` / `--resume`),
+помнит контекст прошлых ходов, а в промпт автоматически инжектится **история
+чата** (полная — при первом срабатывании; только новые сообщения — далее).
+Хранится это в `state/sessions.json` (gitignored).
+
 ```
 YouGile  ──POST──▶  https://<your-public-domain>/yougile/webhook
                     │
@@ -39,6 +45,7 @@ YouGile  ──POST──▶  https://<your-public-domain>/yougile/webhook
 | `logs/events.jsonl` | Полные входящие вебхуки |
 | `logs/claude.log` | stdout/stderr запущенных claude-процессов |
 | `logs/uvicorn.{log,err}` | Логи uvicorn (пишутся launchd) |
+| `state/sessions.json` | Per-chat: `session_id` + `last_message_id` (**gitignored**) |
 
 Системное (не в репо, по желанию):
 - `~/Library/LaunchAgents/org.local.yougile-webhook.plist` — launchd-автозапуск (есть пример ниже)
@@ -98,6 +105,7 @@ prompt_file = "prompts/task_in_progress.txt"
 | `workdir` | Рабочая директория для claude (override `CLAUDE_WORKDIR`) |
 | `extra_args` | CLI-аргументы для claude (override `CLAUDE_EXTRA_ARGS`) |
 | `column_transition_only` | bool, default `true`. Когда задан `column_names`: срабатывать только если задача реально перешла в колонку (`prevData.columnId != payload.columnId`), а не на каждое `task-updated` пока она там лежит |
+| `session_per_chat` | bool, default `true`. Если включено — claude запускается с `--session-id` (первый раз) или `--resume` (далее), привязанный к UUID чата задачи. Агент сохраняет контекст между упоминаниями. Если выключено — каждый запуск stateless |
 
 Все списки/условия комбинируются по И. Пустое поле = условие неактивно.
 
@@ -142,6 +150,9 @@ prompt_file = "prompts/task_in_progress.txt"
 | `RULES_FILE` | По умолчанию `rules.toml` |
 | `SENDER_KEYS` | Какие ключи payload считать «id отправителя» |
 | `COLUMN_KEYS` | Какие ключи payload считать «id колонки» |
+| `CHAT_ID_KEYS` | Какие ключи payload считать «UUID чата/задачи» (по умолчанию `chatId,id`). Используется как ключ к сессии claude |
+| `CHAT_HISTORY_FIRST_TIME_LIMIT` | Сколько последних сообщений тянуть в промпт при ПЕРВОМ срабатывании на чат (default 20) |
+| `CHAT_HISTORY_DELTA_LIMIT` | Сколько НОВЫХ сообщений (с момента предыдущего ответа агента) тянуть на последующих (default 50) |
 
 После правки `.env` или `rules.toml` — перезапуск:
 
@@ -257,6 +268,47 @@ launchctl list | grep yougile-webhook
   внутренние подсказки, ссылки, имена репо.
 - Если используете туннель (FRP/cloudflared/ngrok), его токен — отдельный
   секрет.
+
+## Сессии и история чата
+
+Каждый чат задачи в YouGile (`chatId == taskId`) маппится на **один**
+постоянный `session_id` claude. State:
+
+```
+state/sessions.json
+{
+  "<task-uuid>": {
+    "session_id": "<claude-session-uuid>",
+    "last_message_id": 1779100000000,
+    "updated_at": "..."
+  }
+}
+```
+
+Поток на каждое срабатывание правила с `session_per_chat = true`:
+
+1. Извлекаем `chatId` из пейлоада (порядок ключей: `CHAT_ID_KEYS`).
+2. Берём `chat_lock` неблокирующе. Если claude уже работает по этому чату —
+   событие **дропается** (см. `spawn_reason: chat-busy` в логах). Очереди нет.
+3. Тянем сообщения из чата через `/api-v2/chats/<chatId>/messages`:
+   - первый раз — последние `CHAT_HISTORY_FIRST_TIME_LIMIT` (с пагинацией);
+   - далее — только новее `last_message_id` (параметр `since` сдвинут на +1
+     чтобы исключить уже виденное).
+4. Рендерим промпт. Плейсхолдер `{chat_history}` в шаблоне заменяется на
+   `[ts] sender: text` построчно. Если плейсхолдера нет — блок дописывается
+   в конец промпта.
+5. Спавним claude:
+   - первый раз: `claude -p --session-id <uuid> "..."` (uuid генерируется);
+   - далее: `claude -p --resume <uuid> "..."`.
+6. После завершения процесса сохраняем (или подтверждаем) `session_id` и
+   обновляем `last_message_id` до максимального из подгруженной партии.
+
+Если по какой-то причине state потерялся / claude-сессия удалена с диска —
+следующий запуск пойдёт как первый, агент получит полную историю заново и
+будет работать в новой сессии. Безопасный fallback.
+
+Для правил, где сессия не нужна (например, разовые ресерч-агенты, которым не
+нужна память между задачами), ставьте `session_per_chat = false`.
 
 ## Дизайн / расширяемость
 

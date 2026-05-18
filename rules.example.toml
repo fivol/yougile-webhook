@@ -18,6 +18,11 @@
 #                           transitions into the column (prevData.columnId != payload.columnId).
 #                           Setting to false will fire on every task event while the task sits
 #                           in the target column — usually too noisy.
+#   session_per_chat        bool (default true). When true, claude is run with --session-id (first
+#                           time) or --resume (subsequent), keyed to the task/chat UUID. The same
+#                           agent "remembers" prior turns. Set to false to make each invocation
+#                           stateless. Chat history is also fetched from YouGile and injected via
+#                           the {chat_history} placeholder in the prompt template.
 
 # Chat-mention bot: someone writes "@Agent ..." in a task chat.
 [[rules]]

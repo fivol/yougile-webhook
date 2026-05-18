@@ -9,17 +9,22 @@ import subprocess
 import threading
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, Request
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+STATE_DIR = ROOT / "state"
+STATE_DIR.mkdir(exist_ok=True)
+STATE_FILE = STATE_DIR / "sessions.json"
 EVENT_LOG = LOG_DIR / "events.jsonl"
 CLAUDE_LOG = LOG_DIR / "claude.log"
 
@@ -65,9 +70,21 @@ COLUMN_KEYS = [
     ).split(",")
     if k.strip()
 ]
+CHAT_ID_KEYS = [
+    k.strip()
+    for k in os.environ.get("CHAT_ID_KEYS", "chatId,id").split(",")
+    if k.strip()
+]
+
+CHAT_HISTORY_FIRST_TIME_LIMIT = int(os.environ.get("CHAT_HISTORY_FIRST_TIME_LIMIT", "20"))
+CHAT_HISTORY_DELTA_LIMIT = int(os.environ.get("CHAT_HISTORY_DELTA_LIMIT", "50"))
 
 RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
 
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+# ---------------------------------------------------------------- rule model
 
 @dataclass
 class Rule:
@@ -80,20 +97,16 @@ class Rule:
     prompt_template: str
     workdir: str
     extra_args: List[str]
-    # When True and column_names is set: only fire if the task actually transitioned
-    # into the column (prevData.columnId != payload.columnId). Otherwise every
-    # task-updated event while the task already sits in that column would re-fire.
     column_transition_only: bool = True
+    # Continue the same claude session across re-mentions on the same chat.
+    session_per_chat: bool = True
     allowed_sender_ids: Set[str] = field(default_factory=set)
     column_ids: Set[str] = field(default_factory=set)
 
 
 def load_rules(path: Path) -> List[Rule]:
     if not path.exists():
-        log.error(
-            "rules file %s not found — copy rules.example.toml to rules.toml and edit",
-            path,
-        )
+        log.error("rules file %s not found — copy rules.example.toml to rules.toml and edit", path)
         return []
     with path.open("rb") as f:
         data = tomllib.load(f)
@@ -120,10 +133,13 @@ def load_rules(path: Path) -> List[Rule]:
                     else list(CLAUDE_DEFAULT_EXTRA_ARGS)
                 ),
                 column_transition_only=bool(raw.get("column_transition_only", True)),
+                session_per_chat=bool(raw.get("session_per_chat", True)),
             )
         )
     return rules
 
+
+# ---------------------------------------------------------------- API helpers
 
 def _api_get(path: str) -> Optional[dict]:
     if not YOUGILE_API_KEY:
@@ -133,53 +149,64 @@ def _api_get(path: str) -> Optional[dict]:
         headers={"Authorization": f"Bearer {YOUGILE_API_KEY}"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read())
     except (urllib.error.URLError, json.JSONDecodeError):
         log.exception("API GET failed: %s", path)
         return None
 
 
-def resolve_rules(rules: List[Rule]) -> None:
-    users = _api_get("/users?limit=1000") or {}
-    columns = _api_get("/columns?limit=1000") or {}
-    email_to_id: Dict[str, str] = {
-        (u.get("email") or "").lower(): u["id"] for u in users.get("content", [])
-    }
-    name_to_ids: Dict[str, Set[str]] = {}
-    for c in columns.get("content", []):
-        key = (c.get("title") or "").lower()
-        if key:
-            name_to_ids.setdefault(key, set()).add(c["id"])
+USERS_BY_ID: Dict[str, Dict[str, Any]] = {}
+USERS_BY_EMAIL: Dict[str, str] = {}
+COLUMNS_BY_NAME: Dict[str, Set[str]] = {}
 
+
+def refresh_directories() -> None:
+    USERS_BY_ID.clear()
+    USERS_BY_EMAIL.clear()
+    COLUMNS_BY_NAME.clear()
+    users = _api_get("/users?limit=1000") or {}
+    for u in users.get("content", []):
+        uid = u["id"]
+        USERS_BY_ID[uid] = u
+        em = (u.get("email") or "").lower()
+        if em:
+            USERS_BY_EMAIL[em] = uid
+    columns = _api_get("/columns?limit=1000") or {}
+    for c in columns.get("content", []):
+        title = (c.get("title") or "").lower()
+        if title:
+            COLUMNS_BY_NAME.setdefault(title, set()).add(c["id"])
+
+
+def resolve_rules(rules: List[Rule]) -> None:
     for r in rules:
         for email in r.allowed_sender_emails:
-            uid = email_to_id.get(email.lower())
+            uid = USERS_BY_EMAIL.get(email.lower())
             if uid:
                 r.allowed_sender_ids.add(uid)
             else:
                 log.warning("rule %s: email %s not found in company users", r.name, email)
         for cname in r.column_names:
-            ids = name_to_ids.get(cname.lower())
+            ids = COLUMNS_BY_NAME.get(cname.lower())
             if ids:
                 r.column_ids.update(ids)
             else:
                 log.warning("rule %s: column '%s' not found", r.name, cname)
         log.info(
-            "rule %s: enabled=%s events=%s pattern=%s senders=%d columns=%d workdir=%s",
-            r.name,
-            r.enabled,
-            sorted(r.events),
+            "rule %s: enabled=%s events=%s pattern=%s senders=%d columns=%d workdir=%s session_per_chat=%s",
+            r.name, r.enabled, sorted(r.events),
             r.pattern.pattern if r.pattern else None,
-            len(r.allowed_sender_ids),
-            len(r.column_ids),
-            r.workdir,
+            len(r.allowed_sender_ids), len(r.column_ids), r.workdir, r.session_per_chat,
         )
 
 
+refresh_directories()
 RULES: List[Rule] = load_rules(RULES_FILE)
 resolve_rules(RULES)
 
+
+# ---------------------------------------------------------------- payload extraction
 
 def _deep_get(payload, keys: List[str]) -> Optional[str]:
     if not isinstance(payload, dict):
@@ -196,6 +223,15 @@ def _deep_get(payload, keys: List[str]) -> Optional[str]:
                 return value
     return None
 
+
+def extract_chat_id(payload) -> Optional[str]:
+    cid = _deep_get(payload, CHAT_ID_KEYS)
+    if cid and _UUID_RE.match(cid):
+        return cid
+    return None
+
+
+# ---------------------------------------------------------------- rule matching
 
 def rule_matches(rule: Rule, payload) -> Tuple[bool, str]:
     if not rule.enabled:
@@ -246,36 +282,149 @@ def find_matching_rule(payload) -> Tuple[Optional[Rule], List[Tuple[str, str]]]:
     return None, reasons
 
 
+# ---------------------------------------------------------------- state
+
+_state_lock = threading.Lock()
+
+
+def load_state() -> Dict[str, Dict[str, Any]]:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log.exception("state file corrupted, starting fresh")
+        return {}
+
+
+def save_state(state: Dict[str, Dict[str, Any]]) -> None:
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def update_chat_state(chat_id: str, **fields: Any) -> Dict[str, Any]:
+    with _state_lock:
+        state = load_state()
+        entry = state.setdefault(chat_id, {})
+        entry.update(fields)
+        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+        save_state(state)
+        return dict(entry)
+
+
+def get_chat_state(chat_id: str) -> Dict[str, Any]:
+    with _state_lock:
+        return load_state().get(chat_id, {})
+
+
+# ---------------------------------------------------------------- chat history
+
+def fetch_chat_messages(
+    chat_id: str, since: Optional[int] = None, limit: int = 20
+) -> List[dict]:
+    """Fetch up to `limit` messages, paginating if needed. Returns the LATEST
+    `limit` messages (oldest first). `since` is exclusive — only messages with
+    id strictly greater than `since` are returned.
+    """
+    PAGE = 1000  # YouGile API max
+    page_limit = min(PAGE, max(1, limit))
+    collected: List[dict] = []
+    offset = 0
+    while True:
+        params = {
+            "limit": str(page_limit),
+            "offset": str(offset),
+            "includeSystem": "false",
+        }
+        if since is not None:
+            # Some YouGile deployments treat `since` as inclusive; shift by 1
+            # to make it strictly "after" last_seen.
+            params["since"] = str(int(since) + 1)
+        qs = urllib.parse.urlencode(params)
+        data = _api_get(f"/chats/{chat_id}/messages?{qs}") or {}
+        items = data.get("content", []) or []
+        if not items:
+            break
+        collected.extend(items)
+        paging = data.get("paging") or {}
+        if not paging.get("next"):
+            break
+        offset += len(items)
+        if offset > 100_000:  # hard safety cap
+            break
+    collected.sort(key=lambda m: m.get("id") or 0)
+    if limit and len(collected) > limit:
+        collected = collected[-limit:]
+    return collected
+
+
+def _format_sender(user_id: Optional[str]) -> str:
+    if not user_id:
+        return "unknown"
+    u = USERS_BY_ID.get(user_id)
+    if not u:
+        return f"user:{user_id[:8]}"
+    return u.get("email") or u.get("realName") or f"user:{user_id[:8]}"
+
+
+def render_chat_history(messages: List[dict]) -> str:
+    if not messages:
+        return "(no prior messages)"
+    lines = []
+    for m in messages:
+        ts_ms = m.get("id") or 0
+        try:
+            ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        except (OSError, ValueError):
+            ts = "?"
+        sender = _format_sender(m.get("fromUserId"))
+        text = (m.get("text") or "").replace("\n", " ")
+        lines.append(f"[{ts}] {sender}: {text}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- spawning
+
 app = FastAPI(title="YouGile webhook receiver")
 
 _active_lock = threading.Lock()
 _active_procs: Set[int] = set()
 
+_chat_locks_mutex = threading.Lock()
+_chat_busy: Dict[str, threading.Lock] = {}
 
-def spawn_claude(rule: Rule, payload) -> bool:
-    with _active_lock:
-        if len(_active_procs) >= CLAUDE_MAX_CONCURRENT:
-            log.warning(
-                "rule %s: max-concurrent %d reached, dropping",
-                rule.name,
-                CLAUDE_MAX_CONCURRENT,
-            )
-            return False
 
+def _get_chat_lock(chat_id: str) -> threading.Lock:
+    with _chat_locks_mutex:
+        lock = _chat_busy.get(chat_id)
+        if lock is None:
+            lock = threading.Lock()
+            _chat_busy[chat_id] = lock
+        return lock
+
+
+def _build_prompt(rule: Rule, payload, chat_history_text: str, is_first_turn: bool) -> str:
     event_json = json.dumps(payload, ensure_ascii=False, indent=2)
-    prompt = rule.prompt_template.replace("{event_json}", event_json)
-    cmd = [CLAUDE_BIN, *rule.extra_args, "-p", prompt]
+    rendered = rule.prompt_template
+    rendered = rendered.replace("{event_json}", event_json)
+    rendered = rendered.replace("{chat_history}", chat_history_text)
+    rendered = rendered.replace("{first_turn}", "true" if is_first_turn else "false")
+    # If template uses no placeholder for history, append it so the agent still sees it.
+    if "{chat_history}" not in rule.prompt_template and chat_history_text:
+        rendered = (
+            f"{rendered}\n\n"
+            f"---\nRecent messages in this task chat "
+            f"({'first turn — full history' if is_first_turn else 'new since your last reply'}):\n"
+            f"{chat_history_text}\n"
+        )
+    return rendered
 
-    ts = datetime.now(timezone.utc).isoformat()
-    header = (
-        f"\n\n=== {ts} | rule={rule.name} | spawn ===\n"
-        f"cwd: {rule.workdir}\nbin: {CLAUDE_BIN}\nargs: {rule.extra_args}\n"
-        f"--- prompt ---\n{prompt}\n--- output ---\n"
-    )
+
+def _spawn_subprocess(rule: Rule, cmd: List[str], header: str, on_exit) -> Optional[subprocess.Popen]:
     log_fp = CLAUDE_LOG.open("a", encoding="utf-8")
     log_fp.write(header)
     log_fp.flush()
-
     try:
         proc = subprocess.Popen(
             cmd,
@@ -288,26 +437,105 @@ def spawn_claude(rule: Rule, payload) -> bool:
     except Exception:
         log.exception("rule %s: failed to spawn claude", rule.name)
         log_fp.close()
-        return False
+        return None
 
     pid = proc.pid
     with _active_lock:
         _active_procs.add(pid)
-    log.info("rule %s: claude spawned pid=%s", rule.name, pid)
+    log.info("rule %s: claude spawned pid=%s cmd=%s", rule.name, pid, cmd[:3] + ["..."])
 
     def _reap():
         rc = proc.wait()
         with _active_lock:
             _active_procs.discard(pid)
-        log_fp.write(
-            f"\n--- exit rc={rc} ts={datetime.now(timezone.utc).isoformat()} ---\n"
-        )
+        log_fp.write(f"\n--- exit rc={rc} ts={datetime.now(timezone.utc).isoformat()} ---\n")
         log_fp.close()
         log.info("rule %s: claude pid=%s rc=%s", rule.name, pid, rc)
+        try:
+            on_exit(rc)
+        except Exception:
+            log.exception("rule %s: on_exit hook failed", rule.name)
 
     threading.Thread(target=_reap, daemon=True).start()
-    return True
+    return proc
 
+
+def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
+    with _active_lock:
+        if len(_active_procs) >= CLAUDE_MAX_CONCURRENT:
+            return False, "global-max-concurrent"
+
+    chat_id = extract_chat_id(payload) if rule.session_per_chat else None
+    chat_lock: Optional[threading.Lock] = None
+    if chat_id:
+        chat_lock = _get_chat_lock(chat_id)
+        if not chat_lock.acquire(blocking=False):
+            log.warning("rule %s: chat %s already busy, dropping", rule.name, chat_id)
+            return False, "chat-busy"
+
+    try:
+        if chat_id:
+            chat_state = get_chat_state(chat_id)
+            session_id = chat_state.get("session_id")
+            last_msg_id = chat_state.get("last_message_id")
+            is_first_turn = not session_id
+            if is_first_turn:
+                session_id = str(uuid.uuid4())
+                history = fetch_chat_messages(
+                    chat_id, since=None, limit=CHAT_HISTORY_FIRST_TIME_LIMIT
+                )
+            else:
+                history = fetch_chat_messages(
+                    chat_id, since=last_msg_id, limit=CHAT_HISTORY_DELTA_LIMIT
+                )
+            history_text = render_chat_history(history)
+            newest_msg_id = max(
+                [int(m["id"]) for m in history if m.get("id")] + [last_msg_id or 0]
+            )
+            session_flag = ["--session-id", session_id] if is_first_turn else ["--resume", session_id]
+        else:
+            session_id = None
+            history_text = ""
+            is_first_turn = True
+            newest_msg_id = None
+            session_flag = []
+
+        prompt = _build_prompt(rule, payload, history_text, is_first_turn)
+        cmd = [CLAUDE_BIN, *rule.extra_args, *session_flag, "-p", prompt]
+
+        ts = datetime.now(timezone.utc).isoformat()
+        header = (
+            f"\n\n=== {ts} | rule={rule.name} | chat={chat_id} | session={session_id} "
+            f"| first_turn={is_first_turn} | spawn ===\n"
+            f"cwd: {rule.workdir}\nbin: {CLAUDE_BIN}\nargs: {rule.extra_args + session_flag}\n"
+            f"--- prompt ---\n{prompt}\n--- output ---\n"
+        )
+
+        def on_exit(rc: int) -> None:
+            try:
+                if chat_id:
+                    fields: Dict[str, Any] = {"session_id": session_id}
+                    if newest_msg_id:
+                        fields["last_message_id"] = newest_msg_id
+                    update_chat_state(chat_id, **fields)
+            finally:
+                if chat_lock is not None:
+                    chat_lock.release()
+
+        proc = _spawn_subprocess(rule, cmd, header, on_exit)
+        if proc is None:
+            if chat_lock is not None:
+                chat_lock.release()
+            return False, "spawn-failed"
+        return True, "ok"
+    except Exception:
+        log.exception("rule %s: spawn flow failed", rule.name)
+        if chat_lock is not None:
+            chat_lock.release()
+        return False, "exception"
+
+
+# ---------------------------------------------------------------- HTTP
 
 @app.get("/healthz")
 def healthz():
@@ -316,6 +544,7 @@ def healthz():
         "claude_bin": CLAUDE_BIN,
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,
         "active_claude_procs": len(_active_procs),
+        "tracked_chats": list(load_state().keys()),
         "rules": [
             {
                 "name": r.name,
@@ -325,6 +554,7 @@ def healthz():
                 "allowed_sender_ids": sorted(r.allowed_sender_ids),
                 "column_ids": sorted(r.column_ids),
                 "workdir": r.workdir,
+                "session_per_chat": r.session_per_chat,
             }
             for r in RULES
         ],
@@ -350,9 +580,21 @@ async def yougile_webhook(req: Request):
 
     rule, reasons = find_matching_rule(payload)
     fired_rule: Optional[str] = None
-    if rule and spawn_claude(rule, payload):
-        fired_rule = rule.name
+    spawn_reason: Optional[str] = None
+    if rule:
+        ok, why = spawn_claude(rule, payload)
+        spawn_reason = why
+        if ok:
+            fired_rule = rule.name
 
     event = isinstance(payload, dict) and payload.get("event")
-    log.info("event=%s fired=%s reasons=%s", event, fired_rule, reasons)
-    return {"ok": True, "fired_rule": fired_rule, "reasons": reasons}
+    log.info(
+        "event=%s fired=%s spawn_reason=%s match_reasons=%s",
+        event, fired_rule, spawn_reason, reasons,
+    )
+    return {
+        "ok": True,
+        "fired_rule": fired_rule,
+        "spawn_reason": spawn_reason,
+        "match_reasons": reasons,
+    }
