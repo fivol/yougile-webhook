@@ -45,7 +45,7 @@ YouGile  ──POST──▶  https://<your-public-domain>/yougile/webhook
 | `logs/events.jsonl` | Полные входящие вебхуки |
 | `logs/claude.log` | stdout/stderr запущенных claude-процессов |
 | `logs/uvicorn.{log,err}` | Логи uvicorn (пишутся launchd) |
-| `state/sessions.json` | Per-chat: `session_id` + `last_message_id` (**gitignored**) |
+| `state/chats/<chatId>.json` | Per-chat: `last_message_id`, `first_seen_at`, `updated_at` (**gitignored**) |
 
 Системное (не в репо, по желанию):
 - `~/Library/LaunchAgents/org.local.yougile-webhook.plist` — launchd-автозапуск (есть пример ниже)
@@ -277,49 +277,62 @@ launchctl list | grep yougile-webhook
 Это удобно и при дебаге (`claude --resume` в интерактивном пикере покажет
 сессии с теми же UUID, что и задачи в YouGile).
 
-State хранит **только** что мы видели по последнему обработанному сообщению:
+State шардирован — один JSON-файл на чат:
 
 ```
-state/sessions.json
+state/chats/<task-uuid>.json
 {
-  "<task-uuid>": {
-    "last_message_id": 1779100000000,
-    "updated_at": "..."
-  }
+  "first_seen_at": "...",
+  "last_message_id": 1779100000000,
+  "updated_at": "..."
 }
 ```
 
-«Первый раз или продолжение» определяется не по state, а по наличию файла
-сессии claude на диске: `~/.claude/projects/<encoded-workdir>/<chatId>.jsonl`.
-Это делает систему устойчивой к рассинхронизации.
+Существование файла `state/chats/<chatId>.json` == «эту задачу мы уже запускали,
+сессия в claude есть, делаем `--resume`». Отсутствие == «впервые, делаем
+`--session-id <chatId>`». Никакого peek-а в `~/.claude` — формат и расположение
+сессий claude нас не касается.
+
+Преимущества per-chat файлов:
+- файл не пухнет с ростом числа задач;
+- независимые записи (read/write на разные чаты не конфликтуют — global lock не нужен);
+- легко переносить / бэкапить / просматривать отдельный чат;
+- atomic writes (`.tmp` → `rename`) — устойчиво к падению посреди записи.
 
 Поток на каждое срабатывание правила с `session_per_chat = true`:
 
 1. Извлекаем `chatId` из пейлоада (порядок ключей: `CHAT_ID_KEYS`).
 2. Берём `chat_lock` неблокирующе. Если claude уже работает по этому чату —
    событие **дропается** (см. `spawn_reason: chat-busy` в логах). Очереди нет.
-3. Смотрим, есть ли уже сессия `chatId` на диске у claude:
-   - Нет файла → **first turn**: запускаем `claude -p --session-id <chatId>`,
-     тянем последние `CHAT_HISTORY_FIRST_TIME_LIMIT` сообщений из YouGile API.
-   - Файл есть → **resume**: запускаем `claude -p --resume <chatId>`, тянем
-     только сообщения с `id > last_message_id` (параметр `since` сдвинут
-     на +1 чтобы не повторять уже виденное).
+3. Смотрим `state/chats/<chatId>.json`:
+   - **Нет файла** → first turn: тянем последние `CHAT_HISTORY_FIRST_TIME_LIMIT`
+     сообщений из YouGile API, запускаем `claude -p --session-id <chatId>`,
+     сразу пишем state-файл (с `first_seen_at`) — чтобы при крэше во время
+     спавна следующий тригер не сделал double `--session-id`.
+   - **Файл есть** → resume: тянем сообщения с `id > last_message_id` (параметр
+     `since` сдвинут на +1, чтобы не повторять последнее), запускаем
+     `claude -p --resume <chatId>`.
 4. Рендерим промпт. Плейсхолдер `{chat_history}` в шаблоне заменяется на
    `[ts] sender: text` построчно. Если плейсхолдера нет — блок дописывается
    в конец промпта.
-5. После завершения процесса обновляем `last_message_id` в state.
+5. После завершения процесса обновляем `last_message_id` в state-файле.
 
-### Восстановление после рассинхронизации
+### Миграция со старого формата
 
-| `state/sessions.json` | claude session file | поведение |
-|---|---|---|
-| есть | есть | `--resume` (норма) |
-| есть | удалён | `--session-id` — clean restart с полной историей; state перепишется |
-| удалён | есть | `--resume` — память агента сохранена; история подтянется как «recent N» |
-| удалён | удалён | `--session-id` — старт с нуля |
+Если в `state/` лежит старый монолитный `sessions.json` (от прошлых версий),
+при старте он будет автоматически разнесён в `state/chats/*.json`, а оригинал
+переименован в `sessions.json.migrated`.
 
-Конфликтов с «session id already in use» при штатной работе быть не может,
-поскольку source of truth — диск claude.
+### Восстановление и edge-cases
+
+- **Удалить весь state** для чата — просто `rm state/chats/<chatId>.json`. На
+  следующее срабатывание агент стартует с нуля в новой сессии.
+- **Удалить claude-сессию** (через сторонний инструмент / переустановка):
+  файл нашего state остаётся, мы попробуем `--resume`, claude вернёт ошибку.
+  Лечение — удалить и наш state-файл (он маленький, см. путь выше).
+- Конфликты «session id already in use» при штатной работе невозможны: один
+  source of truth (наш state-файл), детерминистическая привязка
+  `chatId == session_id`.
 
 Для правил, где сессия не нужна (например, разовые ресерч-агенты, которым не
 нужна память между задачами), ставьте `session_per_chat = false`.

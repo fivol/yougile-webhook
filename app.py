@@ -21,9 +21,9 @@ from fastapi import FastAPI, Request
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
-STATE_DIR = ROOT / "state"
-STATE_DIR.mkdir(exist_ok=True)
-STATE_FILE = STATE_DIR / "sessions.json"
+STATE_DIR = ROOT / os.environ.get("STATE_DIR", "state")
+CHATS_STATE_DIR = STATE_DIR / "chats"
+CHATS_STATE_DIR.mkdir(parents=True, exist_ok=True)
 EVENT_LOG = LOG_DIR / "events.jsonl"
 CLAUDE_LOG = LOG_DIR / "claude.log"
 
@@ -282,39 +282,74 @@ def find_matching_rule(payload) -> Tuple[Optional[Rule], List[Tuple[str, str]]]:
 
 
 # ---------------------------------------------------------------- state
-
-_state_lock = threading.Lock()
-
-
-def load_state() -> Dict[str, Dict[str, Any]]:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        log.exception("state file corrupted, starting fresh")
-        return {}
+#
+# State is sharded per-chat: one JSON file per chat under state/chats/<chatId>.json.
+# Existence of a file == "we have launched claude for this chat before, the session
+# is set up". This means we don't need to peek at claude's internal storage.
+# Each per-chat write is atomic (write to .tmp, then rename). Concurrent writes to
+# the SAME chat file are excluded by the in-memory chat_lock (drop-if-busy), so no
+# global lock is needed.
 
 
-def save_state(state: Dict[str, Dict[str, Any]]) -> None:
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+def _chat_state_path(chat_id: str) -> Path:
+    return CHATS_STATE_DIR / f"{chat_id}.json"
 
 
-def update_chat_state(chat_id: str, **fields: Any) -> Dict[str, Any]:
-    with _state_lock:
-        state = load_state()
-        entry = state.setdefault(chat_id, {})
-        entry.update(fields)
-        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-        save_state(state)
-        return dict(entry)
+def chat_known(chat_id: str) -> bool:
+    return _chat_state_path(chat_id).exists()
 
 
 def get_chat_state(chat_id: str) -> Dict[str, Any]:
-    with _state_lock:
-        return load_state().get(chat_id, {})
+    p = _chat_state_path(chat_id)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log.exception("chat state corrupted: %s", p)
+        return {}
+
+
+def update_chat_state(chat_id: str, **fields: Any) -> Dict[str, Any]:
+    p = _chat_state_path(chat_id)
+    existing = get_chat_state(chat_id)
+    existing.update(fields)
+    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+    return dict(existing)
+
+
+def list_known_chats() -> List[str]:
+    return sorted(p.stem for p in CHATS_STATE_DIR.glob("*.json"))
+
+
+def _migrate_legacy_state() -> None:
+    """One-time migration from the old monolithic state/sessions.json layout."""
+    legacy = STATE_DIR / "sessions.json"
+    if not legacy.exists():
+        return
+    try:
+        data = json.loads(legacy.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    migrated = 0
+    for chat_id, entry in (data or {}).items():
+        if not isinstance(entry, dict) or _chat_state_path(chat_id).exists():
+            continue
+        new_entry = {
+            k: entry[k]
+            for k in ("last_message_id", "updated_at", "first_seen_at")
+            if k in entry
+        }
+        update_chat_state(chat_id, **new_entry)
+        migrated += 1
+    legacy.rename(legacy.with_suffix(".json.migrated"))
+    log.info("migrated %d chat(s) from legacy sessions.json", migrated)
+
+
+_migrate_legacy_state()
 
 
 # ---------------------------------------------------------------- chat history
@@ -365,20 +400,6 @@ def _format_sender(user_id: Optional[str]) -> str:
     if not u:
         return f"user:{user_id[:8]}"
     return u.get("email") or u.get("realName") or f"user:{user_id[:8]}"
-
-
-def _claude_session_file(workdir: str, session_id: str) -> Path:
-    """Path where claude code stores a session's transcript.
-
-    Claude encodes the workdir by replacing every "/" with "-" and uses the
-    resulting string as the directory name under ~/.claude/projects/.
-    """
-    encoded = workdir.replace("/", "-")
-    return Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
-
-
-def claude_session_exists(workdir: str, session_id: str) -> bool:
-    return _claude_session_file(workdir, session_id).exists()
 
 
 def render_chat_history(messages: List[dict]) -> str:
@@ -489,32 +510,33 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
     try:
         if chat_id:
             # The claude session id IS the YouGile chat/task UUID — deterministic,
-            # so we never need to map it. Whether to --resume or --session-id is
-            # decided by checking claude's on-disk session file directly.
+            # so we never need to map it. "Have we already started a session for
+            # this chat?" is answered solely by whether state/chats/<chatId>.json
+            # exists. No peeking into claude's internal storage.
             session_id = chat_id
-            session_exists = claude_session_exists(rule.workdir, session_id)
+            known = chat_known(chat_id)
             chat_state = get_chat_state(chat_id)
             last_msg_id = chat_state.get("last_message_id")
 
-            if not session_exists:
-                # First time on this chat in this workdir (or claude state was wiped).
-                # Fetch the recent history afresh; ignore any stale last_message_id.
+            if not known:
                 is_first_turn = True
                 history = fetch_chat_messages(
                     chat_id, since=None, limit=CHAT_HISTORY_FIRST_TIME_LIMIT
                 )
                 session_flag = ["--session-id", session_id]
+                # Mark the chat as known BEFORE spawn so a crash mid-launch
+                # doesn't make us double-fire --session-id on retry.
+                update_chat_state(
+                    chat_id,
+                    first_seen_at=datetime.now(timezone.utc).isoformat(),
+                )
             else:
                 is_first_turn = False
-                if last_msg_id:
-                    history = fetch_chat_messages(
-                        chat_id, since=last_msg_id, limit=CHAT_HISTORY_DELTA_LIMIT
-                    )
-                else:
-                    # Session exists but our state was wiped — feed recent context.
-                    history = fetch_chat_messages(
-                        chat_id, since=None, limit=CHAT_HISTORY_FIRST_TIME_LIMIT
-                    )
+                history = fetch_chat_messages(
+                    chat_id,
+                    since=last_msg_id,
+                    limit=CHAT_HISTORY_DELTA_LIMIT,
+                )
                 session_flag = ["--resume", session_id]
 
             history_text = render_chat_history(history)
@@ -569,7 +591,7 @@ def healthz():
         "claude_bin": CLAUDE_BIN,
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,
         "active_claude_procs": len(_active_procs),
-        "tracked_chats": list(load_state().keys()),
+        "tracked_chats": list_known_chats(),
         "rules": [
             {
                 "name": r.name,
