@@ -1,0 +1,124 @@
+A user invoked `!implement` in a YouGile task chat. Your job is to either
+ask clarifying questions OR implement the task end-to-end across the
+repositories under your working directory, then open one PR per affected
+repo into its `dev` branch and post the PR links back into the chat.
+
+Trigger event:
+{event_json}
+
+Task chat history (full on first invocation; only new messages on
+subsequent invocations):
+{chat_history}
+
+YOU ARE RUNNING from the company root directory. It contains several
+repositories as subfolders. Discover them with:
+
+    find . -maxdepth 2 -name .git -type d | sed 's|/.git$||'
+
+ATTACHMENTS:
+- Files dropped into the YouGile chat appear in history as
+  `[image: /abs/path]` or `[file: /abs/path]` — open them with your Read
+  tool (images render visually) BEFORE deciding on scope. The task may
+  rely on a screenshot/mockup.
+
+STEP 0 — fetch the full task. The trigger fires on a chat message; the
+parent task UUID is `payload.chatId`. Pull the task body:
+
+    mcp__yougile-mcp__get_task   id = payload.chatId
+
+STEP 1 — DECIDE: ambiguous → ask. Clear → implement.
+
+Combine task title + description + chat history + attachments. Form a
+concrete plan: which repo(s), what changes, expected PR title(s).
+
+If anything material is unclear (missing acceptance criteria, conflicting
+hints, two reasonable interpretations, unspecified UI behaviour, etc.):
+  - Pick the SMALLEST set of specific yes/no or pick-from-list questions
+    whose answers unlock the work. Avoid open-ended "what do you want?".
+  - Post them in the task chat with
+    `mcp__yougile-mcp__send_task_message` (taskId = payload.chatId).
+  - End the message with a clear instruction:
+        "Ответь на вопросы и пингани снова через `!implement` — продолжу."
+  - STOP. Do NOT touch any code, branch, or worktree.
+
+If the task is clear, proceed to Step 2.
+
+STEP 2 — slug & branch name.
+
+Pick a kebab-case slug derived from the task title — under 50 chars,
+specific. Examples: `fix-consent-double-fire`, `add-csv-export`,
+`refactor-auth-middleware`. The git branch name is `task-<slug>`.
+
+STEP 3 — for EACH affected repository <repo>, do all of these:
+
+  1) Verify `dev` exists upstream:
+        git -C <repo> fetch origin
+        git -C <repo> rev-parse --verify origin/dev
+     If `dev` is missing, STOP and report this in the chat — do not
+     guess `main`/`master`.
+
+  2) Create a worktree off origin/dev (path is relative to the company
+     root):
+        mkdir -p worktrees/<slug>
+        git -C <repo> worktree add \
+            "$PWD/worktrees/<slug>/<repo>" \
+            -b "task-<slug>" \
+            origin/dev
+
+     If the worktree path already exists (retry of a previous partial
+     run), pick a slug suffix like `-v2` and try again — do NOT reuse a
+     dirty worktree.
+
+  3) `cd` into `worktrees/<slug>/<repo>` and IMPLEMENT the task. Tests
+     where reasonable. Small, focused commits. English commit messages
+     and code comments.
+
+  4) Push:
+        git push -u origin "task-<slug>"
+
+  5) Open the PR into `dev`:
+        gh pr create --base dev --head "task-<slug>" \
+            --title "<short imperative title>" \
+            --body "$(cat <<'EOF'
+        <1-3 bullet summary of the change>
+
+        YouGile task: <link to the task, or just the task UUID if no URL>
+        EOF
+        )"
+     Capture the returned PR URL.
+
+  If `gh` is not configured for a given repo (auth, no remote, etc.),
+  report it in the chat for that repo and SKIP it. Do not invent URLs.
+
+STEP 4 — post ONE chat message with all PR links.
+
+Use `mcp__yougile-mcp__send_task_message`, taskId = payload.chatId.
+Plain text body. Example:
+
+    Готово. PRs:
+    - app: https://github.com/org/app/pull/123
+    - bitfront: https://github.com/org/bitfront/pull/456
+
+If only some repos succeeded, list both successes AND failures with a
+one-line reason for each failure. Keep the message under ~15 lines.
+
+For clickable links, also pass `textHtml` with `<a href>` tags; keep
+`text` as the plain fallback.
+
+FORMATTING: YouGile chat does NOT render markdown. Plain text in `text`;
+simple HTML (`<p>`, `<b>`, `<a>`, `<code>`, `<br>`, `<table>`) in
+`textHtml`. Do NOT use tables in `text` — neither markdown pipe-tables
+nor ASCII columns; they wrap and become unreadable. Use a vertical list
+or per-option block instead; if a grid is truly needed, put a real
+`<table>` into `textHtml` and keep `text` as a plain fallback.
+
+HARD RULES:
+- NEVER touch any branch other than the new `task-<slug>`. Do not push
+  to `dev` directly. Do not modify any other repo state.
+- NEVER force-push. NEVER amend an existing commit.
+- One PR per affected repo, always with base = `dev`.
+- Do not ask follow-up questions AFTER you have started coding —
+  either clarify in Step 1, or finish the job.
+- If anything fails mid-implementation in a way you can't recover from,
+  post a clear status into the chat (what was done, what failed, the
+  state of each worktree) and stop.

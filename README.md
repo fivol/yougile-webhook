@@ -31,6 +31,7 @@ cp .env.example .env
 cp rules.example.toml rules.toml
 cp prompts/chat_mention.example.txt    prompts/chat_mention.txt
 cp prompts/task_in_progress.example.txt prompts/task_in_progress.txt
+cp prompts/implement.example.txt       prompts/implement.txt
 # edit .env, rules.toml, and the prompts
 ```
 
@@ -100,9 +101,21 @@ YOUGILE_WEBHOOK_EVENT=(chat_message|task)-.*
 
 ## Configure rules — `rules.toml`
 
-A list of trigger rules, evaluated top to bottom; **first match wins**.
+A list of trigger rules, evaluated top to bottom; **first match wins** —
+put the most specific rules first.
 
 ```toml
+# Implement command: "!implement ..." — agent clarifies or implements
+# the task end-to-end across affected repos, opens one PR into `dev`
+# per repo, and posts the PR links back into the chat.
+[[rules]]
+name = "chat_implement"
+enabled = true
+events = ["chat_message-created"]
+pattern = "!implement\\b"
+allowed_sender_emails = ["you@example.com"]
+prompt_file = "prompts/implement.txt"
+
 [[rules]]
 name = "chat_mention"
 enabled = true
@@ -121,6 +134,28 @@ prompt_file = "prompts/task_in_progress.txt"
 # workdir = "/path/to/your/company-root"                     # override per-rule
 # extra_args = "--dangerously-skip-permissions --model sonnet"
 ```
+
+### `!implement` flow
+
+When someone writes `!implement ...` in a task chat:
+
+1. Agent fetches the full task (title + description) and reads the chat
+   history (including any image attachments).
+2. **If the task is ambiguous** — agent posts the smallest set of
+   clarifying questions back into the chat and stops. The user answers
+   and re-triggers with `!implement` again. The claude session is
+   preserved across both invocations (same `chatId`), so context
+   carries over.
+3. **If the task is clear** — for each affected repository:
+   - `git worktree add worktrees/<slug>/<repo> -b task-<slug> origin/dev`
+     (worktrees live under the company root, `dev` is required)
+   - Implements + commits in the worktree
+   - `git push -u origin task-<slug>`
+   - `gh pr create --base dev` → captures the PR URL
+4. Posts ONE chat message with all PR links (one per touched repo).
+
+The implement rule must come **above** `chat_mention` in `rules.toml` so
+that `@Agent !implement ...` routes to implement, not to chat-mention.
 
 | Field | Meaning |
 |---|---|
@@ -155,6 +190,9 @@ prompt_file = "prompts/task_in_progress.txt"
 | `CHAT_ID_KEYS` | Same, for the task/chat UUID used as the claude session id. |
 | `CHAT_HISTORY_FIRST_TIME_LIMIT` | How many recent messages to inject on the first trigger for a chat (default 20). |
 | `CHAT_HISTORY_DELTA_LIMIT` | How many new messages to inject on subsequent triggers (default 50). |
+| `ATTACHMENTS_ENABLED` | Default `true`. Download `/root/#file:<url>` attachments from chat messages into `state/attachments/<chatId>/` and surface them to the agent. |
+| `ATTACHMENT_MAX_BYTES` | Per-file size cap (default 25 MiB). Larger files are skipped. |
+| `ATTACHMENT_TIMEOUT_SECONDS` | Per-file download timeout (default 30s). |
 
 After editing `.env` or `rules.toml`, reload:
 
@@ -178,6 +216,28 @@ For rules with `session_per_chat = true` (default):
 
 To reset a single chat: `rm state/chats/<chatId>.json`. The next trigger
 will start a fresh session and re-inject full history.
+
+## Attachments (images & files)
+
+YouGile embeds files inline in chat messages as
+`/root/#file:<url>`. With `ATTACHMENTS_ENABLED=true` (default) every such
+URL found in the trigger payload and in fetched history is downloaded
+once into `state/attachments/<chatId>/` and the marker is rewritten in
+the rendered history as `[image: /abs/path]` or `[file: /abs/path]`. The
+agent can then open the local file with its `Read` tool — images render
+visually for vision-capable models.
+
+A list of every downloaded path is also appended to the prompt under
+`Attachments referenced above are saved locally`, so the agent can see
+at a glance what's available without parsing the history.
+
+Caps: `ATTACHMENT_MAX_BYTES` (25 MiB default) and
+`ATTACHMENT_TIMEOUT_SECONDS` (30s default). Files that exceed the cap
+or time out are silently skipped and their markers stay unresolved.
+
+To send files back to chat, the prompts point the agent at
+`mcp__yougile-mcp__send_task_file` (taskId = `payload.chatId`,
+filePath = local path).
 
 ## Replying from the agent
 
@@ -240,6 +300,7 @@ previous column.
 | `rules.toml`, `prompts/*.txt` | Your real rules and prompts (**gitignored**). |
 | `.env.example` / `.env` | Runtime config (`.env` gitignored). |
 | `state/chats/<chatId>.json` | Per-chat session state (gitignored). |
+| `state/attachments/<chatId>/` | Locally-cached chat attachments (gitignored). |
 | `logs/events.jsonl` | All inbound webhooks. |
 | `logs/claude.log` | Spawned claude stdout/stderr. |
 

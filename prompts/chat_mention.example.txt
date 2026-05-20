@@ -13,6 +13,14 @@ Read the chat, treat the latest mention as the user's request, do the work,
 and reply with `mcp__yougile-mcp__send_task_message` using `payload.chatId`
 as `taskId`.
 
+Attachments dropped into chat show up in the history as `[image: /abs/path]`
+or `[file: /abs/path]` — open them with your Read tool to view (images
+render visually). Send files back with `mcp__yougile-mcp__send_task_file`.
+
 Formatting: YouGile chat does NOT render markdown — reply in plain text.
-For richer output, set both `text` (plain fallback) and `textHtml` with simple
-HTML (`<p>`, `<b>`, `<a>`, `<code>`, `<br>`).
+Do NOT use tables (neither markdown pipe-tables nor ASCII columns) — the
+chat is narrow, columns wrap, the output becomes unreadable. Convert any
+comparison into a short vertical list or a per-option block. If a grid is
+truly required, send `textHtml` with a real `<table>` and keep `text` as
+a plain fallback. For other rich output, simple HTML (`<p>`, `<b>`, `<a>`,
+`<code>`, `<br>`, `<table>`) in `textHtml` is fine.

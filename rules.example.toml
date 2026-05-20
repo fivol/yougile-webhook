@@ -24,6 +24,20 @@
 #                           stateless. Chat history is also fetched from YouGile and injected via
 #                           the {chat_history} placeholder in the prompt template.
 
+# Implement-task command: someone writes "!implement ..." in a task chat.
+# Agent reads the task, optionally asks clarifying questions, otherwise
+# creates a worktree off `dev` per affected repo, branches as
+# `task-<slug>`, opens a PR into `dev` for each, and posts the PR links
+# back into the chat.
+# Put this ABOVE chat_mention so "@Agent !implement ..." routes here.
+[[rules]]
+name = "chat_implement"
+enabled = true
+events = ["chat_message-created"]
+pattern = "!implement\\b"
+allowed_sender_emails = ["you@example.com"]
+prompt_file = "prompts/implement.txt"
+
 # Chat-mention bot: someone writes "@Agent ..." in a task chat.
 [[rules]]
 name = "chat_mention"

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
@@ -24,6 +26,8 @@ LOG_DIR.mkdir(exist_ok=True)
 STATE_DIR = ROOT / os.environ.get("STATE_DIR", "state")
 CHATS_STATE_DIR = STATE_DIR / "chats"
 CHATS_STATE_DIR.mkdir(parents=True, exist_ok=True)
+ATTACHMENTS_DIR = STATE_DIR / "attachments"
+ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 EVENT_LOG = LOG_DIR / "events.jsonl"
 CLAUDE_LOG = LOG_DIR / "claude.log"
 
@@ -77,6 +81,10 @@ CHAT_ID_KEYS = [
 
 CHAT_HISTORY_FIRST_TIME_LIMIT = int(os.environ.get("CHAT_HISTORY_FIRST_TIME_LIMIT", "20"))
 CHAT_HISTORY_DELTA_LIMIT = int(os.environ.get("CHAT_HISTORY_DELTA_LIMIT", "50"))
+
+ATTACHMENTS_ENABLED = os.environ.get("ATTACHMENTS_ENABLED", "true").lower() not in ("0", "false", "no")
+ATTACHMENT_MAX_BYTES = int(os.environ.get("ATTACHMENT_MAX_BYTES", str(25 * 1024 * 1024)))
+ATTACHMENT_TIMEOUT_SECONDS = int(os.environ.get("ATTACHMENT_TIMEOUT_SECONDS", "30"))
 
 RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
 
@@ -352,6 +360,165 @@ def _migrate_legacy_state() -> None:
 _migrate_legacy_state()
 
 
+# ---------------------------------------------------------------- attachments
+#
+# YouGile embeds chat files inline as "/root/#file:<url>" inside the message
+# text (see yougile-mcp/src/tools/task-chat.ts). We download each unique URL
+# once per chat into state/attachments/<chatId>/ and rewrite occurrences in
+# rendered history to "[image: <abs-path>]" / "[file: <abs-path>]" so the
+# claude agent can open them with its Read tool.
+
+FILE_MARKER_RE = re.compile(r"/root/#file:(\S+)")
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".heic", ".heif", ".avif"}
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    return name[:80] or "file"
+
+
+def _is_image(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTS
+
+
+def _attachment_dir(chat_id: Optional[str]) -> Path:
+    sub = chat_id or "_global"
+    d = ATTACHMENTS_DIR / sub
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _download_attachment(url: str, chat_id: Optional[str]) -> Optional[Path]:
+    """Download `url` into the chat's attachment dir. Idempotent — re-uses
+    files when a previous run already fetched the same URL. Returns the local
+    path on success, None on any failure.
+    """
+    if not ATTACHMENTS_ENABLED:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return None
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+    raw_name = _safe_filename(Path(parsed.path).name or digest)
+    chat_dir = _attachment_dir(chat_id)
+
+    # If we already downloaded this URL, find the matching file by prefix.
+    for existing in chat_dir.glob(f"{digest}_*"):
+        if existing.is_file() and existing.stat().st_size > 0:
+            return existing
+
+    headers: Dict[str, str] = {"User-Agent": "yougile-webhook/1.0"}
+    if YOUGILE_API_KEY and "yougile" in (parsed.netloc or ""):
+        headers["Authorization"] = f"Bearer {YOUGILE_API_KEY}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=ATTACHMENT_TIMEOUT_SECONDS) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+            ext = Path(raw_name).suffix
+            if not ext and ctype:
+                guessed = mimetypes.guess_extension(ctype)
+                if guessed:
+                    raw_name = f"{Path(raw_name).stem}{guessed}"
+            dest = chat_dir / f"{digest}_{raw_name}"
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            written = 0
+            with tmp.open("wb") as f:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > ATTACHMENT_MAX_BYTES:
+                        raise IOError(
+                            f"attachment exceeds ATTACHMENT_MAX_BYTES "
+                            f"({ATTACHMENT_MAX_BYTES} bytes)"
+                        )
+                    f.write(chunk)
+            tmp.replace(dest)
+            log.info("downloaded attachment chat=%s url=%s -> %s (%d bytes)",
+                     chat_id, url, dest, written)
+            return dest
+    except Exception as e:
+        log.warning("attachment download failed chat=%s url=%s: %s", chat_id, url, e)
+        try:
+            tmp_path = chat_dir / f"{digest}_{raw_name}.tmp"
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+
+def _extract_attachment_urls(message: Any) -> List[str]:
+    """Pull every /root/#file:<url> reference out of a message dict — checks
+    the text field plus any nested chunks the YouGile editor inlines.
+    """
+    urls: List[str] = []
+    if not isinstance(message, dict):
+        return urls
+    text = message.get("text") or ""
+    if isinstance(text, str):
+        urls.extend(FILE_MARKER_RE.findall(text))
+    text_html = message.get("textHtml") or ""
+    if isinstance(text_html, str):
+        urls.extend(FILE_MARKER_RE.findall(text_html))
+    chunks = (((message.get("properties") or {}).get("params") or {}).get("chunks")) or []
+    if isinstance(chunks, list):
+        for c in chunks:
+            if not isinstance(c, dict):
+                continue
+            for v in (c.get("replacement"), (c.get("data") or {}).get("url")):
+                if isinstance(v, str):
+                    urls.extend(FILE_MARKER_RE.findall(v))
+    seen: Set[str] = set()
+    out: List[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _render_attachment_marker(path: Path) -> str:
+    kind = "image" if _is_image(path) else "file"
+    return f"[{kind}: {path}]"
+
+
+def _annotate_text_with_attachments(
+    text: str, url_to_path: Dict[str, Path]
+) -> Tuple[str, List[Path]]:
+    """Replace each /root/#file:<url> in `text` with a `[image:|file: <path>]`
+    marker. Returns the rewritten text and the list of locally-downloaded
+    paths actually referenced.
+    """
+    referenced: List[Path] = []
+
+    def _sub(m: re.Match) -> str:
+        url = m.group(1)
+        path = url_to_path.get(url)
+        if path is None:
+            return m.group(0)
+        referenced.append(path)
+        return _render_attachment_marker(path)
+
+    return FILE_MARKER_RE.sub(_sub, text), referenced
+
+
+def download_message_attachments(
+    message: Any, chat_id: Optional[str]
+) -> Dict[str, Path]:
+    """Download every attachment referenced by `message`. Returns
+    {url: local_path} for everything that succeeded.
+    """
+    if not ATTACHMENTS_ENABLED:
+        return {}
+    out: Dict[str, Path] = {}
+    for url in _extract_attachment_urls(message):
+        path = _download_attachment(url, chat_id)
+        if path is not None:
+            out[url] = path
+    return out
+
+
 # ---------------------------------------------------------------- chat history
 
 def fetch_chat_messages(
@@ -402,10 +569,20 @@ def _format_sender(user_id: Optional[str]) -> str:
     return u.get("email") or u.get("realName") or f"user:{user_id[:8]}"
 
 
-def render_chat_history(messages: List[dict]) -> str:
+def render_chat_history(
+    messages: List[dict], chat_id: Optional[str] = None
+) -> Tuple[str, List[Path]]:
+    """Render messages as text. Downloads any `/root/#file:<url>` attachments
+    to state/attachments/<chatId>/ and rewrites them inline as
+    `[image: <abs-path>]` / `[file: <abs-path>]`. Returns (rendered_text,
+    sorted list of unique local attachment paths referenced anywhere in the
+    rendered history).
+    """
     if not messages:
-        return "(no prior messages)"
-    lines = []
+        return "(no prior messages)", []
+    lines: List[str] = []
+    all_paths: List[Path] = []
+    seen_paths: Set[str] = set()
     for m in messages:
         ts_ms = m.get("id") or 0
         try:
@@ -413,9 +590,22 @@ def render_chat_history(messages: List[dict]) -> str:
         except (OSError, ValueError):
             ts = "?"
         sender = _format_sender(m.get("fromUserId"))
-        text = (m.get("text") or "").replace("\n", " ")
+        text = m.get("text") or ""
+        url_to_path = download_message_attachments(m, chat_id)
+        text, referenced = _annotate_text_with_attachments(text, url_to_path)
+        # Append any attachments that weren't inlined in text (e.g. attached
+        # via chunks only) so the agent still sees them on this line.
+        extras = [p for u, p in url_to_path.items() if p not in referenced]
+        for p in extras:
+            text = f"{text} {_render_attachment_marker(p)}".strip()
+        for p in list(url_to_path.values()):
+            key = str(p)
+            if key not in seen_paths:
+                seen_paths.add(key)
+                all_paths.append(p)
+        text = text.replace("\n", " ")
         lines.append(f"[{ts}] {sender}: {text}")
-    return "\n".join(lines)
+    return "\n".join(lines), all_paths
 
 
 # ---------------------------------------------------------------- spawning
@@ -438,7 +628,13 @@ def _get_chat_lock(chat_id: str) -> threading.Lock:
         return lock
 
 
-def _build_prompt(rule: Rule, payload, chat_history_text: str, is_first_turn: bool) -> str:
+def _build_prompt(
+    rule: Rule,
+    payload,
+    chat_history_text: str,
+    is_first_turn: bool,
+    attachment_paths: List[Path],
+) -> str:
     event_json = json.dumps(payload, ensure_ascii=False, indent=2)
     rendered = rule.prompt_template
     rendered = rendered.replace("{event_json}", event_json)
@@ -451,6 +647,13 @@ def _build_prompt(rule: Rule, payload, chat_history_text: str, is_first_turn: bo
             f"---\nRecent messages in this task chat "
             f"({'first turn — full history' if is_first_turn else 'new since your last reply'}):\n"
             f"{chat_history_text}\n"
+        )
+    if attachment_paths:
+        listed = "\n".join(f"- {_render_attachment_marker(p)}" for p in attachment_paths)
+        rendered = (
+            f"{rendered}\n\n"
+            f"---\nAttachments referenced above are saved locally — open them "
+            f"with your Read tool to view their contents:\n{listed}\n"
         )
     return rendered
 
@@ -539,7 +742,7 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
                 )
                 session_flag = ["--resume", session_id]
 
-            history_text = render_chat_history(history)
+            history_text, attachment_paths = render_chat_history(history, chat_id)
             newest_msg_id = max(
                 [int(m["id"]) for m in history if m.get("id")] + [last_msg_id or 0]
             )
@@ -549,8 +752,21 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
             is_first_turn = True
             newest_msg_id = None
             session_flag = []
+            attachment_paths = []
 
-        prompt = _build_prompt(rule, payload, history_text, is_first_turn)
+        # Webhook can race ahead of /chats/<id>/messages — if the trigger
+        # message itself carries attachments we haven't seen in history yet,
+        # pull them in so the agent doesn't miss the very file that prompted
+        # this run.
+        trigger_message = payload.get("payload") if isinstance(payload, dict) else None
+        trigger_urls = download_message_attachments(trigger_message, chat_id)
+        seen_paths = {str(p) for p in attachment_paths}
+        for p in trigger_urls.values():
+            if str(p) not in seen_paths:
+                seen_paths.add(str(p))
+                attachment_paths.append(p)
+
+        prompt = _build_prompt(rule, payload, history_text, is_first_turn, attachment_paths)
         cmd = [CLAUDE_BIN, *rule.extra_args, *session_flag, "-p", prompt]
 
         ts = datetime.now(timezone.utc).isoformat()
