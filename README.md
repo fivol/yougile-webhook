@@ -241,10 +241,25 @@ filePath = local path).
 
 ## Replying from the agent
 
-YouGile chat does **not** render markdown. The agent prompts already
-instruct claude to reply in plain text and, when richer formatting is
-needed, pass `textHtml` (simple HTML — `<p>`, `<b>`, `<a>`, `<code>`,
-`<br>`) alongside the `text` plain fallback.
+YouGile chat does **not** render markdown but it DOES render the
+`textHtml` field. The agent prompts instruct claude to set BOTH `text`
+(plain-text fallback for notifications/copy-paste/search) AND `textHtml`
+(what the user actually sees) for any non-trivial reply, and to use the
+full HTML toolkit there:
+
+- structure: `<p>`, `<br>`, `<hr>`
+- headings: `<h3>`, `<h4>` (avoid `<h1>`/`<h2>` — too large inside chat)
+- emphasis: `<b>`/`<strong>`, `<i>`/`<em>`, `<u>`, `<s>`, `<mark>`
+- lists: `<ul><li>`, `<ol><li>`
+- code: `<code>` inline, `<pre><code>...</code></pre>` blocks
+- quotes: `<blockquote>`
+- links: `<a href="...">label</a>` — always wrap URLs so they're clickable
+- tables: real `<table>` when a grid is genuinely needed
+
+Markdown syntax (`**bold**`, backticks, `#` headings, `|` pipe-tables,
+`-`/`*` bullet markers) MUST NOT go into `text` — YouGile shows it as
+raw characters. If a particular HTML tag renders as literal text in your
+deployment, drop it from future replies.
 
 ## Reference: real YouGile payloads
 

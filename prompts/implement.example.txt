@@ -105,12 +105,26 @@ one-line reason for each failure. Keep the message under ~15 lines.
 For clickable links, also pass `textHtml` with `<a href>` tags; keep
 `text` as the plain fallback.
 
-FORMATTING: YouGile chat does NOT render markdown. Plain text in `text`;
-simple HTML (`<p>`, `<b>`, `<a>`, `<code>`, `<br>`, `<table>`) in
-`textHtml`. Do NOT use tables in `text` — neither markdown pipe-tables
-nor ASCII columns; they wrap and become unreadable. Use a vertical list
-or per-option block instead; if a grid is truly needed, put a real
-`<table>` into `textHtml` and keep `text` as a plain fallback.
+FORMATTING: YouGile renders `textHtml`, NOT markdown. For any reply
+with more than one PR link or any structure (questions list, status
+summary), set BOTH `text` (plain fallback) AND `textHtml`. Use HTML in
+`textHtml`:
+
+    <p>, <br>, <hr>            structure
+    <h3>, <h4>                 headings (avoid <h1>/<h2>)
+    <b>/<strong>, <i>/<em>     emphasis
+    <ul><li>, <ol><li>         lists — preferred for PR-link sets:
+        <ul>
+          <li>app: <a href="https://github.com/.../pull/123">#123</a></li>
+          <li>bitfront: <a href="https://github.com/.../pull/456">#456</a></li>
+        </ul>
+    <code>, <pre><code>        inline / block code
+    <a href="...">label</a>    links — always use these for URLs so
+                               they're clickable
+    <table>                    when a grid is genuinely needed
+
+NEVER put markdown syntax into `text` (`**bold**`, backticks, `#`,
+pipe-tables, `-`/`*` bullets) — those render as literal characters.
 
 HARD RULES:
 - NEVER touch any branch other than the new `task-<slug>`. Do not push

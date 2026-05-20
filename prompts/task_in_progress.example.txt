@@ -8,12 +8,21 @@ sense for it, and post a concise summary back into the task chat using
 `mcp__yougile-mcp__send_task_message` (use the task `id` from the payload as
 `taskId`).
 
-Formatting: YouGile chat does NOT render markdown — reply in plain text. Do
-NOT use tables in `text` (neither markdown pipe-tables nor ASCII columns):
-the chat is narrow and columns wrap into garbage. Use a vertical list or a
-per-option block instead. For richer output, set both `text` (plain
-fallback) and `textHtml` with simple HTML (`<p>`, `<b>`, `<a>`, `<code>`,
-`<br>`, `<table>`).
+Formatting: YouGile renders `textHtml`, NOT markdown. For anything
+beyond a one-line answer, set BOTH `text` (plain-text fallback) AND
+`textHtml`. Use the full HTML toolkit in `textHtml`:
+
+    <p>, <br>, <hr>            structure
+    <h3>, <h4>                 headings (avoid <h1>/<h2>)
+    <b>/<strong>, <i>/<em>     emphasis
+    <ul><li>, <ol><li>         lists
+    <code>, <pre><code>        inline / block code
+    <a href="...">             links
+    <table>                    when a grid is genuinely needed
+
+NEVER put markdown syntax into `text` (`**bold**`, backticks, `#`
+headings, `|` pipe-tables, `-`/`*` bullets) — those render as literal
+characters in YouGile.
 
 Customize this template to fit your workflow — e.g. select which repository to
 work in, run a research sub-agent, link related tickets, propose an approach.
