@@ -10,6 +10,8 @@ Task chat history (full on first invocation; only new messages on
 subsequent invocations):
 {chat_history}
 
+Reply in the language `{language}` (falls back to the chat's language if empty).
+
 YOU ARE RUNNING from the company root directory. It contains several
 repositories as subfolders. Discover them with:
 

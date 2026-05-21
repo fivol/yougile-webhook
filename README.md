@@ -167,9 +167,12 @@ that `@Agent !implement ...` routes to implement, not to chat-mention.
 | `column_names` | Match `payload.columnId` against the resolved UUIDs of these column titles. |
 | `column_transition_only` | Default `true`. When `column_names` is set, only fire on actual transitions (`prevData.columnId != payload.columnId`). |
 | `session_per_chat` | Default `true`. Runs claude with `--session-id <chatId>` first time, `--resume <chatId>` after. |
-| `prompt_file` | Path to a text file used as the prompt. `{event_json}`, `{chat_history}`, `{first_turn}`, and `{formatting}` (see below) are substituted. |
+| `prompt_file` | Path to a text file used as the prompt. `{event_json}`, `{chat_history}`, `{first_turn}`, `{formatting}`, and `{language}` are substituted. |
 | `workdir` | Override `CLAUDE_WORKDIR` for this rule. |
 | `extra_args` | Override `CLAUDE_EXTRA_ARGS` for this rule. |
+| `ack_message` | Optional short plain-text reply posted into the task chat the moment claude is successfully spawned (e.g. `"Взял в работу..."`). Fires only after the subprocess actually started, so a failed launch never leaves an orphan ack. Opt-in — omitted = no ack. |
+| `ack_message_html` | Optional HTML companion to `ack_message`. Usually unneeded — keep acks short and plain. |
+| `language` | Output language hint, substituted into prompts as `{language}` (e.g. `"ru"`). Lets you declare the reply language once in the rules file instead of repeating it in every prompt. |
 
 ## Configure runtime — `.env`
 

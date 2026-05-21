@@ -140,6 +140,13 @@ class Rule:
     column_transition_only: bool = True
     # Continue the same claude session across re-mentions on the same chat.
     session_per_chat: bool = True
+    # Short status reply posted into the task chat the moment this rule fires,
+    # before claude finishes. Plain text; optional HTML companion.
+    ack_message: Optional[str] = None
+    ack_message_html: Optional[str] = None
+    # Output language hint, substituted into prompts as {language}. Lets the
+    # rules file declare "ru" once instead of repeating it in every prompt.
+    language: Optional[str] = None
     allowed_sender_ids: Set[str] = field(default_factory=set)
     column_ids: Set[str] = field(default_factory=set)
 
@@ -174,6 +181,9 @@ def load_rules(path: Path) -> List[Rule]:
                 ),
                 column_transition_only=bool(raw.get("column_transition_only", True)),
                 session_per_chat=bool(raw.get("session_per_chat", True)),
+                ack_message=(raw.get("ack_message") or None),
+                ack_message_html=(raw.get("ack_message_html") or None),
+                language=(raw.get("language") or None),
             )
         )
     return rules
@@ -194,6 +204,41 @@ def _api_get(path: str) -> Optional[dict]:
     except (urllib.error.URLError, json.JSONDecodeError):
         log.exception("API GET failed: %s", path)
         return None
+
+
+def _api_post(path: str, body: dict) -> Optional[dict]:
+    if not YOUGILE_API_KEY:
+        return None
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{YOUGILE_API_BASE}{path}",
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {YOUGILE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except (urllib.error.URLError, json.JSONDecodeError):
+        log.exception("API POST failed: %s", path)
+        return None
+
+
+def send_chat_message(chat_id: str, text: str, text_html: Optional[str] = None) -> bool:
+    """Post a chat message into a YouGile task chat. Returns True on success.
+    Used for fast ack replies sent directly from the webhook handler — separate
+    from messages the spawned claude posts via mcp__yougile-mcp__send_task_message.
+    """
+    if not chat_id or not text:
+        return False
+    body: Dict[str, Any] = {"text": text}
+    if text_html:
+        body["textHtml"] = text_html
+    return _api_post(f"/chats/{chat_id}/messages", body) is not None
 
 
 USERS_BY_ID: Dict[str, Dict[str, Any]] = {}
@@ -681,6 +726,7 @@ def _build_prompt(
     rendered = rendered.replace("{chat_history}", chat_history_text)
     rendered = rendered.replace("{first_turn}", "true" if is_first_turn else "false")
     rendered = rendered.replace("{formatting}", FORMATTING_BLOCK)
+    rendered = rendered.replace("{language}", rule.language or "")
     # If the template doesn't reference {formatting} explicitly, append it so
     # every spawned agent still sees the rules — guarantees consistent output.
     if "{formatting}" not in rule.prompt_template and FORMATTING_BLOCK:
@@ -893,6 +939,26 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
             if chat_lock is not None:
                 chat_lock.release()
             return False, "spawn-failed"
+
+        # Fast ack — let the user see "I'm on it" without waiting for claude
+        # to finish. Only fire AFTER claude was actually spawned, so a failed
+        # launch never leaves an orphan "taking it" message in the chat. In a
+        # thread so urllib doesn't add latency to the webhook response.
+        if chat_id and rule.ack_message:
+            ack_chat_id = chat_id
+            ack_text = rule.ack_message
+            ack_html = rule.ack_message_html
+            rule_name = rule.name
+
+            def _send_ack() -> None:
+                try:
+                    ok = send_chat_message(ack_chat_id, ack_text, ack_html)
+                    log.info("rule %s: ack sent chat=%s ok=%s", rule_name, ack_chat_id, ok)
+                except Exception:
+                    log.exception("rule %s: ack send failed chat=%s", rule_name, ack_chat_id)
+
+            threading.Thread(target=_send_ack, daemon=True).start()
+
         return True, "ok"
     except Exception:
         log.exception("rule %s: spawn flow failed", rule.name)

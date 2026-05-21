@@ -13,6 +13,8 @@ Read the chat, treat the latest mention as the user's request, do the work,
 and reply with `mcp__yougile-mcp__send_task_message` using `payload.chatId`
 as `taskId`.
 
+Reply in the language `{language}` (falls back to the chat's language if empty).
+
 Attachments dropped into chat show up in the history as `[image: /abs/path]`
 or `[file: /abs/path]` — open them with your Read tool to view (images
 render visually). Send files back with `mcp__yougile-mcp__send_task_file`.

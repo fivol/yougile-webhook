@@ -23,6 +23,16 @@
 #                           agent "remembers" prior turns. Set to false to make each invocation
 #                           stateless. Chat history is also fetched from YouGile and injected via
 #                           the {chat_history} placeholder in the prompt template.
+#   ack_message             optional plain-text reply posted into the task chat the moment this
+#                           rule fires — before claude finishes. Use a short status like
+#                           "Взял в работу..." so the user sees the agent is working. Opt-in:
+#                           omitted = no ack. Sent via the YouGile API key user (not the spawned
+#                           claude), so it doesn't re-trigger any sender-filtered rules.
+#   ack_message_html        optional HTML companion to ack_message (rarely needed — keep acks
+#                           short, plain text usually wins).
+#   language                output language hint, substituted into prompts as {language}. Lets
+#                           you set "ru" once in the rules file instead of repeating it in every
+#                           prompt template.
 
 # Implement-task command: someone writes "!implement ..." in a task chat.
 # Agent reads the task, optionally asks clarifying questions, otherwise
@@ -37,6 +47,8 @@ events = ["chat_message-created"]
 pattern = "!implement\\b"
 allowed_sender_emails = ["you@example.com"]
 prompt_file = "prompts/implement.txt"
+language = "en"
+ack_message = "On it — starting the implementation..."
 
 # Chat-mention bot: someone writes "@Agent ..." in a task chat.
 [[rules]]
@@ -46,6 +58,8 @@ events = ["chat_message-created"]
 pattern = "@Agent"
 allowed_sender_emails = ["you@example.com"]
 prompt_file = "prompts/chat_mention.txt"
+language = "en"
+ack_message = "On it..."
 
 # Auto-kickoff: a task appears in (or is moved into) the "In progress" column.
 # Use this to spawn a short research/proposal agent that posts a summary
