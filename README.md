@@ -167,7 +167,7 @@ that `@Agent !implement ...` routes to implement, not to chat-mention.
 | `column_names` | Match `payload.columnId` against the resolved UUIDs of these column titles. |
 | `column_transition_only` | Default `true`. When `column_names` is set, only fire on actual transitions (`prevData.columnId != payload.columnId`). |
 | `session_per_chat` | Default `true`. Runs claude with `--session-id <chatId>` first time, `--resume <chatId>` after. |
-| `prompt_file` | Path to a text file used as the prompt. `{event_json}` and `{chat_history}` are substituted. |
+| `prompt_file` | Path to a text file used as the prompt. `{event_json}`, `{chat_history}`, `{first_turn}`, and `{formatting}` (see below) are substituted. |
 | `workdir` | Override `CLAUDE_WORKDIR` for this rule. |
 | `extra_args` | Override `CLAUDE_EXTRA_ARGS` for this rule. |
 
@@ -177,6 +177,7 @@ that `@Agent !implement ...` routes to implement, not to chat-mention.
 |---|---|
 | `YOUGILE_API_KEY` | Required. Used by `register_webhook.py` and for resolving emails/columns at startup. |
 | `YOUGILE_API_BASE` | Default `https://yougile.com/api-v2`. |
+| `YOUGILE_FILE_BASE_URL` | Origin used to resolve schemeless `/user-data/...` attachment URLs that YouGile inlines in chat messages. Default: derived from `YOUGILE_API_BASE` (e.g. `https://yougile.com`). |
 | `YOUGILE_WEBHOOK_URL` | Public URL of this receiver. |
 | `YOUGILE_WEBHOOK_EVENT` | Event regex for the YouGile subscription. Keep broad (`(chat_message\|task)-.*` or `.*`). |
 | `HOST` / `PORT` | Bind address (default `127.0.0.1:9100`). |
@@ -184,6 +185,8 @@ that `@Agent !implement ...` routes to implement, not to chat-mention.
 | `CLAUDE_WORKDIR` | Default workdir for spawned claude processes. |
 | `CLAUDE_EXTRA_ARGS` | Default CLI args. |
 | `CLAUDE_MAX_CONCURRENT` | Hard cap on concurrent claude processes. Excess events are dropped. |
+| `CLAUDE_API_RETRIES` | Total attempts (incl. the first) when the spawned claude exits non-zero AND its output matches a transient Anthropic API error (`API Error: 5xx`, `Overloaded`, `overloaded_error`, `rate_limit_error`). Default `3`. |
+| `CLAUDE_RETRY_DELAYS` | Comma-separated backoff in seconds between retries. Default `30,120,300`. The last value repeats if there are more retries than entries. |
 | `RULES_FILE` | Default `rules.toml`. |
 | `SENDER_KEYS` | Payload keys checked (in order, top-level and nested) for the sender's user UUID. |
 | `COLUMN_KEYS` | Same, for column UUIDs. |
@@ -239,27 +242,33 @@ To send files back to chat, the prompts point the agent at
 `mcp__yougile-mcp__send_task_file` (taskId = `payload.chatId`,
 filePath = local path).
 
-## Replying from the agent
+## Replying from the agent — shared formatting
 
-YouGile chat does **not** render markdown but it DOES render the
-`textHtml` field. The agent prompts instruct claude to set BOTH `text`
-(plain-text fallback for notifications/copy-paste/search) AND `textHtml`
-(what the user actually sees) for any non-trivial reply, and to use the
-full HTML toolkit there:
+Every spawned agent should produce visually consistent messages — same
+density, same heading discipline, same link style. The single source of
+truth is **`prompts/_formatting.txt`**: it's loaded once at startup and
+substituted into every prompt that contains `{formatting}` (and appended
+as a fallback to prompts that don't). Override with `FORMATTING_FILE` env
+var.
 
-- structure: `<p>`, `<br>`, `<hr>`
-- headings: `<h3>`, `<h4>` (avoid `<h1>`/`<h2>` — too large inside chat)
-- emphasis: `<b>`/`<strong>`, `<i>`/`<em>`, `<u>`, `<s>`, `<mark>`
-- lists: `<ul><li>`, `<ol><li>`
-- code: `<code>` inline, `<pre><code>...</code></pre>` blocks
-- quotes: `<blockquote>`
-- links: `<a href="...">label</a>` — always wrap URLs so they're clickable
-- tables: real `<table>` when a grid is genuinely needed
+Edit `prompts/_formatting.txt` once and every rule picks up the change
+on next restart — no per-prompt copy-paste. The shipped file enforces:
 
-Markdown syntax (`**bold**`, backticks, `#` headings, `|` pipe-tables,
-`-`/`*` bullet markers) MUST NOT go into `text` — YouGile shows it as
-raw characters. If a particular HTML tag renders as literal text in your
-deployment, drop it from future replies.
+- `textHtml` is what YouGile actually renders; `text` is the plain
+  fallback. Set both for any non-trivial reply.
+- No `<h1>`/`<h2>` — they render enormous in chat. Use `<h4>` for the
+  top heading of a multi-section message, `<b>` for sub-section labels.
+- One blank line maximum between sections; no stacked `<br><br>` or
+  empty `<p></p>` for spacing.
+- One `<p>` per paragraph, no `<p>` inside `<li>`, no blank lines
+  between `<li>` items.
+- Always wrap URLs in `<a href="...">label</a>` with a human-readable
+  label.
+- Never put markdown (`**bold**`, backticks, `#`, `|` tables, `-`/`*`
+  bullets) into `text` — YouGile shows it as raw characters.
+
+If a particular HTML tag renders as literal text in your deployment,
+drop it from `prompts/_formatting.txt`.
 
 ## Reference: real YouGile payloads
 

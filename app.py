@@ -9,6 +9,7 @@ import re
 import shlex
 import subprocess
 import threading
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -51,6 +52,14 @@ log = logging.getLogger("yougile-webhook")
 
 YOUGILE_API_KEY = os.environ.get("YOUGILE_API_KEY", "")
 YOUGILE_API_BASE = os.environ.get("YOUGILE_API_BASE", "https://yougile.com/api-v2").rstrip("/")
+# Host used to resolve schemeless `/user-data/...` file URLs that YouGile
+# inlines as `/root/#file:/user-data/...` in chat messages. Defaults to the
+# YOUGILE_API_BASE origin (strip the `/api-v2` path).
+_default_file_host = urllib.parse.urlparse(YOUGILE_API_BASE)
+YOUGILE_FILE_BASE_URL = os.environ.get(
+    "YOUGILE_FILE_BASE_URL",
+    f"{_default_file_host.scheme}://{_default_file_host.netloc}" if _default_file_host.netloc else "",
+).rstrip("/")
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_DEFAULT_WORKDIR = os.environ.get("CLAUDE_WORKDIR") or str(ROOT)
@@ -58,6 +67,19 @@ CLAUDE_DEFAULT_EXTRA_ARGS = shlex.split(
     os.environ.get("CLAUDE_EXTRA_ARGS", "--dangerously-skip-permissions")
 )
 CLAUDE_MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "2"))
+
+# Retry policy for transient API errors. The Anthropic API surfaces overload /
+# rate-limit failures as 5xx; the claude CLI prints them to stdout and exits
+# with a non-zero code. We re-spawn the same command after a backoff.
+CLAUDE_API_RETRIES = int(os.environ.get("CLAUDE_API_RETRIES", "3"))
+CLAUDE_RETRY_DELAYS = [
+    int(x) for x in os.environ.get("CLAUDE_RETRY_DELAYS", "30,120,300").split(",")
+    if x.strip()
+] or [30, 120, 300]
+CLAUDE_RETRY_PATTERN = re.compile(
+    r"API Error:\s*5\d\d|overloaded_error|rate_limit_error|\bOverloaded\b",
+    re.IGNORECASE,
+)
 
 SENDER_KEYS = [
     k.strip()
@@ -87,6 +109,17 @@ ATTACHMENT_MAX_BYTES = int(os.environ.get("ATTACHMENT_MAX_BYTES", str(25 * 1024 
 ATTACHMENT_TIMEOUT_SECONDS = int(os.environ.get("ATTACHMENT_TIMEOUT_SECONDS", "30"))
 
 RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
+
+# Shared formatting guidance, substituted into every prompt via {formatting}.
+# Single source of truth so all spawned agents post visually-consistent messages
+# into YouGile chats. Optional file — if it's missing the placeholder just gets
+# stripped, so existing prompts that don't use it keep working.
+_FORMATTING_FILE = ROOT / os.environ.get("FORMATTING_FILE", "prompts/_formatting.txt")
+FORMATTING_BLOCK = (
+    _FORMATTING_FILE.read_text(encoding="utf-8").strip()
+    if _FORMATTING_FILE.exists()
+    else ""
+)
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
@@ -396,8 +429,15 @@ def _download_attachment(url: str, chat_id: Optional[str]) -> Optional[Path]:
     if not ATTACHMENTS_ENABLED:
         return None
     parsed = urllib.parse.urlparse(url)
+    # YouGile inlines uploaded files as `/root/#file:/user-data/...` — the
+    # extracted URL is a server-relative path. Resolve it against the YouGile
+    # origin so the download actually fires.
     if parsed.scheme not in ("http", "https"):
-        return None
+        if YOUGILE_FILE_BASE_URL and url.startswith("/"):
+            url = f"{YOUGILE_FILE_BASE_URL}{url}"
+            parsed = urllib.parse.urlparse(url)
+        else:
+            return None
     digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
     raw_name = _safe_filename(Path(parsed.path).name or digest)
     chat_dir = _attachment_dir(chat_id)
@@ -640,6 +680,11 @@ def _build_prompt(
     rendered = rendered.replace("{event_json}", event_json)
     rendered = rendered.replace("{chat_history}", chat_history_text)
     rendered = rendered.replace("{first_turn}", "true" if is_first_turn else "false")
+    rendered = rendered.replace("{formatting}", FORMATTING_BLOCK)
+    # If the template doesn't reference {formatting} explicitly, append it so
+    # every spawned agent still sees the rules — guarantees consistent output.
+    if "{formatting}" not in rule.prompt_template and FORMATTING_BLOCK:
+        rendered = f"{rendered}\n\n---\n{FORMATTING_BLOCK}\n"
     # If template uses no placeholder for history, append it so the agent still sees it.
     if "{chat_history}" not in rule.prompt_template and chat_history_text:
         rendered = (
@@ -658,10 +703,23 @@ def _build_prompt(
     return rendered
 
 
-def _spawn_subprocess(rule: Rule, cmd: List[str], header: str, on_exit) -> Optional[subprocess.Popen]:
+def _spawn_subprocess(
+    rule: Rule,
+    cmd: List[str],
+    header: str,
+    on_exit,
+    attempt: int = 1,
+) -> Optional[subprocess.Popen]:
     log_fp = CLAUDE_LOG.open("a", encoding="utf-8")
-    log_fp.write(header)
+    if attempt == 1:
+        log_fp.write(header)
+    else:
+        log_fp.write(
+            f"\n--- retry attempt {attempt}/{CLAUDE_API_RETRIES} "
+            f"ts={datetime.now(timezone.utc).isoformat()} ---\n"
+        )
     log_fp.flush()
+    output_start = log_fp.tell()
     try:
         proc = subprocess.Popen(
             cmd,
@@ -672,22 +730,52 @@ def _spawn_subprocess(rule: Rule, cmd: List[str], header: str, on_exit) -> Optio
             start_new_session=True,
         )
     except Exception:
-        log.exception("rule %s: failed to spawn claude", rule.name)
+        log.exception("rule %s: failed to spawn claude (attempt %d)", rule.name, attempt)
         log_fp.close()
+        # On first-attempt spawn failure the caller cleans up (chat_lock etc.).
+        # On retry there is no caller waiting — make sure on_exit still fires.
+        if attempt > 1:
+            try:
+                on_exit(-1)
+            except Exception:
+                log.exception("rule %s: on_exit hook failed", rule.name)
         return None
 
     pid = proc.pid
     with _active_lock:
         _active_procs.add(pid)
-    log.info("rule %s: claude spawned pid=%s cmd=%s", rule.name, pid, cmd[:3] + ["..."])
+    log.info(
+        "rule %s: claude spawned pid=%s attempt=%d cmd=%s",
+        rule.name, pid, attempt, cmd[:3] + ["..."],
+    )
 
     def _reap():
         rc = proc.wait()
         with _active_lock:
             _active_procs.discard(pid)
-        log_fp.write(f"\n--- exit rc={rc} ts={datetime.now(timezone.utc).isoformat()} ---\n")
+        log_fp.write(
+            f"\n--- exit rc={rc} attempt={attempt} "
+            f"ts={datetime.now(timezone.utc).isoformat()} ---\n"
+        )
+        log_fp.flush()
+        end_pos = log_fp.tell()
         log_fp.close()
-        log.info("rule %s: claude pid=%s rc=%s", rule.name, pid, rc)
+        log.info("rule %s: claude pid=%s attempt=%d rc=%s", rule.name, pid, attempt, rc)
+
+        if rc != 0 and attempt < CLAUDE_API_RETRIES and _output_is_transient(output_start, end_pos):
+            delay = CLAUDE_RETRY_DELAYS[min(attempt - 1, len(CLAUDE_RETRY_DELAYS) - 1)]
+            log.warning(
+                "rule %s: transient API error (rc=%s) — retrying in %ds (attempt %d/%d)",
+                rule.name, rc, delay, attempt + 1, CLAUDE_API_RETRIES,
+            )
+
+            def _delayed_retry():
+                time.sleep(delay)
+                _spawn_subprocess(rule, cmd, header, on_exit, attempt=attempt + 1)
+
+            threading.Thread(target=_delayed_retry, daemon=True).start()
+            return
+
         try:
             on_exit(rc)
         except Exception:
@@ -695,6 +783,21 @@ def _spawn_subprocess(rule: Rule, cmd: List[str], header: str, on_exit) -> Optio
 
     threading.Thread(target=_reap, daemon=True).start()
     return proc
+
+
+def _output_is_transient(start: int, end: int) -> bool:
+    """Read this attempt's slice of CLAUDE_LOG and check for an Anthropic 5xx /
+    overload / rate-limit signature."""
+    if end <= start:
+        return False
+    try:
+        with CLAUDE_LOG.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(start)
+            output = f.read(end - start)
+    except Exception:
+        log.exception("failed to read claude.log slice for retry decision")
+        return False
+    return bool(CLAUDE_RETRY_PATTERN.search(output))
 
 
 def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:

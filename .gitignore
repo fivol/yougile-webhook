@@ -5,7 +5,12 @@ state/
 __pycache__/
 *.pyc
 
-# user-specific rules + prompt files (templates with .example.* are committed)
+# user-specific rules + prompt files (templates with .example.* are committed;
+# _formatting.txt is engine-shared boilerplate without secrets, also committed)
 rules.toml
 prompts/*.txt
 !prompts/*.example.txt
+!prompts/_formatting.txt
+
+# local Claude Code instructions (per-checkout, not for the public repo)
+CLAUDE.local.md

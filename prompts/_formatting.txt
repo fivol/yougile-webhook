@@ -1,0 +1,65 @@
+FORMATTING — read carefully. Applies to EVERY message you post into a
+YouGile task chat from this system. All messages from this agent should
+look like the same author wrote them — same density, same heading
+discipline, same link style. Do not invent your own visual style.
+
+CHANNEL RULES
+
+- YouGile chat does NOT render markdown. It DOES render the `textHtml`
+  field. For any reply longer than one short sentence, set BOTH `text`
+  (plain prose fallback for notifications/search/copy) AND `textHtml`
+  (what the user actually sees).
+- NEVER put markdown into `text` (`**bold**`, backticks, `#` headings,
+  `|` pipe-tables, `-`/`*` bullet markers). They render as literal
+  characters in many YouGile clients.
+- `text` should be plain prose: short paragraphs separated by single
+  blank lines. No HTML in `text`.
+
+DENSITY — this is a chat message, not a blog post
+
+- NO <h1>. NO <h2>. They render enormous in the YouGile chat panel and
+  look broken on mobile. This rule is non-negotiable.
+- Use <h4> for the top heading of a multi-section message. Use <b>...</b>
+  (inside a <p>) for a sub-section label inside a single block.
+- If the message is under ~80 words, use NO headings at all — just
+  paragraphs.
+- One blank line maximum between sections. NEVER stack <br><br> or empty
+  <p></p> to create vertical space.
+- One <p> per paragraph. Do NOT wrap every line in its own <p> and do
+  NOT use <p> inside <li>.
+- Lists with one item are not lists — inline them in prose.
+- Lists with multiple items: <ul><li>…</li><li>…</li></ul> with no
+  blank lines or <br> between items, and no nested <p>.
+- Aim for the whole message to fit one mobile screen. If you need more,
+  consider whether half of it belongs in a follow-up reply or a PR
+  description instead.
+
+HTML TOOLKIT — use only these tags (drop any tag from future replies if
+you observe it rendering as raw text in this deployment)
+
+    structure : <p>, <br>, <hr>            (<br> sparingly)
+    headings  : <h4>, <h3>                 (NEVER <h1>/<h2>)
+    emphasis  : <b>/<strong>, <i>/<em>, <u>, <s>, <mark>
+    lists     : <ul><li>, <ol><li>         (tight, no nested <p>/<br>)
+    code      : <code> inline,
+                <pre><code>…</code></pre> blocks
+    quotes    : <blockquote>               (sparingly)
+    links     : <a href="…">label</a>      (always wrap raw URLs)
+    tables    : <table> only when a grid is genuinely needed
+
+LINKS
+
+- Every URL in `textHtml` must be wrapped in <a href="…">label</a> so it
+  is clickable. The label should be human-readable (`#123`, `PR — fix
+  X`, repo name) not the raw URL.
+- For lists of PR links, use a compact <ul>:
+      <ul>
+        <li>app: <a href="…">#123 — short title</a></li>
+        <li>infra: <a href="…">#456 — short title</a></li>
+      </ul>
+
+EXAMPLES — short reply (one sentence): plain `text` only is fine,
+`textHtml` not needed.
+
+EXAMPLES — structured reply: <h4> title, one <p> per paragraph, one
+<ul> of bullets, no <br>, no <h1>/<h2>, no markdown.
