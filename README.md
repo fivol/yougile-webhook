@@ -191,6 +191,7 @@ that `@Agent !implement ...` routes to implement, not to chat-mention.
 | `CLAUDE_API_RETRIES` | Total attempts (incl. the first) when the spawned claude exits non-zero AND its output matches a transient Anthropic API error (`API Error: 5xx`, `Overloaded`, `overloaded_error`, `rate_limit_error`). Default `3`. |
 | `CLAUDE_RETRY_DELAYS` | Comma-separated backoff in seconds between retries. Default `30,120,300`. The last value repeats if there are more retries than entries. |
 | `RULES_FILE` | Default `rules.toml`. |
+| `WEBHOOK_ENSURE_INTERVAL_SECONDS` | How often the service sweeps its own YouGile subscription and revives it if YouGile auto-disabled it after a streak of failed deliveries (e.g. while we were down). Default `900` (15 min). The same check runs once at startup. Set to a large value to disable the timer; the startup check still fires. |
 | `SENDER_KEYS` | Payload keys checked (in order, top-level and nested) for the sender's user UUID. |
 | `COLUMN_KEYS` | Same, for column UUIDs. |
 | `CHAT_ID_KEYS` | Same, for the task/chat UUID used as the claude session id. |

@@ -110,6 +110,13 @@ ATTACHMENT_TIMEOUT_SECONDS = int(os.environ.get("ATTACHMENT_TIMEOUT_SECONDS", "3
 
 RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
 
+# YouGile auto-disables a webhook subscription after enough failed deliveries
+# (e.g. while we were down or the tunnel was unreachable). Sweep our subscriptions
+# at startup and on a timer so a temporary outage doesn't permanently silence us.
+WEBHOOK_URL = os.environ.get("YOUGILE_WEBHOOK_URL", "").strip()
+WEBHOOK_EVENT_REGEX = os.environ.get("YOUGILE_WEBHOOK_EVENT", "(chat_message|task)-.*").strip()
+WEBHOOK_ENSURE_INTERVAL_SECONDS = int(os.environ.get("WEBHOOK_ENSURE_INTERVAL_SECONDS", "900"))
+
 # Shared formatting guidance, substituted into every prompt via {formatting}.
 # Single source of truth so all spawned agents post visually-consistent messages
 # into YouGile chats. Optional file — if it's missing the placeholder just gets
@@ -228,6 +235,82 @@ def _api_post(path: str, body: dict) -> Optional[dict]:
         return None
 
 
+def _api_put(path: str, body: dict) -> Optional[dict]:
+    if not YOUGILE_API_KEY:
+        return None
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{YOUGILE_API_BASE}{path}",
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {YOUGILE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except (urllib.error.URLError, json.JSONDecodeError):
+        log.exception("API PUT failed: %s", path)
+        return None
+
+
+def _list_our_webhooks() -> List[dict]:
+    raw = _api_get("/webhooks")
+    if raw is None:
+        return []
+    subs = raw if isinstance(raw, list) else (raw.get("content") or raw.get("data") or [])
+    return [s for s in subs if isinstance(s, dict) and s.get("url") == WEBHOOK_URL]
+
+
+def ensure_webhook_subscription() -> bool:
+    """Make sure a healthy YouGile webhook subscription points at our URL.
+
+    Run at startup and on a timer (WEBHOOK_ENSURE_INTERVAL_SECONDS). YouGile
+    disables a subscription after a streak of failed deliveries — once we are
+    back up the subscription stays dead unless we touch it. We try to flip
+    `disabled` back to false (preserves the id and YouGile-side counters);
+    if that doesn't take, we delete and recreate. Returns True if a healthy
+    subscription is in place after the call.
+    """
+    if not (WEBHOOK_URL and YOUGILE_API_KEY):
+        return False
+    ours = _list_our_webhooks()
+    if any(not s.get("disabled") for s in ours):
+        return True
+    for s in ours:
+        sub_id = s.get("id")
+        if sub_id:
+            _api_put(f"/webhooks/{sub_id}", {"disabled": False})
+    ours = _list_our_webhooks()
+    if any(not s.get("disabled") for s in ours):
+        log.info("ensure_webhook: re-enabled existing subscription for %s", WEBHOOK_URL)
+        return True
+    for s in ours:
+        sub_id = s.get("id")
+        if sub_id:
+            _api_put(f"/webhooks/{sub_id}", {"deleted": True})
+            log.info("ensure_webhook: removed dead subscription %s", sub_id)
+    created = _api_post("/webhooks", {"url": WEBHOOK_URL, "event": WEBHOOK_EVENT_REGEX})
+    if created:
+        log.info("ensure_webhook: created fresh subscription for %s", WEBHOOK_URL)
+        return True
+    log.warning("ensure_webhook: failed to provision subscription for %s", WEBHOOK_URL)
+    return False
+
+
+def _webhook_watcher() -> None:
+    """Background daemon: keep the YouGile subscription healthy."""
+    while True:
+        time.sleep(WEBHOOK_ENSURE_INTERVAL_SECONDS)
+        try:
+            ensure_webhook_subscription()
+        except Exception:
+            log.exception("ensure_webhook: watcher cycle failed")
+
+
 def send_chat_message(chat_id: str, text: str, text_html: Optional[str] = None) -> bool:
     """Post a chat message into a YouGile task chat. Returns True on success.
     Used for fast ack replies sent directly from the webhook handler — separate
@@ -289,6 +372,12 @@ def resolve_rules(rules: List[Rule]) -> None:
 refresh_directories()
 RULES: List[Rule] = load_rules(RULES_FILE)
 resolve_rules(RULES)
+
+if WEBHOOK_URL:
+    ensure_webhook_subscription()
+    threading.Thread(target=_webhook_watcher, daemon=True).start()
+else:
+    log.warning("YOUGILE_WEBHOOK_URL not set — skipping subscription self-heal")
 
 
 # ---------------------------------------------------------------- payload extraction
@@ -984,12 +1073,22 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
 
 @app.get("/healthz")
 def healthz():
+    subs = _list_our_webhooks() if WEBHOOK_URL else []
     return {
         "ok": True,
         "claude_bin": CLAUDE_BIN,
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,
         "active_claude_procs": len(_active_procs),
         "tracked_chats": list_known_chats(),
+        "webhook_subscriptions": [
+            {
+                "id": s.get("id"),
+                "disabled": bool(s.get("disabled")),
+                "failures_since_last_success": s.get("failuresSinceLastSuccess"),
+                "last_success": s.get("lastSuccess"),
+            }
+            for s in subs
+        ],
         "rules": [
             {
                 "name": r.name,
