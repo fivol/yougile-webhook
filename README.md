@@ -170,8 +170,8 @@ that `@Agent !implement ...` routes to implement, not to chat-mention.
 | `prompt_file` | Path to a text file used as the prompt. `{event_json}`, `{chat_history}`, `{first_turn}`, `{formatting}`, and `{language}` are substituted. |
 | `workdir` | Override `CLAUDE_WORKDIR` for this rule. |
 | `extra_args` | Override `CLAUDE_EXTRA_ARGS` for this rule. |
-| `ack_message` | Optional short plain-text reply posted into the task chat the moment claude is successfully spawned (e.g. `"Взял в работу..."`). Fires only after the subprocess actually started, so a failed launch never leaves an orphan ack. Opt-in — omitted = no ack. |
-| `ack_message_html` | Optional HTML companion to `ack_message`. Usually unneeded — keep acks short and plain. |
+| `ack_message` | Optional short plain-text reply posted into the task chat the moment claude is successfully spawned (e.g. `"Взял в работу..."`). The session id (== chat/task UUID) is auto-appended on its own line so you can copy it from the task and continue the same session locally with `claude --resume <id>`. Fires only after the subprocess actually started, so a failed launch never leaves an orphan ack. Opt-in — omitted = no ack. |
+| `ack_message_html` | Optional HTML companion to `ack_message`. Usually unneeded — the session id line is appended automatically with `<code>` wrapping for clean copy. |
 | `language` | Output language hint, substituted into prompts as `{language}` (e.g. `"ru"`). Lets you declare the reply language once in the rules file instead of repeating it in every prompt. |
 
 ## Configure runtime — `.env`

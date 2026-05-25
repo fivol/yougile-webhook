@@ -942,12 +942,25 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
 
         # Fast ack — let the user see "I'm on it" without waiting for claude
         # to finish. Only fire AFTER claude was actually spawned, so a failed
-        # launch never leaves an orphan "taking it" message in the chat. In a
-        # thread so urllib doesn't add latency to the webhook response.
-        if chat_id and rule.ack_message:
+        # launch never leaves an orphan "taking it" message in the chat. The
+        # session id (== chat_id) is appended so the user can copy it from the
+        # task and resume the same session from a terminal:
+        #     claude --resume <id>
+        # In a thread so urllib doesn't add latency to the webhook response.
+        if chat_id and rule.ack_message and session_id:
             ack_chat_id = chat_id
-            ack_text = rule.ack_message
-            ack_html = rule.ack_message_html
+            ack_session = session_id
+            ack_text = f"{rule.ack_message}\n\nsession: {ack_session}"
+            if rule.ack_message_html:
+                ack_html = (
+                    f"{rule.ack_message_html}"
+                    f"<p>session: <code>{ack_session}</code></p>"
+                )
+            else:
+                ack_html = (
+                    f"<p>{rule.ack_message}</p>"
+                    f"<p>session: <code>{ack_session}</code></p>"
+                )
             rule_name = rule.name
 
             def _send_ack() -> None:
