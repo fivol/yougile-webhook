@@ -573,6 +573,15 @@ def _download_attachment(url: str, chat_id: Optional[str]) -> Optional[Path]:
     """
     if not ATTACHMENTS_ENABLED:
         return None
+    # YouGile sometimes inlines preview thumbnails with the query string
+    # double-encoded into the path component, e.g.
+    #   `.../image.png%3Fpreviews%5B%5D%3D-256-preview%40256x128`
+    # i.e. `image.png?previews[]=-256-preview@256x128` re-encoded as a
+    # literal filename. The server treats that as an unknown file and
+    # 404s. Decode once and drop the (now real) query string so we fetch
+    # the original full-resolution file instead.
+    if "%3F" in url or "%3f" in url:
+        url = urllib.parse.unquote(url).split("?", 1)[0]
     parsed = urllib.parse.urlparse(url)
     # YouGile inlines uploaded files as `/root/#file:/user-data/...` — the
     # extracted URL is a server-relative path. Resolve it against the YouGile
