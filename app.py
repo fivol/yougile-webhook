@@ -593,7 +593,14 @@ def _download_attachment(url: str, chat_id: Optional[str]) -> Optional[Path]:
         else:
             return None
     digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
-    raw_name = _safe_filename(Path(parsed.path).name or digest)
+    # Decode URL-escaped basename ONCE before sanitizing — otherwise paths
+    # like `%D0%A1%D0%BD…` (Cyrillic filename) blow up to 80+ chars of
+    # underscores and the `.png` extension falls off in truncation. After
+    # `unquote` we get the literal filename (Cyrillic or otherwise) and
+    # `_safe_filename` replaces only the non-ASCII chars, leaving the
+    # extension and any date markers intact.
+    raw_basename = urllib.parse.unquote(Path(parsed.path).name) or digest
+    raw_name = _safe_filename(raw_basename)
     chat_dir = _attachment_dir(chat_id)
 
     # If we already downloaded this URL, find the matching file by prefix.
