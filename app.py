@@ -145,6 +145,12 @@ class Rule:
     workdir: str
     extra_args: List[str]
     column_transition_only: bool = True
+    # Skip this rule if a claude session has already been started for the
+    # task's chat (i.e. state/chats/<chatId>.json exists). Lets the
+    # auto-kickoff rules (e.g. task_in_progress) bow out when a human has
+    # already pinged the agent in the chat via @Agent / !implement so we
+    # don't pile a second LLM run on top of an existing conversation.
+    skip_if_chat_known: bool = False
     # Continue the same claude session across re-mentions on the same chat.
     session_per_chat: bool = True
     # Short status reply posted into the task chat the moment this rule fires,
@@ -187,6 +193,7 @@ def load_rules(path: Path) -> List[Rule]:
                     else list(CLAUDE_DEFAULT_EXTRA_ARGS)
                 ),
                 column_transition_only=bool(raw.get("column_transition_only", True)),
+                skip_if_chat_known=bool(raw.get("skip_if_chat_known", False)),
                 session_per_chat=bool(raw.get("session_per_chat", True)),
                 ack_message=(raw.get("ack_message") or None),
                 ack_message_html=(raw.get("ack_message_html") or None),
@@ -442,6 +449,10 @@ def rule_matches(rule: Rule, payload) -> Tuple[bool, str]:
                         break
             if prev_col == col:
                 return False, "no-column-transition"
+    if rule.skip_if_chat_known:
+        chat_id = extract_chat_id(payload)
+        if chat_id and chat_known(chat_id):
+            return False, "chat-already-has-llm-session"
     return True, "ok"
 
 

@@ -92,17 +92,20 @@ STEP 3 — for EACH affected repository <repo>, do all of these:
   If `gh` is not configured for a given repo (auth, no remote, etc.),
   report it in the chat for that repo and SKIP it. Do not invent URLs.
 
-STEP 4 — post ONE chat message with all PR links.
+STEP 4 — post ONE chat message with all PR links AND branch names.
 
 Use `mcp__yougile-mcp__send_task_message`, taskId = payload.chatId.
-Plain text body. Example:
+For each repo include BOTH the PR URL and the branch name you pushed
+(always `task-<slug>`, possibly with a `-vN` suffix if you had to retry).
+Example plain text body:
 
-    Готово. PRs:
-    - app: https://github.com/org/app/pull/123
-    - bitfront: https://github.com/org/bitfront/pull/456
+    Done.
+    - app — branch `task-add-csv-export`, PR: https://github.com/org/app/pull/123
+    - bitfront — branch `task-add-csv-export`, PR: https://github.com/org/bitfront/pull/456
 
 If only some repos succeeded, list both successes AND failures with a
-one-line reason for each failure. Keep the message under ~15 lines.
+one-line reason for each failure (failures still include the branch name
+if a branch was created). Keep the message under ~15 lines.
 
 {formatting}
 

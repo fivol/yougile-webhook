@@ -152,7 +152,8 @@ When someone writes `!implement ...` in a task chat:
    - Implements + commits in the worktree
    - `git push -u origin task-<slug>`
    - `gh pr create --base dev` → captures the PR URL
-4. Posts ONE chat message with all PR links (one per touched repo).
+4. Posts ONE chat message with all PR links AND the branch name
+   (`task-<slug>`) for each touched repo.
 
 The implement rule must come **above** `chat_mention` in `rules.toml` so
 that `@Agent !implement ...` routes to implement, not to chat-mention.
@@ -166,6 +167,7 @@ that `@Agent !implement ...` routes to implement, not to chat-mention.
 | `allowed_sender_emails` | Whitelist; resolved to user UUIDs at startup via `/api-v2/users`. Empty = no sender filter (not recommended). |
 | `column_names` | Match `payload.columnId` against the resolved UUIDs of these column titles. |
 | `column_transition_only` | Default `true`. When `column_names` is set, only fire on actual transitions (`prevData.columnId != payload.columnId`). |
+| `skip_if_chat_known` | Default `false`. Skip this rule if a claude session already exists for the task's chat (`state/chats/<chatId>.json` exists). Use it on auto-kickoff rules like `task_in_progress` so they don't pile a second LLM run on top of an already-active `@Agent` / `!implement` conversation. |
 | `session_per_chat` | Default `true`. Runs claude with `--session-id <chatId>` first time, `--resume <chatId>` after. |
 | `prompt_file` | Path to a text file used as the prompt. `{event_json}`, `{chat_history}`, `{first_turn}`, `{formatting}`, and `{language}` are substituted. |
 | `workdir` | Override `CLAUDE_WORKDIR` for this rule. |
