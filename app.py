@@ -835,6 +835,7 @@ def _build_prompt(
     chat_history_text: str,
     is_first_turn: bool,
     attachment_paths: List[Path],
+    session_id: Optional[str] = None,
 ) -> str:
     event_json = json.dumps(payload, ensure_ascii=False, indent=2)
     rendered = rule.prompt_template
@@ -843,6 +844,7 @@ def _build_prompt(
     rendered = rendered.replace("{first_turn}", "true" if is_first_turn else "false")
     rendered = rendered.replace("{formatting}", FORMATTING_BLOCK)
     rendered = rendered.replace("{language}", rule.language or "")
+    rendered = rendered.replace("{session_id}", session_id or "")
     # If the template doesn't reference {formatting} explicitly, append it so
     # every spawned agent still sees the rules — guarantees consistent output.
     if "{formatting}" not in rule.prompt_template and FORMATTING_BLOCK:
@@ -1031,7 +1033,10 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
                 seen_paths.add(str(p))
                 attachment_paths.append(p)
 
-        prompt = _build_prompt(rule, payload, history_text, is_first_turn, attachment_paths)
+        prompt = _build_prompt(
+            rule, payload, history_text, is_first_turn, attachment_paths,
+            session_id=session_id,
+        )
         cmd = [CLAUDE_BIN, *rule.extra_args, *session_flag, "-p", prompt]
 
         ts = datetime.now(timezone.utc).isoformat()

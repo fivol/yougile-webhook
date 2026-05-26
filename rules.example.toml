@@ -39,23 +39,11 @@
 #                           you set "ru" once in the rules file instead of repeating it in every
 #                           prompt template.
 
-# Implement-task command: someone writes "!implement ..." in a task chat.
-# Agent reads the task, optionally asks clarifying questions, otherwise
-# creates a worktree off `dev` per affected repo, branches as
-# `task-<slug>`, opens a PR into `dev` for each, and posts the PR links
-# back into the chat.
-# Put this ABOVE chat_mention so "@Agent !implement ..." routes here.
-[[rules]]
-name = "chat_implement"
-enabled = true
-events = ["chat_message-created"]
-pattern = "!implement\\b"
-allowed_sender_emails = ["you@example.com"]
-prompt_file = "prompts/implement.txt"
-language = "en"
-ack_message = "On it — starting the implementation..."
-
-# Chat-mention bot: someone writes "@Agent ..." in a task chat.
+# @Agent — unified entry point. The agent reads the latest mention,
+# classifies it as RESEARCH (read-only answer) or IMPLEMENT (worktree +
+# branch off `dev` + PR per affected repo; subsequent mentions reuse the
+# same branch/PR), and posts its own ack ("Investigating" / "Starting
+# work" / "Continuing on …") with the session id — no auto-ack needed.
 [[rules]]
 name = "chat_mention"
 enabled = true
@@ -64,7 +52,6 @@ pattern = "@Agent"
 allowed_sender_emails = ["you@example.com"]
 prompt_file = "prompts/chat_mention.txt"
 language = "en"
-ack_message = "On it..."
 
 # Auto-kickoff: a task appears in (or is moved into) the "In progress" column.
 # Use this to spawn a short research/proposal agent that posts a summary

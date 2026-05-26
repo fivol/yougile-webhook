@@ -31,7 +31,6 @@ cp .env.example .env
 cp rules.example.toml rules.toml
 cp prompts/chat_mention.example.txt    prompts/chat_mention.txt
 cp prompts/task_in_progress.example.txt prompts/task_in_progress.txt
-cp prompts/implement.example.txt       prompts/implement.txt
 # edit .env, rules.toml, and the prompts
 ```
 
@@ -105,17 +104,9 @@ A list of trigger rules, evaluated top to bottom; **first match wins** —
 put the most specific rules first.
 
 ```toml
-# Implement command: "!implement ..." — agent clarifies or implements
-# the task end-to-end across affected repos, opens one PR into `dev`
-# per repo, and posts the PR links back into the chat.
-[[rules]]
-name = "chat_implement"
-enabled = true
-events = ["chat_message-created"]
-pattern = "!implement\\b"
-allowed_sender_emails = ["you@example.com"]
-prompt_file = "prompts/implement.txt"
-
+# @Agent — unified entry point. Agent classifies the latest mention as
+# RESEARCH or IMPLEMENT and acts accordingly. Posts its own ack
+# ("Исследую" / "Начал работу" / "Продолжаю …") with the session id.
 [[rules]]
 name = "chat_mention"
 enabled = true
@@ -131,32 +122,44 @@ events = ["task-created", "task-moved", "task-updated"]
 column_names = ["In progress"]
 allowed_sender_emails = ["you@example.com"]
 prompt_file = "prompts/task_in_progress.txt"
+skip_if_chat_known = true                                    # don't double-fire if @Agent already ran
 # workdir = "/path/to/your/company-root"                     # override per-rule
 # extra_args = "--dangerously-skip-permissions --model sonnet"
 ```
 
-### `!implement` flow
+### `@Agent` flow
 
-When someone writes `!implement ...` in a task chat:
+`@Agent` is the only chat entry point. The agent reads the latest
+mention together with the task title/description, chat history, and any
+attached screenshots, then picks ONE of two modes:
 
-1. Agent fetches the full task (title + description) and reads the chat
-   history (including any image attachments).
-2. **If the task is ambiguous** — agent posts the smallest set of
-   clarifying questions back into the chat and stops. The user answers
-   and re-triggers with `!implement` again. The claude session is
-   preserved across both invocations (same `chatId`), so context
-   carries over.
-3. **If the task is clear** — for each affected repository:
+- **RESEARCH** — questions / analysis / investigation. Agent answers
+  in chat with no code changes. Ack: `Исследую` + session id.
+- **IMPLEMENT** — code changes (add / fix / refactor / extend / tests).
+  Ack: `Начал работу` + session id (first time) or `Продолжаю в ветке
+  task-<slug>` + session id (continuation).
+
+In IMPLEMENT mode the agent keeps **one worktree + one branch + one PR
+per task chat** (base = `dev`):
+
+1. **First time:** for each affected repo:
    - `git worktree add worktrees/<slug>/<repo> -b task-<slug> origin/dev`
      (worktrees live under the company root, `dev` is required)
    - Implements + commits in the worktree
    - `git push -u origin task-<slug>`
    - `gh pr create --base dev` → captures the PR URL
-4. Posts ONE chat message with all PR links AND the branch name
-   (`task-<slug>`) for each touched repo.
+   - Posts ONE chat message listing each touched repo's branch name and
+     PR URL.
+2. **Continuation** (same chat, follow-up `@Agent`): agent re-uses the
+   existing worktree/branch, adds commits, `git push` — the existing PR
+   auto-updates. No second PR.
+3. **Fresh branch/PR**: only when the user explicitly asks for one
+   ("новая ветка", "новый PR", "fresh PR"). Then the first-time flow
+   runs again with a new slug.
 
-The implement rule must come **above** `chat_mention` in `rules.toml` so
-that `@Agent !implement ...` routes to implement, not to chat-mention.
+Claude's session memory (`--session-id <chatId>` first time, `--resume
+<chatId>` after) is what lets the agent remember the slug / worktree
+path / PR URL across turns.
 
 | Field | Meaning |
 |---|---|
@@ -167,9 +170,9 @@ that `@Agent !implement ...` routes to implement, not to chat-mention.
 | `allowed_sender_emails` | Whitelist; resolved to user UUIDs at startup via `/api-v2/users`. Empty = no sender filter (not recommended). |
 | `column_names` | Match `payload.columnId` against the resolved UUIDs of these column titles. |
 | `column_transition_only` | Default `true`. When `column_names` is set, only fire on actual transitions (`prevData.columnId != payload.columnId`). |
-| `skip_if_chat_known` | Default `false`. Skip this rule if a claude session already exists for the task's chat (`state/chats/<chatId>.json` exists). Use it on auto-kickoff rules like `task_in_progress` so they don't pile a second LLM run on top of an already-active `@Agent` / `!implement` conversation. |
+| `skip_if_chat_known` | Default `false`. Skip this rule if a claude session already exists for the task's chat (`state/chats/<chatId>.json` exists). Use it on auto-kickoff rules like `task_in_progress` so they don't pile a second LLM run on top of an already-active `@Agent` conversation. |
 | `session_per_chat` | Default `true`. Runs claude with `--session-id <chatId>` first time, `--resume <chatId>` after. |
-| `prompt_file` | Path to a text file used as the prompt. `{event_json}`, `{chat_history}`, `{first_turn}`, `{formatting}`, and `{language}` are substituted. |
+| `prompt_file` | Path to a text file used as the prompt. `{event_json}`, `{chat_history}`, `{first_turn}`, `{formatting}`, `{language}`, and `{session_id}` are substituted. |
 | `workdir` | Override `CLAUDE_WORKDIR` for this rule. |
 | `extra_args` | Override `CLAUDE_EXTRA_ARGS` for this rule. |
 | `ack_message` | Optional short plain-text reply posted into the task chat the moment claude is successfully spawned (e.g. `"Взял в работу..."`). The session id (== chat/task UUID) is auto-appended on its own line so you can copy it from the task and continue the same session locally with `claude --resume <id>`. Fires only after the subprocess actually started, so a failed launch never leaves an orphan ack. Opt-in — omitted = no ack. |
