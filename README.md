@@ -129,9 +129,12 @@ skip_if_chat_known = true                                    # don't double-fire
 
 ### `@Agent` flow
 
-`@Agent` is the only chat entry point. The agent reads the latest
-mention together with the task title/description, chat history, and any
-attached screenshots, then picks ONE of two modes:
+`@Agent` is the only chat entry point. The moment a mention matches a
+rule, the receiver drops a 👍 reaction on that message (configurable via
+`ACK_REACTION_EMOJI`) as an instant "received" signal — before the agent
+even spawns. The agent then reads the latest mention together with the
+task title/description, chat history, and any attached screenshots, then
+picks ONE of two modes:
 
 - **RESEARCH** — questions / analysis / investigation. Agent answers
   in chat with no code changes. Ack: `Исследую` + session id.
@@ -205,6 +208,7 @@ path / PR URL across turns.
 | `ATTACHMENTS_ENABLED` | Default `true`. Download `/root/#file:<url>` attachments from chat messages into `state/attachments/<chatId>/` and surface them to the agent. |
 | `ATTACHMENT_MAX_BYTES` | Per-file size cap (default 25 MiB). Larger files are skipped. |
 | `ATTACHMENT_TIMEOUT_SECONDS` | Per-file download timeout (default 30s). |
+| `ACK_REACTION_EMOJI` | Emoji reaction dropped on the trigger message the instant it matches a rule — fires before the agent spawns and before any `ack_message`, as an immediate "received" signal. Default `👍`. YouGile accepts ONLY `👍 👎 👏 🙂 😀 😕 🎉 ❤ 🚀 ✔` (👀 is rejected). Empty = disabled. Applies only to `chat_message-*` events. |
 
 After editing `.env` or `rules.toml`, reload:
 

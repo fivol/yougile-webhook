@@ -108,6 +108,13 @@ ATTACHMENTS_ENABLED = os.environ.get("ATTACHMENTS_ENABLED", "true").lower() not 
 ATTACHMENT_MAX_BYTES = int(os.environ.get("ATTACHMENT_MAX_BYTES", str(25 * 1024 * 1024)))
 ATTACHMENT_TIMEOUT_SECONDS = int(os.environ.get("ATTACHMENT_TIMEOUT_SECONDS", "30"))
 
+# Reaction dropped on the trigger message the instant it matches a rule — a
+# fast "received" signal that fires BEFORE the agent spawns and before any ack
+# reply. YouGile only accepts a fixed reaction set
+# (👍 👎 👏 🙂 😀 😕 🎉 ❤ 🚀 ✔) — 👀 (eyes) is rejected with HTTP 400. Set to an
+# empty string to disable reacting entirely.
+ACK_REACTION_EMOJI = os.environ.get("ACK_REACTION_EMOJI", "👍").strip()
+
 RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
 
 # YouGile auto-disables a webhook subscription after enough failed deliveries
@@ -331,6 +338,21 @@ def send_chat_message(chat_id: str, text: str, text_html: Optional[str] = None) 
     return _api_post(f"/chats/{chat_id}/messages", body) is not None
 
 
+def react_to_message(chat_id: str, message_id: str, emoji: str) -> bool:
+    """Set the API-token user's reaction on a chat message. Returns True on success.
+
+    YouGile's reaction set is fixed (👍 👎 👏 🙂 😀 😕 🎉 ❤ 🚀 ✔); anything else
+    (e.g. 👀) is rejected with HTTP 400. The `react` body field is an ARRAY that
+    REPLACES this user's whole reaction list — despite the OpenAPI spec typing it
+    as a string — so a single-element array sets exactly one reaction and is
+    idempotent on webhook re-delivery. Used as the fast "received" signal the
+    moment a rule matches, before the agent is even spawned.
+    """
+    if not (chat_id and message_id and emoji):
+        return False
+    return _api_put(f"/chats/{chat_id}/messages/{message_id}", {"react": [emoji]}) is not None
+
+
 USERS_BY_ID: Dict[str, Dict[str, Any]] = {}
 USERS_BY_EMAIL: Dict[str, str] = {}
 COLUMNS_BY_NAME: Dict[str, Set[str]] = {}
@@ -409,6 +431,23 @@ def extract_chat_id(payload) -> Optional[str]:
     cid = _deep_get(payload, CHAT_ID_KEYS)
     if cid and _UUID_RE.match(cid):
         return cid
+    return None
+
+
+def extract_message_id(payload) -> Optional[str]:
+    """Numeric chat-message id (a millisecond timestamp) for chat_message-* events.
+
+    It lives at payload.payload.id and is returned as a string for the API path.
+    Returns None for task/column events, whose payload.id is a UUID rather than a
+    digit string — so reacting naturally no-ops on anything but a chat message.
+    """
+    if not isinstance(payload, dict):
+        return None
+    inner = payload.get("payload")
+    if isinstance(inner, dict):
+        mid = inner.get("id")
+        if isinstance(mid, int) or (isinstance(mid, str) and mid.isdigit()):
+            return str(mid)
     return None
 
 
@@ -1158,6 +1197,20 @@ async def yougile_webhook(req: Request):
     fired_rule: Optional[str] = None
     spawn_reason: Optional[str] = None
     if rule:
+        # Fast "received" signal: react to the trigger message the instant it
+        # matches a rule — before spawning the agent and before any ack reply.
+        # Fire-and-forget in a thread so the extra API round-trip never delays
+        # the webhook response. No-ops for non-chat events (no numeric message
+        # id) and when ACK_REACTION_EMOJI is empty.
+        if ACK_REACTION_EMOJI:
+            react_chat_id = extract_chat_id(payload)
+            react_msg_id = extract_message_id(payload)
+            if react_chat_id and react_msg_id:
+                threading.Thread(
+                    target=react_to_message,
+                    args=(react_chat_id, react_msg_id, ACK_REACTION_EMOJI),
+                    daemon=True,
+                ).start()
         ok, why = spawn_claude(rule, payload)
         spawn_reason = why
         if ok:
