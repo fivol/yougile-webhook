@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -66,7 +67,42 @@ CLAUDE_DEFAULT_WORKDIR = os.environ.get("CLAUDE_WORKDIR") or str(ROOT)
 CLAUDE_DEFAULT_EXTRA_ARGS = shlex.split(
     os.environ.get("CLAUDE_EXTRA_ARGS", "--dangerously-skip-permissions")
 )
-CLAUDE_MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "2"))
+CLAUDE_MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "10"))
+
+# When a new @Agent message lands in a chat whose turn is STILL running, we
+# interrupt the in-flight turn (kill its process group) and immediately start a
+# fresh turn that --resumes the same session — so the agent sees the new
+# instruction and can continue or change direction. After the initial SIGTERM
+# we wait this many 0.1s ticks (default 30 → ~3s, lets claude flush its session
+# transcript) before escalating to SIGKILL.
+INTERRUPT_SIGKILL_GRACE_TICKS = int(os.environ.get("INTERRUPT_SIGKILL_GRACE_TICKS", "30"))
+
+# Posted into a task chat when a turn can't start because the global
+# concurrency cap (CLAUDE_MAX_CONCURRENT) is saturated by OTHER chats — so the
+# user gets a clear "try again shortly" instead of a silent drop. Plain text +
+# optional HTML, both overridable via env. Empty text disables the notice.
+CONCURRENCY_BUSY_MESSAGE = os.environ.get(
+    "CONCURRENCY_BUSY_MESSAGE",
+    "I'm at capacity right now — too many tasks are running in parallel. "
+    "Please mention @Agent again in a couple of minutes and I'll pick this up.",
+).strip()
+CONCURRENCY_BUSY_MESSAGE_HTML = os.environ.get("CONCURRENCY_BUSY_MESSAGE_HTML", "").strip() or None
+
+# Prepended to the prompt when this turn is replacing a turn we just
+# interrupted, so the resumed agent treats the newest chat message as a live
+# course-correction rather than a routine follow-up.
+INTERRUPT_NOTICE = (
+    "⚠️ YOU WERE INTERRUPTED. While you were still working on the previous "
+    "instruction in this chat, the user sent a NEW message (the most recent "
+    "message in the chat history below) — on purpose, to add to or REDIRECT "
+    "your current work. Before anything else:\n"
+    "  1. Re-read the latest user message(s) and treat them as the current, "
+    "authoritative instruction.\n"
+    "  2. Check your workspace / git state — the previous turn was cut off "
+    "mid-run and may have left uncommitted edits or a half-finished step.\n"
+    "  3. Then continue, extend, or change direction as the new message "
+    "requires, and proceed through your normal flow (ack → work → final reply)."
+)
 
 # Retry policy for transient API errors. The Anthropic API surfaces overload /
 # rate-limit failures as 5xx; the claude CLI prints them to stdout and exits
@@ -854,6 +890,15 @@ app = FastAPI(title="YouGile webhook receiver")
 
 _active_lock = threading.Lock()
 _active_procs: Set[int] = set()
+# chat_id -> the live Popen for that chat's current turn. Lets us interrupt an
+# in-flight turn when a new instruction arrives. Guarded by _active_lock.
+_chat_procs: Dict[str, subprocess.Popen] = {}
+# pids we deliberately killed to interrupt a turn — _reap must NOT mistake their
+# non-zero exit for a transient API failure and retry them. Guarded by _active_lock.
+_interrupted_pids: Set[int] = set()
+# chat_id -> (rule, payload) queued to run the instant the current turn dies.
+# Set when we interrupt a busy chat; consumed by _release_chat. Guarded by _active_lock.
+_pending_turns: Dict[str, Tuple[Rule, Any]] = {}
 
 _chat_locks_mutex = threading.Lock()
 _chat_busy: Dict[str, threading.Lock] = {}
@@ -868,6 +913,81 @@ def _get_chat_lock(chat_id: str) -> threading.Lock:
         return lock
 
 
+def _terminate_proc_group(pid: int) -> None:
+    """SIGTERM the turn's process group, escalating to SIGKILL if it lingers.
+
+    Spawned with start_new_session=True, so pid == pgid and a single killpg
+    reaches claude plus every tool / MCP / subagent child it started. The grace
+    period lets claude flush its session transcript so the --resume that follows
+    still finds a usable session. Runs in its own thread (fire-and-forget) so the
+    webhook handler never blocks on the kill.
+    """
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    for _ in range(max(0, INTERRUPT_SIGKILL_GRACE_TICKS)):
+        time.sleep(0.1)
+        try:
+            os.killpg(pid, 0)
+        except (ProcessLookupError, OSError):
+            return  # whole group is gone
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _interrupt_chat(chat_id: str) -> bool:
+    """Kill the chat's in-flight turn so a fresh one can take over. Returns True
+    if there was a live process to interrupt. Marks the pid so _reap skips the
+    transient-error retry path for an intentional kill."""
+    with _active_lock:
+        proc = _chat_procs.get(chat_id)
+        if proc is None:
+            return False
+        pid = proc.pid
+        _interrupted_pids.add(pid)
+    threading.Thread(target=_terminate_proc_group, args=(pid,), daemon=True).start()
+    return True
+
+
+def _post_capacity_message(chat_id: Optional[str]) -> None:
+    """Tell the chat we're at the global concurrency cap (fire-and-forget)."""
+    if not (chat_id and CONCURRENCY_BUSY_MESSAGE):
+        return
+
+    def _send() -> None:
+        try:
+            send_chat_message(chat_id, CONCURRENCY_BUSY_MESSAGE, CONCURRENCY_BUSY_MESSAGE_HTML)
+        except Exception:
+            log.exception("capacity message send failed chat=%s", chat_id)
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _release_chat(chat_id: Optional[str], chat_lock: Optional[threading.Lock]) -> None:
+    """Release a chat's turn lock, then run any turn queued while it was busy.
+
+    Single exit point for every turn (normal completion, spawn failure, or
+    exception), so an interrupting instruction recorded in _pending_turns is
+    never orphaned. The queued turn starts here — chained off the dying turn —
+    which is why interrupting never blocks the webhook handler.
+    """
+    if chat_lock is not None:
+        chat_lock.release()
+    if not chat_id:
+        return
+    with _active_lock:
+        pending = _pending_turns.pop(chat_id, None)
+    if pending is None:
+        return
+    p_rule, p_payload = pending
+    ok, why = spawn_claude(p_rule, p_payload, interrupted=True)
+    if not ok and why == "global-max-concurrent":
+        _post_capacity_message(chat_id)
+
+
 def _build_prompt(
     rule: Rule,
     payload,
@@ -875,6 +995,7 @@ def _build_prompt(
     is_first_turn: bool,
     attachment_paths: List[Path],
     session_id: Optional[str] = None,
+    interrupted: bool = False,
 ) -> str:
     event_json = json.dumps(payload, ensure_ascii=False, indent=2)
     rendered = rule.prompt_template
@@ -903,6 +1024,8 @@ def _build_prompt(
             f"---\nAttachments referenced above are saved locally — open them "
             f"with your Read tool to view their contents:\n{listed}\n"
         )
+    if interrupted and INTERRUPT_NOTICE:
+        rendered = f"{INTERRUPT_NOTICE}\n\n---\n{rendered}"
     return rendered
 
 
@@ -911,6 +1034,7 @@ def _spawn_subprocess(
     cmd: List[str],
     header: str,
     on_exit,
+    chat_id: Optional[str] = None,
     attempt: int = 1,
 ) -> Optional[subprocess.Popen]:
     log_fp = CLAUDE_LOG.open("a", encoding="utf-8")
@@ -947,6 +1071,8 @@ def _spawn_subprocess(
     pid = proc.pid
     with _active_lock:
         _active_procs.add(pid)
+        if chat_id:
+            _chat_procs[chat_id] = proc
     log.info(
         "rule %s: claude spawned pid=%s attempt=%d cmd=%s",
         rule.name, pid, attempt, cmd[:3] + ["..."],
@@ -956,6 +1082,10 @@ def _spawn_subprocess(
         rc = proc.wait()
         with _active_lock:
             _active_procs.discard(pid)
+            was_interrupted = pid in _interrupted_pids
+            _interrupted_pids.discard(pid)
+            if chat_id and _chat_procs.get(chat_id) is proc:
+                del _chat_procs[chat_id]
         log_fp.write(
             f"\n--- exit rc={rc} attempt={attempt} "
             f"ts={datetime.now(timezone.utc).isoformat()} ---\n"
@@ -965,7 +1095,8 @@ def _spawn_subprocess(
         log_fp.close()
         log.info("rule %s: claude pid=%s attempt=%d rc=%s", rule.name, pid, attempt, rc)
 
-        if rc != 0 and attempt < CLAUDE_API_RETRIES and _output_is_transient(output_start, end_pos):
+        if (not was_interrupted and rc != 0 and attempt < CLAUDE_API_RETRIES
+                and _output_is_transient(output_start, end_pos)):
             delay = CLAUDE_RETRY_DELAYS[min(attempt - 1, len(CLAUDE_RETRY_DELAYS) - 1)]
             log.warning(
                 "rule %s: transient API error (rc=%s) — retrying in %ds (attempt %d/%d)",
@@ -974,7 +1105,7 @@ def _spawn_subprocess(
 
             def _delayed_retry():
                 time.sleep(delay)
-                _spawn_subprocess(rule, cmd, header, on_exit, attempt=attempt + 1)
+                _spawn_subprocess(rule, cmd, header, on_exit, chat_id=chat_id, attempt=attempt + 1)
 
             threading.Thread(target=_delayed_retry, daemon=True).start()
             return
@@ -1003,18 +1134,45 @@ def _output_is_transient(start: int, end: int) -> bool:
     return bool(CLAUDE_RETRY_PATTERN.search(output))
 
 
-def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
+def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, str]:
+    chat_id = extract_chat_id(payload) if rule.session_per_chat else None
+    chat_lock: Optional[threading.Lock] = _get_chat_lock(chat_id) if chat_id else None
+
+    if chat_lock is not None and not chat_lock.acquire(blocking=False):
+        # A turn is already running for this chat. Don't drop the new message —
+        # queue it and interrupt the in-flight turn; the queued turn starts the
+        # instant the current one dies (chained from _release_chat), resuming the
+        # same session so the agent sees the new instruction and can redirect.
+        with _active_lock:
+            _pending_turns[chat_id] = (rule, payload)
+        if _interrupt_chat(chat_id):
+            log.info("rule %s: chat %s busy — interrupting current turn for new instruction",
+                     rule.name, chat_id)
+            return True, "interrupting"
+        # No live process to kill — the holder is either finishing right now or
+        # sitting in a retry backoff. Reclaim our queued turn and try to run it
+        # directly so it can't dangle; if the lock is genuinely still held (retry
+        # backoff), leave it queued for that holder's _release_chat to chain.
+        with _active_lock:
+            pending = _pending_turns.pop(chat_id, None)
+        if pending is None:
+            return True, "interrupting"  # a _release_chat already chained it
+        if not chat_lock.acquire(blocking=False):
+            with _active_lock:
+                _pending_turns.setdefault(chat_id, pending)
+            log.info("rule %s: chat %s busy (lock held) — queued pending turn", rule.name, chat_id)
+            return True, "queued"
+        rule, payload = pending
+        interrupted = True  # treat the reclaimed turn as an interrupting one
+
+    # No per-chat session, or the chat is idle and we now hold its lock. Enforce
+    # the global concurrency cap for genuinely new turns — an interrupt replaces
+    # an existing turn (1-for-1) and never reaches here.
     with _active_lock:
         if len(_active_procs) >= CLAUDE_MAX_CONCURRENT:
+            if chat_lock is not None:
+                chat_lock.release()
             return False, "global-max-concurrent"
-
-    chat_id = extract_chat_id(payload) if rule.session_per_chat else None
-    chat_lock: Optional[threading.Lock] = None
-    if chat_id:
-        chat_lock = _get_chat_lock(chat_id)
-        if not chat_lock.acquire(blocking=False):
-            log.warning("rule %s: chat %s already busy, dropping", rule.name, chat_id)
-            return False, "chat-busy"
 
     try:
         if chat_id:
@@ -1074,7 +1232,7 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
 
         prompt = _build_prompt(
             rule, payload, history_text, is_first_turn, attachment_paths,
-            session_id=session_id,
+            session_id=session_id, interrupted=interrupted,
         )
         cmd = [CLAUDE_BIN, *rule.extra_args, *session_flag, "-p", prompt]
 
@@ -1091,13 +1249,11 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
                 if chat_id and newest_msg_id:
                     update_chat_state(chat_id, last_message_id=newest_msg_id)
             finally:
-                if chat_lock is not None:
-                    chat_lock.release()
+                _release_chat(chat_id, chat_lock)
 
-        proc = _spawn_subprocess(rule, cmd, header, on_exit)
+        proc = _spawn_subprocess(rule, cmd, header, on_exit, chat_id=chat_id)
         if proc is None:
-            if chat_lock is not None:
-                chat_lock.release()
+            _release_chat(chat_id, chat_lock)
             return False, "spawn-failed"
 
         # Fast ack — let the user see "I'm on it" without waiting for claude
@@ -1135,8 +1291,7 @@ def spawn_claude(rule: Rule, payload) -> Tuple[bool, str]:
         return True, "ok"
     except Exception:
         log.exception("rule %s: spawn flow failed", rule.name)
-        if chat_lock is not None:
-            chat_lock.release()
+        _release_chat(chat_id, chat_lock)
         return False, "exception"
 
 
@@ -1215,6 +1370,9 @@ async def yougile_webhook(req: Request):
         spawn_reason = why
         if ok:
             fired_rule = rule.name
+        elif why == "global-max-concurrent":
+            # Saturated by OTHER chats — tell the user instead of dropping silently.
+            _post_capacity_message(extract_chat_id(payload))
 
     event = isinstance(payload, dict) and payload.get("event")
     log.info(

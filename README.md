@@ -195,7 +195,9 @@ path / PR URL across turns.
 | `CLAUDE_BIN` | Path to the `claude` CLI. |
 | `CLAUDE_WORKDIR` | Default workdir for spawned claude processes. |
 | `CLAUDE_EXTRA_ARGS` | Default CLI args. |
-| `CLAUDE_MAX_CONCURRENT` | Hard cap on concurrent claude processes. Excess events are dropped. |
+| `CLAUDE_MAX_CONCURRENT` | Hard cap on concurrent claude processes across DISTINCT chats (default 10). A re-mention in an already-running chat interrupts that turn instead of counting here. When a genuinely new chat hits the cap, it gets `CONCURRENCY_BUSY_MESSAGE` rather than a silent drop. |
+| `CONCURRENCY_BUSY_MESSAGE` / `_HTML` | Message posted into a chat when the global cap is saturated by OTHER chats (so the user knows to retry shortly). Empty = stay silent. |
+| `INTERRUPT_SIGKILL_GRACE_TICKS` | When a new `@Agent` message interrupts a running turn for the same chat, how many 0.1s ticks to wait after `SIGTERM` before `SIGKILL` (lets claude flush its session transcript). Default `30` (~3s). |
 | `CLAUDE_API_RETRIES` | Total attempts (incl. the first) when the spawned claude exits non-zero AND its output matches a transient Anthropic API error (`API Error: 5xx`, `Overloaded`, `overloaded_error`, `rate_limit_error`). Default `3`. |
 | `CLAUDE_RETRY_DELAYS` | Comma-separated backoff in seconds between retries. Default `30,120,300`. The last value repeats if there are more retries than entries. |
 | `RULES_FILE` | Default `rules.toml`. |
@@ -227,11 +229,30 @@ For rules with `session_per_chat = true` (default):
 - Existence of that file decides `--resume` vs `--session-id`.
 - The prompt receives chat history via the `{chat_history}` placeholder
   (full on first run, only new messages on subsequent runs).
-- While claude is running for a chat, new triggers for the SAME chat are
-  dropped with `spawn_reason: chat-busy`. No queue.
+- While claude is running for a chat, a new `@Agent` message for the SAME
+  chat **interrupts** the in-flight turn (see below) — it is never dropped.
 
 To reset a single chat: `rm state/chats/<chatId>.json`. The next trigger
 will start a fresh session and re-inject full history.
+
+### Interrupting a running turn
+
+A new `@Agent` message that lands while the agent is still working on the
+same chat does **not** queue or get dropped — it takes over immediately:
+
+1. The in-flight turn's process group is `SIGTERM`-ed (then `SIGKILL` after
+   `INTERRUPT_SIGKILL_GRACE_TICKS` × 0.1s, so claude can flush its session).
+2. The instant it dies, a fresh turn starts that `--resume`s the same
+   session, with the new message in its delta history and an explicit
+   "you were interrupted" notice prepended to the prompt.
+3. The agent re-reads the latest message as the authoritative instruction,
+   checks its workspace/git state (the previous turn may have stopped
+   mid-edit), and continues, extends, or changes direction accordingly.
+
+This is how you redirect the agent mid-task — just `@Agent` again with the
+new instruction. Webhook returns `spawn_reason: interrupting`. Because an
+interrupt replaces an existing turn 1-for-1, it never counts against
+`CLAUDE_MAX_CONCURRENT`; that cap only limits genuinely distinct chats.
 
 ## Attachments (images & files)
 
