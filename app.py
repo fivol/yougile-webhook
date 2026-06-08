@@ -15,6 +15,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -485,6 +486,41 @@ def extract_message_id(payload) -> Optional[str]:
         if isinstance(mid, int) or (isinstance(mid, str) and mid.isdigit()):
             return str(mid)
     return None
+
+
+# YouGile delivers webhooks at-least-once: when our 200 is slow — e.g. a first
+# turn that synchronously fetches the full chat history before responding — it
+# re-sends the *same* chat_message-created (identical id) several times within
+# seconds. A duplicate must never reach spawn_claude again: the re-delivery is
+# seen as a "new instruction" and interrupts the in-flight turn. If that turn is
+# the first one (creating the session via --session-id), SIGTERM kills it before
+# the session is persisted, and every later --resume then dies with "No
+# conversation found" — the chat reacts 👍 but can never answer. So we drop
+# re-deliveries by id here. Bounded in-memory LRU is enough: duplicates arrive
+# within seconds, long before a restart would clear the cache.
+_DEDUP_CACHE_SIZE = 2048
+_seen_msg_ids: "OrderedDict[str, None]" = OrderedDict()
+_seen_msg_ids_lock = threading.Lock()
+
+
+def is_duplicate_delivery(payload) -> bool:
+    """True if this exact chat message was already dispatched (records it on the
+    first sighting). Returns False for events without a numeric message id
+    (task/column events), whose idempotency is handled by their own match rules
+    — so they are never deduped here."""
+    mid = extract_message_id(payload)
+    if mid is None:
+        return False
+    event = payload.get("event") if isinstance(payload, dict) else None
+    key = f"{event}|{extract_chat_id(payload)}|{mid}"
+    with _seen_msg_ids_lock:
+        if key in _seen_msg_ids:
+            _seen_msg_ids.move_to_end(key)
+            return True
+        _seen_msg_ids[key] = None
+        while len(_seen_msg_ids) > _DEDUP_CACHE_SIZE:
+            _seen_msg_ids.popitem(last=False)
+        return False
 
 
 # ---------------------------------------------------------------- rule matching
@@ -1351,7 +1387,13 @@ async def yougile_webhook(req: Request):
     rule, reasons = find_matching_rule(payload)
     fired_rule: Optional[str] = None
     spawn_reason: Optional[str] = None
-    if rule:
+    if rule and is_duplicate_delivery(payload):
+        # YouGile re-sent a message we already dispatched. Re-running it would
+        # interrupt the in-flight turn — fatally so while that turn is still
+        # creating the session. The first delivery already reacted and spawned,
+        # so this one is a pure no-op.
+        spawn_reason = "duplicate"
+    elif rule:
         # Fast "received" signal: react to the trigger message the instant it
         # matches a rule — before spawning the agent and before any ack reply.
         # Fire-and-forget in a thread so the extra API round-trip never delays
