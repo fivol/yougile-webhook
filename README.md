@@ -202,6 +202,10 @@ path / PR URL across turns.
 | `CLAUDE_RETRY_DELAYS` | Comma-separated backoff in seconds between retries. Default `30,120,300`. The last value repeats if there are more retries than entries. |
 | `RULES_FILE` | Default `rules.toml`. |
 | `WEBHOOK_ENSURE_INTERVAL_SECONDS` | How often the service sweeps its own YouGile subscription and revives it if YouGile auto-disabled it after a streak of failed deliveries (e.g. while we were down). Default `900` (15 min). The same check runs once at startup. Set to a large value to disable the timer; the startup check still fires. |
+| `YOUGILE_API_TIMEOUT` | Per-attempt timeout (seconds) for every call to the YouGile API. Default `15`. |
+| `YOUGILE_API_MAX_RETRIES` | Retries for data-plane calls (reaction, ack, history fetch, message post) on a *transient* failure — network error, timeout, HTTP 429/5xx — with capped exponential backoff. `0` = retry forever (default), so a flapping VPN or brief outage never drops a 👍 or an ack. A 4xx is permanent and never retried. |
+| `YOUGILE_API_BOOT_RETRIES` | Bounded retry budget for boot/control-plane calls (directory load, webhook (de)registration) so a dead API at startup can't hang the import; the watcher just retries next cycle. Default `2`. |
+| `YOUGILE_API_RETRY_BASE_DELAY` / `YOUGILE_API_RETRY_MAX_DELAY` | Backoff between API retries — starts at base, doubles, capped at max (seconds). Defaults `1` / `30`. |
 | `SENDER_KEYS` | Payload keys checked (in order, top-level and nested) for the sender's user UUID. |
 | `COLUMN_KEYS` | Same, for column UUIDs. |
 | `CHAT_ID_KEYS` | Same, for the task/chat UUID used as the claude session id. |

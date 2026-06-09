@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -62,6 +63,25 @@ YOUGILE_FILE_BASE_URL = os.environ.get(
     "YOUGILE_FILE_BASE_URL",
     f"{_default_file_host.scheme}://{_default_file_host.netloc}" if _default_file_host.netloc else "",
 ).rstrip("/")
+
+# --- YouGile API retry policy ------------------------------------------------
+# A VPN flapping on this host, a brief YouGile outage, or a TLS handshake timing
+# out should never lose a 👍, an ack, or a chat-history read. Each HTTP attempt
+# is bounded by YOUGILE_API_TIMEOUT; on a *transient* failure (network error,
+# timeout, HTTP 429, or 5xx) we retry with capped exponential backoff. A 4xx is
+# a permanent client error (rejected reaction emoji, stale id, bad key) and is
+# never retried — that would spin forever.
+#
+# Data-plane calls (reaction, ack, history fetch, message post) default to
+# infinite retries (YOUGILE_API_MAX_RETRIES=0) so the flow survives any blip.
+# Boot/control-plane calls (directory load, webhook (de)registration) pass a
+# small finite budget so a dead API at startup can't hang the import, and the
+# watcher just retries on its next cycle.
+YOUGILE_API_TIMEOUT = int(os.environ.get("YOUGILE_API_TIMEOUT", "15"))
+YOUGILE_API_MAX_RETRIES = int(os.environ.get("YOUGILE_API_MAX_RETRIES", "0"))  # 0 = infinite
+YOUGILE_API_BOOT_RETRIES = int(os.environ.get("YOUGILE_API_BOOT_RETRIES", "2"))
+YOUGILE_API_RETRY_BASE_DELAY = float(os.environ.get("YOUGILE_API_RETRY_BASE_DELAY", "1"))
+YOUGILE_API_RETRY_MAX_DELAY = float(os.environ.get("YOUGILE_API_RETRY_MAX_DELAY", "30"))
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_DEFAULT_WORKDIR = os.environ.get("CLAUDE_WORKDIR") or str(ROOT)
@@ -249,67 +269,90 @@ def load_rules(path: Path) -> List[Rule]:
 
 # ---------------------------------------------------------------- API helpers
 
-def _api_get(path: str) -> Optional[dict]:
+def _api_request(
+    method: str,
+    path: str,
+    body: Optional[dict] = None,
+    *,
+    retries: Optional[int] = None,
+) -> Optional[dict]:
+    """Call the YouGile API, retrying transient failures with capped backoff.
+
+    Each attempt is bounded by YOUGILE_API_TIMEOUT. Network-level errors (DNS,
+    connection reset, TLS-handshake / read timeout — what a flapping VPN looks
+    like), HTTP 429, and 5xx are retried; `retries` caps the count (None ->
+    YOUGILE_API_MAX_RETRIES, 0 -> retry forever). A 4xx is a permanent client
+    error and returns None at once — retrying it would spin. Returns the parsed
+    JSON ({} for an empty body) on success, None on a permanent error or once
+    the retry budget is exhausted.
+    """
     if not YOUGILE_API_KEY:
         return None
-    req = urllib.request.Request(
-        f"{YOUGILE_API_BASE}{path}",
-        headers={"Authorization": f"Bearer {YOUGILE_API_KEY}"},
+    data = (
+        json.dumps(body, ensure_ascii=False).encode("utf-8")
+        if body is not None
+        else None
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except (urllib.error.URLError, json.JSONDecodeError):
-        log.exception("API GET failed: %s", path)
-        return None
-
-
-def _api_post(path: str, body: dict) -> Optional[dict]:
-    if not YOUGILE_API_KEY:
-        return None
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {"Authorization": f"Bearer {YOUGILE_API_KEY}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
-        f"{YOUGILE_API_BASE}{path}",
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {YOUGILE_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        f"{YOUGILE_API_BASE}{path}", data=data, method=method, headers=headers
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else None
-    except (urllib.error.URLError, json.JSONDecodeError):
-        log.exception("API POST failed: %s", path)
-        return None
+
+    max_retries = YOUGILE_API_MAX_RETRIES if retries is None else retries
+    attempt = 0
+    delay = YOUGILE_API_RETRY_BASE_DELAY
+    while True:
+        attempt += 1
+        try:
+            with urllib.request.urlopen(req, timeout=YOUGILE_API_TIMEOUT) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            # We got an HTTP response. 4xx (except 429) is permanent — a rejected
+            # emoji, a stale id, a bad key — so don't waste retries on it.
+            if exc.code != 429 and 400 <= exc.code < 500:
+                log.warning(
+                    "API %s %s -> HTTP %s (permanent, not retrying)", method, path, exc.code
+                )
+                return None
+            reason: Any = f"HTTP {exc.code}"
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+        except json.JSONDecodeError:
+            # Got a body but it isn't JSON — not a connectivity issue, retrying
+            # won't help.
+            log.exception("API %s %s: malformed JSON response", method, path)
+            return None
+
+        if max_retries and attempt > max_retries:
+            log.warning(
+                "API %s %s: giving up after %d attempt(s) (%s)", method, path, attempt, reason
+            )
+            return None
+        log.warning(
+            "API %s %s: transient failure (%s) — retry %d in %.0fs",
+            method, path, reason, attempt, delay,
+        )
+        time.sleep(delay)
+        delay = min(delay * 2, YOUGILE_API_RETRY_MAX_DELAY)
 
 
-def _api_put(path: str, body: dict) -> Optional[dict]:
-    if not YOUGILE_API_KEY:
-        return None
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        f"{YOUGILE_API_BASE}{path}",
-        data=data,
-        method="PUT",
-        headers={
-            "Authorization": f"Bearer {YOUGILE_API_KEY}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
-    except (urllib.error.URLError, json.JSONDecodeError):
-        log.exception("API PUT failed: %s", path)
-        return None
+def _api_get(path: str, *, retries: Optional[int] = None) -> Optional[dict]:
+    return _api_request("GET", path, retries=retries)
+
+
+def _api_post(path: str, body: dict, *, retries: Optional[int] = None) -> Optional[dict]:
+    return _api_request("POST", path, body, retries=retries)
+
+
+def _api_put(path: str, body: dict, *, retries: Optional[int] = None) -> Optional[dict]:
+    return _api_request("PUT", path, body, retries=retries)
 
 
 def _list_our_webhooks() -> List[dict]:
-    raw = _api_get("/webhooks")
+    raw = _api_get("/webhooks", retries=YOUGILE_API_BOOT_RETRIES)
     if raw is None:
         return []
     subs = raw if isinstance(raw, list) else (raw.get("content") or raw.get("data") or [])
@@ -334,7 +377,7 @@ def ensure_webhook_subscription() -> bool:
     for s in ours:
         sub_id = s.get("id")
         if sub_id:
-            _api_put(f"/webhooks/{sub_id}", {"disabled": False})
+            _api_put(f"/webhooks/{sub_id}", {"disabled": False}, retries=YOUGILE_API_BOOT_RETRIES)
     ours = _list_our_webhooks()
     if any(not s.get("disabled") for s in ours):
         log.info("ensure_webhook: re-enabled existing subscription for %s", WEBHOOK_URL)
@@ -342,9 +385,12 @@ def ensure_webhook_subscription() -> bool:
     for s in ours:
         sub_id = s.get("id")
         if sub_id:
-            _api_put(f"/webhooks/{sub_id}", {"deleted": True})
+            _api_put(f"/webhooks/{sub_id}", {"deleted": True}, retries=YOUGILE_API_BOOT_RETRIES)
             log.info("ensure_webhook: removed dead subscription %s", sub_id)
-    created = _api_post("/webhooks", {"url": WEBHOOK_URL, "event": WEBHOOK_EVENT_REGEX})
+    created = _api_post(
+        "/webhooks", {"url": WEBHOOK_URL, "event": WEBHOOK_EVENT_REGEX},
+        retries=YOUGILE_API_BOOT_RETRIES,
+    )
     if created:
         log.info("ensure_webhook: created fresh subscription for %s", WEBHOOK_URL)
         return True
@@ -399,14 +445,14 @@ def refresh_directories() -> None:
     USERS_BY_ID.clear()
     USERS_BY_EMAIL.clear()
     COLUMNS_BY_NAME.clear()
-    users = _api_get("/users?limit=1000") or {}
+    users = _api_get("/users?limit=1000", retries=YOUGILE_API_BOOT_RETRIES) or {}
     for u in users.get("content", []):
         uid = u["id"]
         USERS_BY_ID[uid] = u
         em = (u.get("email") or "").lower()
         if em:
             USERS_BY_EMAIL[em] = uid
-    columns = _api_get("/columns?limit=1000") or {}
+    columns = _api_get("/columns?limit=1000", retries=YOUGILE_API_BOOT_RETRIES) or {}
     for c in columns.get("content", []):
         title = (c.get("title") or "").lower()
         if title:
@@ -1408,7 +1454,10 @@ async def yougile_webhook(req: Request):
                     args=(react_chat_id, react_msg_id, ACK_REACTION_EMOJI),
                     daemon=True,
                 ).start()
-        ok, why = spawn_claude(rule, payload)
+        # spawn_claude reads chat history synchronously (now with infinite API
+        # retries), so run it off the event loop — a VPN flap mid-fetch must not
+        # stall healthz or the acceptance of other webhook deliveries.
+        ok, why = await asyncio.to_thread(spawn_claude, rule, payload)
         spawn_reason = why
         if ok:
             fired_rule = rule.name
