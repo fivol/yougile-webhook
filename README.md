@@ -115,6 +115,14 @@ One subscription with a broad event regex covers all rules:
 .venv/bin/python register_webhook.py delete <hook-id>     # delete one
 ```
 
+**Exactly one live subscription per URL.** Two enabled rows for the same URL
+make YouGile deliver every event twice. The service enforces this on every
+`ensure` cycle (startup + timer): it keeps one canonical subscription, prunes
+every other row (dead or duplicate-live), and re-enables the survivor —
+recreating only when there is genuinely none. `register_webhook.py create` also
+refuses to add a second live subscription, so you can't create a duplicate by
+hand either. You normally never need `create` at all — the service self-provisions.
+
 Defaults from `.env.example`:
 
 ```

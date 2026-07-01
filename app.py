@@ -436,15 +436,37 @@ def _list_our_webhooks(*, retries: Optional[int] = None) -> List[dict]:
     return ours
 
 
-def ensure_webhook_subscription(*, retries: Optional[int] = None) -> bool:
-    """Make sure a healthy YouGile webhook subscription points at our URL.
+def _canonical_webhook(subs: List[dict]) -> Optional[dict]:
+    """Among several subscriptions for our URL, pick the single one to keep:
+    prefer an enabled row, then the most recently successful, then the lowest
+    failure streak. Deterministic, so repeated reconciles agree on the survivor.
+    """
+    if not subs:
+        return None
+    return max(
+        subs,
+        key=lambda s: (
+            0 if s.get("disabled") else 1,
+            s.get("lastSuccess") or 0,
+            -(s.get("failuresSinceLastSuccess") or 0),
+        ),
+    )
 
-    Run at startup and on a timer (WEBHOOK_ENSURE_INTERVAL_SECONDS). YouGile
-    disables a subscription after a streak of failed deliveries — once we are
-    back up the subscription stays dead unless we touch it. We try to flip
-    `disabled` back to false (preserves the id and YouGile-side counters);
-    if that doesn't take, we delete and recreate. Returns True if a healthy
-    subscription is in place after the call.
+
+def ensure_webhook_subscription(*, retries: Optional[int] = None) -> bool:
+    """Reconcile YouGile to EXACTLY ONE enabled subscription for our URL.
+
+    Run at startup and on a timer (WEBHOOK_ENSURE_INTERVAL_SECONDS). Two things
+    can leave stale rows: YouGile disables a subscription after a streak of
+    failed deliveries (it stays dead until we touch it), and a delete+recreate
+    or a stray `create` can leave several rows for the same URL — and two LIVE
+    rows mean YouGile delivers every event twice.
+
+    Each call therefore keeps one canonical row, deletes every other (dead OR
+    duplicate-live), and makes sure the survivor is enabled — recreating only
+    when there is genuinely none. A duplicate live subscription is thus
+    self-correcting: it survives at most one cycle before the next ensure prunes
+    it. Returns True if a single healthy subscription is in place after the call.
     """
     if not (WEBHOOK_URL and YOUGILE_API_KEY):
         return False
@@ -455,22 +477,35 @@ def ensure_webhook_subscription(*, retries: Optional[int] = None) -> bool:
             _webhook_status["last_ensure_ok"] = ok
         return ok
 
+    def _prune(subs: List[dict]) -> None:
+        for s in subs:
+            sub_id = s.get("id")
+            if sub_id:
+                _api_put(f"/webhooks/{sub_id}", {"deleted": True}, retries=budget)
+                log.info("ensure_webhook: pruned extra subscription %s (disabled=%s)",
+                         sub_id, s.get("disabled"))
+
     ours = _list_our_webhooks(retries=budget)
-    if any(not s.get("disabled") for s in ours):
-        return _done(True)
-    for s in ours:
-        sub_id = s.get("id")
-        if sub_id:
-            _api_put(f"/webhooks/{sub_id}", {"disabled": False}, retries=budget)
-    ours = _list_our_webhooks(retries=budget)
-    if any(not s.get("disabled") for s in ours):
-        log.info("ensure_webhook: re-enabled existing subscription for %s", WEBHOOK_URL)
-        return _done(True)
-    for s in ours:
-        sub_id = s.get("id")
-        if sub_id:
-            _api_put(f"/webhooks/{sub_id}", {"deleted": True}, retries=budget)
-            log.info("ensure_webhook: removed dead subscription %s", sub_id)
+    keep = _canonical_webhook(ours)
+    if keep is not None:
+        keep_id = keep.get("id")
+        # Collapse every other row for this URL — dead ones and live duplicates.
+        _prune([s for s in ours if s.get("id") != keep_id])
+        if keep.get("disabled"):
+            _api_put(f"/webhooks/{keep_id}", {"disabled": False}, retries=budget)
+            log.info("ensure_webhook: re-enabled subscription %s for %s", keep_id, WEBHOOK_URL)
+        # Confirm the survivor is live; defensively prune anything left over
+        # (e.g. a delete that was still settling, or a racing live row).
+        ours = _list_our_webhooks(retries=budget)
+        live = [s for s in ours if not s.get("disabled")]
+        if live:
+            if len(ours) > 1:
+                keep2_id = (_canonical_webhook(live) or {}).get("id")
+                _prune([s for s in ours if s.get("id") != keep2_id])
+            return _done(True)
+        # The survivor refused to enable — drop everything and recreate below.
+        _prune(ours)
+
     created = _api_post(
         "/webhooks", {"url": WEBHOOK_URL, "event": WEBHOOK_EVENT_REGEX},
         retries=budget,

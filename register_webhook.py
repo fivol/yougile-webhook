@@ -61,7 +61,25 @@ def cmd_list():
     print(json.dumps({"status": status, "data": data}, ensure_ascii=False, indent=2))
 
 
+def _our_subscriptions():
+    _, data = _request("GET", "/webhooks")
+    rows = data
+    if isinstance(rows, dict):
+        rows = rows.get("content") or rows.get("data") or []
+    return [s for s in (rows or []) if isinstance(s, dict) and s.get("url") == WEBHOOK_URL]
+
+
 def cmd_create():
+    # Refuse to create a duplicate: the service keeps exactly one live
+    # subscription per URL, and a second live row makes YouGile deliver every
+    # event twice. If a live one already exists, do nothing.
+    live = [s for s in _our_subscriptions() if not s.get("disabled")]
+    if live:
+        print(json.dumps({
+            "skipped": "a live subscription for this URL already exists — not creating a duplicate",
+            "existing": [s.get("id") for s in live],
+        }, ensure_ascii=False, indent=2))
+        return
     body: dict = {"url": WEBHOOK_URL, "event": EVENT}
     if CHAT_FILTER:
         body["filters"] = [{"name": "chat_message", "value": CHAT_FILTER}]
