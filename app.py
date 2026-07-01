@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -77,11 +78,50 @@ YOUGILE_FILE_BASE_URL = os.environ.get(
 # Boot/control-plane calls (directory load, webhook (de)registration) pass a
 # small finite budget so a dead API at startup can't hang the import, and the
 # watcher just retries on its next cycle.
-YOUGILE_API_TIMEOUT = int(os.environ.get("YOUGILE_API_TIMEOUT", "15"))
+YOUGILE_API_TIMEOUT = int(os.environ.get("YOUGILE_API_TIMEOUT", "30"))
 YOUGILE_API_MAX_RETRIES = int(os.environ.get("YOUGILE_API_MAX_RETRIES", "0"))  # 0 = infinite
 YOUGILE_API_BOOT_RETRIES = int(os.environ.get("YOUGILE_API_BOOT_RETRIES", "2"))
+# Watcher-driven ensure() runs off the request path, so it can afford a bigger
+# budget than the bounded boot retries — a flaky window shouldn't make it give
+# up and go silent for a whole interval.
+YOUGILE_API_WATCHER_RETRIES = int(os.environ.get("YOUGILE_API_WATCHER_RETRIES", "5"))
 YOUGILE_API_RETRY_BASE_DELAY = float(os.environ.get("YOUGILE_API_RETRY_BASE_DELAY", "1"))
 YOUGILE_API_RETRY_MAX_DELAY = float(os.environ.get("YOUGILE_API_RETRY_MAX_DELAY", "30"))
+
+# --- Force IPv4 for all outbound connections --------------------------------
+# The #1 cause of "SSL handshake timed out" on an otherwise-healthy host is a
+# broken/half-open IPv6 route: getaddrinfo returns an AAAA record first, urllib
+# tries it, and the TLS handshake stalls on the dead route until the full
+# timeout — while `curl` (which does Happy-Eyeballs, racing v4 and v6) connects
+# instantly. urllib has no Happy-Eyeballs, so we drop AAAA results and use IPv4
+# only. We keep any explicit AF_INET6 lookups and fall back to the original
+# result set if a host has no A record, so nothing that genuinely needs IPv6
+# breaks. Toggle off with NETWORK_FORCE_IPV4=false.
+NETWORK_FORCE_IPV4 = os.environ.get("NETWORK_FORCE_IPV4", "true").lower() not in ("0", "false", "no")
+if NETWORK_FORCE_IPV4:
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        results = _orig_getaddrinfo(host, port, family, type, proto, flags)
+        if family in (0, socket.AF_UNSPEC):
+            ipv4 = [r for r in results if r[0] == socket.AF_INET]
+            if ipv4:
+                return ipv4
+        return results
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+    log.info("network: forcing IPv4 for outbound connections (NETWORK_FORCE_IPV4=true)")
+
+# --- Event-loop watchdog ----------------------------------------------------
+# launchd KeepAlive restarts the process if it EXITS, but not if the asyncio
+# loop wedges (the failure mode that once left us silently dead for hours). A
+# heartbeat task bumps a monotonic timestamp on the loop; a daemon thread
+# force-exits the process if that timestamp goes stale, letting launchd bring
+# up a fresh one. The threshold is deliberately generous so a momentarily busy
+# loop is never mistaken for a wedged one. Set the timeout to 0 to disable.
+LOOP_WATCHDOG_TIMEOUT_SECONDS = int(os.environ.get("LOOP_WATCHDOG_TIMEOUT_SECONDS", "180"))
+LOOP_WATCHDOG_CHECK_SECONDS = int(os.environ.get("LOOP_WATCHDOG_CHECK_SECONDS", "15"))
+_loop_heartbeat = time.monotonic()
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_DEFAULT_WORKDIR = os.environ.get("CLAUDE_WORKDIR") or str(ROOT)
@@ -163,7 +203,10 @@ CHAT_HISTORY_DELTA_LIMIT = int(os.environ.get("CHAT_HISTORY_DELTA_LIMIT", "50"))
 
 ATTACHMENTS_ENABLED = os.environ.get("ATTACHMENTS_ENABLED", "true").lower() not in ("0", "false", "no")
 ATTACHMENT_MAX_BYTES = int(os.environ.get("ATTACHMENT_MAX_BYTES", str(25 * 1024 * 1024)))
-ATTACHMENT_TIMEOUT_SECONDS = int(os.environ.get("ATTACHMENT_TIMEOUT_SECONDS", "30"))
+ATTACHMENT_TIMEOUT_SECONDS = int(os.environ.get("ATTACHMENT_TIMEOUT_SECONDS", "60"))
+# Retry a transient attachment download (network error, timeout, 5xx) a few
+# times before giving up — a VPN blip shouldn't cost the agent a screenshot.
+ATTACHMENT_MAX_RETRIES = int(os.environ.get("ATTACHMENT_MAX_RETRIES", "3"))
 
 # Reaction dropped on the trigger message the instant it matches a rule — a
 # fast "received" signal that fires BEFORE the agent spawns and before any ack
@@ -180,6 +223,10 @@ RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
 WEBHOOK_URL = os.environ.get("YOUGILE_WEBHOOK_URL", "").strip()
 WEBHOOK_EVENT_REGEX = os.environ.get("YOUGILE_WEBHOOK_EVENT", "(chat_message|task)-.*").strip()
 WEBHOOK_ENSURE_INTERVAL_SECONDS = int(os.environ.get("WEBHOOK_ENSURE_INTERVAL_SECONDS", "900"))
+# After a failed ensure cycle (couldn't reach YouGile / couldn't revive the
+# subscription) retry this soon instead of waiting the full interval, so we
+# recover from an outage in minutes.
+WEBHOOK_ENSURE_RETRY_SECONDS = int(os.environ.get("WEBHOOK_ENSURE_RETRY_SECONDS", "60"))
 
 # Shared formatting guidance, substituted into every prompt via {formatting}.
 # Single source of truth so all spawned agents post visually-consistent messages
@@ -351,15 +398,45 @@ def _api_put(path: str, body: dict, *, retries: Optional[int] = None) -> Optiona
     return _api_request("PUT", path, body, retries=retries)
 
 
-def _list_our_webhooks() -> List[dict]:
-    raw = _api_get("/webhooks", retries=YOUGILE_API_BOOT_RETRIES)
+# Last-known subscription state, refreshed by ensure_webhook_subscription() so
+# /healthz can report it instantly without a live (blocking) API round-trip.
+_webhook_status_lock = threading.Lock()
+_webhook_status: Dict[str, Any] = {
+    "subscriptions": [],
+    "healthy": None,      # None = never checked yet
+    "checked_at": None,   # ISO timestamp of the last successful /webhooks read
+    "last_ensure_ok": None,
+}
+
+
+def _store_webhook_status(subs: List[dict], *, reachable: bool) -> None:
+    with _webhook_status_lock:
+        if reachable:
+            _webhook_status["subscriptions"] = [
+                {
+                    "id": s.get("id"),
+                    "disabled": bool(s.get("disabled")),
+                    "failures_since_last_success": s.get("failuresSinceLastSuccess"),
+                    "last_success": s.get("lastSuccess"),
+                }
+                for s in subs
+            ]
+            _webhook_status["healthy"] = any(not s.get("disabled") for s in subs)
+            _webhook_status["checked_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _list_our_webhooks(*, retries: Optional[int] = None) -> List[dict]:
+    budget = YOUGILE_API_BOOT_RETRIES if retries is None else retries
+    raw = _api_get("/webhooks", retries=budget)
     if raw is None:
         return []
     subs = raw if isinstance(raw, list) else (raw.get("content") or raw.get("data") or [])
-    return [s for s in subs if isinstance(s, dict) and s.get("url") == WEBHOOK_URL]
+    ours = [s for s in subs if isinstance(s, dict) and s.get("url") == WEBHOOK_URL]
+    _store_webhook_status(ours, reachable=True)
+    return ours
 
 
-def ensure_webhook_subscription() -> bool:
+def ensure_webhook_subscription(*, retries: Optional[int] = None) -> bool:
     """Make sure a healthy YouGile webhook subscription points at our URL.
 
     Run at startup and on a timer (WEBHOOK_ENSURE_INTERVAL_SECONDS). YouGile
@@ -371,41 +448,56 @@ def ensure_webhook_subscription() -> bool:
     """
     if not (WEBHOOK_URL and YOUGILE_API_KEY):
         return False
-    ours = _list_our_webhooks()
+    budget = YOUGILE_API_BOOT_RETRIES if retries is None else retries
+
+    def _done(ok: bool) -> bool:
+        with _webhook_status_lock:
+            _webhook_status["last_ensure_ok"] = ok
+        return ok
+
+    ours = _list_our_webhooks(retries=budget)
     if any(not s.get("disabled") for s in ours):
-        return True
+        return _done(True)
     for s in ours:
         sub_id = s.get("id")
         if sub_id:
-            _api_put(f"/webhooks/{sub_id}", {"disabled": False}, retries=YOUGILE_API_BOOT_RETRIES)
-    ours = _list_our_webhooks()
+            _api_put(f"/webhooks/{sub_id}", {"disabled": False}, retries=budget)
+    ours = _list_our_webhooks(retries=budget)
     if any(not s.get("disabled") for s in ours):
         log.info("ensure_webhook: re-enabled existing subscription for %s", WEBHOOK_URL)
-        return True
+        return _done(True)
     for s in ours:
         sub_id = s.get("id")
         if sub_id:
-            _api_put(f"/webhooks/{sub_id}", {"deleted": True}, retries=YOUGILE_API_BOOT_RETRIES)
+            _api_put(f"/webhooks/{sub_id}", {"deleted": True}, retries=budget)
             log.info("ensure_webhook: removed dead subscription %s", sub_id)
     created = _api_post(
         "/webhooks", {"url": WEBHOOK_URL, "event": WEBHOOK_EVENT_REGEX},
-        retries=YOUGILE_API_BOOT_RETRIES,
+        retries=budget,
     )
     if created:
         log.info("ensure_webhook: created fresh subscription for %s", WEBHOOK_URL)
-        return True
+        return _done(True)
     log.warning("ensure_webhook: failed to provision subscription for %s", WEBHOOK_URL)
-    return False
+    return _done(False)
 
 
 def _webhook_watcher() -> None:
-    """Background daemon: keep the YouGile subscription healthy."""
+    """Background daemon: keep the YouGile subscription healthy.
+
+    Self-healing cadence: when the subscription is confirmed healthy we relax to
+    the long interval; when a cycle can't reach YouGile or can't provision the
+    subscription, we retry again soon (WEBHOOK_ENSURE_RETRY_SECONDS) so recovery
+    from an outage takes minutes, not a full interval. The ensure runs off the
+    request path with a generous retry budget.
+    """
     while True:
-        time.sleep(WEBHOOK_ENSURE_INTERVAL_SECONDS)
         try:
-            ensure_webhook_subscription()
+            ok = ensure_webhook_subscription(retries=YOUGILE_API_WATCHER_RETRIES)
         except Exception:
             log.exception("ensure_webhook: watcher cycle failed")
+            ok = False
+        time.sleep(WEBHOOK_ENSURE_INTERVAL_SECONDS if ok else WEBHOOK_ENSURE_RETRY_SECONDS)
 
 
 def send_chat_message(chat_id: str, text: str, text_html: Optional[str] = None) -> bool:
@@ -769,41 +861,72 @@ def _download_attachment(url: str, chat_id: Optional[str]) -> Optional[Path]:
     if YOUGILE_API_KEY and "yougile" in (parsed.netloc or ""):
         headers["Authorization"] = f"Bearer {YOUGILE_API_KEY}"
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=ATTACHMENT_TIMEOUT_SECONDS) as resp:
-            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
-            ext = Path(raw_name).suffix
-            if not ext and ctype:
-                guessed = mimetypes.guess_extension(ctype)
-                if guessed:
-                    raw_name = f"{Path(raw_name).stem}{guessed}"
-            dest = chat_dir / f"{digest}_{raw_name}"
-            tmp = dest.with_suffix(dest.suffix + ".tmp")
-            written = 0
-            with tmp.open("wb") as f:
-                while True:
-                    chunk = resp.read(64 * 1024)
-                    if not chunk:
-                        break
-                    written += len(chunk)
-                    if written > ATTACHMENT_MAX_BYTES:
-                        raise IOError(
-                            f"attachment exceeds ATTACHMENT_MAX_BYTES "
-                            f"({ATTACHMENT_MAX_BYTES} bytes)"
-                        )
-                    f.write(chunk)
-            tmp.replace(dest)
-            log.info("downloaded attachment chat=%s url=%s -> %s (%d bytes)",
-                     chat_id, url, dest, written)
-            return dest
-    except Exception as e:
-        log.warning("attachment download failed chat=%s url=%s: %s", chat_id, url, e)
+
+    def _cleanup_tmp() -> None:
         try:
-            tmp_path = chat_dir / f"{digest}_{raw_name}.tmp"
-            tmp_path.unlink(missing_ok=True)
+            for leftover in chat_dir.glob(f"{digest}_*.tmp"):
+                leftover.unlink(missing_ok=True)
         except Exception:
             pass
-        return None
+
+    # Same transient-vs-permanent split as the API layer: retry network errors,
+    # timeouts and 5xx with capped backoff; give up at once on a 4xx (stale
+    # preview URL, 403) or an over-size file, where retrying can't help.
+    attempt = 0
+    delay = YOUGILE_API_RETRY_BASE_DELAY
+    while True:
+        attempt += 1
+        try:
+            with urllib.request.urlopen(req, timeout=ATTACHMENT_TIMEOUT_SECONDS) as resp:
+                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                ext = Path(raw_name).suffix
+                if not ext and ctype:
+                    guessed = mimetypes.guess_extension(ctype)
+                    if guessed:
+                        raw_name = f"{Path(raw_name).stem}{guessed}"
+                dest = chat_dir / f"{digest}_{raw_name}"
+                tmp = dest.with_suffix(dest.suffix + ".tmp")
+                written = 0
+                with tmp.open("wb") as f:
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > ATTACHMENT_MAX_BYTES:
+                            raise ValueError(
+                                f"attachment exceeds ATTACHMENT_MAX_BYTES "
+                                f"({ATTACHMENT_MAX_BYTES} bytes)"
+                            )
+                        f.write(chunk)
+                tmp.replace(dest)
+                log.info("downloaded attachment chat=%s url=%s -> %s (%d bytes)",
+                         chat_id, url, dest, written)
+                return dest
+        except urllib.error.HTTPError as e:  # HTTPError is-a URLError/OSError — catch first
+            _cleanup_tmp()
+            if 400 <= e.code < 500:
+                log.warning("attachment download chat=%s url=%s -> HTTP %s (permanent)",
+                            chat_id, url, e.code)
+                return None
+            reason: Any = f"HTTP {e.code}"
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            _cleanup_tmp()
+            reason = getattr(e, "reason", e)
+        except Exception as e:
+            # Over-size cap or a local write error — not a connectivity issue.
+            _cleanup_tmp()
+            log.warning("attachment download failed chat=%s url=%s: %s", chat_id, url, e)
+            return None
+
+        if attempt > ATTACHMENT_MAX_RETRIES:
+            log.warning("attachment download giving up after %d attempt(s) chat=%s url=%s (%s)",
+                        attempt, chat_id, url, reason)
+            return None
+        log.warning("attachment download transient (%s) — retry %d chat=%s url=%s",
+                    reason, attempt, chat_id, url)
+        time.sleep(delay)
+        delay = min(delay * 2, YOUGILE_API_RETRY_MAX_DELAY)
 
 
 def _extract_attachment_urls(message: Any) -> List[str]:
@@ -969,6 +1092,54 @@ def render_chat_history(
 # ---------------------------------------------------------------- spawning
 
 app = FastAPI(title="YouGile webhook receiver")
+
+
+async def _loop_heartbeat_task() -> None:
+    """Prove the event loop is alive by bumping a monotonic timestamp."""
+    global _loop_heartbeat
+    while True:
+        _loop_heartbeat = time.monotonic()
+        await asyncio.sleep(5)
+
+
+def _loop_watchdog() -> None:
+    """Force-exit if the event loop stops heart-beating so launchd (KeepAlive)
+    brings up a fresh process. This is the recovery path for a genuinely wedged
+    loop — the very failure mode that once left us silently dead. Network
+    outages are NOT a trigger (they're handled by retries + the subscription
+    watcher); a restart wouldn't fix those anyway. The threshold is far larger
+    than any normal loop pause, so a busy-but-healthy process is never killed.
+    """
+    while True:
+        time.sleep(LOOP_WATCHDOG_CHECK_SECONDS)
+        age = time.monotonic() - _loop_heartbeat
+        if age > LOOP_WATCHDOG_TIMEOUT_SECONDS:
+            log.critical(
+                "watchdog: event loop stalled for %.0fs (> %ds) — exiting for a clean restart",
+                age, LOOP_WATCHDOG_TIMEOUT_SECONDS,
+            )
+            os._exit(1)
+
+
+_heartbeat_task_ref: Optional["asyncio.Task"] = None
+
+
+@app.on_event("startup")
+async def _start_background_tasks() -> None:
+    # Arm the loop heartbeat + watchdog only once the loop is actually running,
+    # so the blocking import-time startup work can't be mistaken for a stall.
+    global _loop_heartbeat, _heartbeat_task_ref
+    _loop_heartbeat = time.monotonic()
+    # Keep a strong reference — asyncio only holds a weak one, so a fire-and-
+    # forget task can be GC'd mid-await.
+    _heartbeat_task_ref = asyncio.create_task(_loop_heartbeat_task())
+    if LOOP_WATCHDOG_TIMEOUT_SECONDS > 0:
+        threading.Thread(target=_loop_watchdog, daemon=True).start()
+        log.info(
+            "watchdog: armed (timeout=%ds, check=%ds)",
+            LOOP_WATCHDOG_TIMEOUT_SECONDS, LOOP_WATCHDOG_CHECK_SECONDS,
+        )
+
 
 _active_lock = threading.Lock()
 _active_procs: Set[int] = set()
@@ -1380,23 +1551,25 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
 # ---------------------------------------------------------------- HTTP
 
 @app.get("/healthz")
-def healthz():
-    subs = _list_our_webhooks() if WEBHOOK_URL else []
+async def healthz():
+    # Never hit the network here: a health check must return instantly even when
+    # YouGile is unreachable, so it stays a reliable liveness signal. The webhook
+    # subscription snapshot is whatever the background watcher last observed.
+    with _webhook_status_lock:
+        webhook = {
+            "subscriptions": list(_webhook_status["subscriptions"]),
+            "healthy": _webhook_status["healthy"],
+            "checked_at": _webhook_status["checked_at"],
+            "last_ensure_ok": _webhook_status["last_ensure_ok"],
+        }
     return {
         "ok": True,
+        "loop_heartbeat_age_s": round(time.monotonic() - _loop_heartbeat, 1),
         "claude_bin": CLAUDE_BIN,
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,
         "active_claude_procs": len(_active_procs),
         "tracked_chats": list_known_chats(),
-        "webhook_subscriptions": [
-            {
-                "id": s.get("id"),
-                "disabled": bool(s.get("disabled")),
-                "failures_since_last_success": s.get("failuresSinceLastSuccess"),
-                "last_success": s.get("lastSuccess"),
-            }
-            for s in subs
-        ],
+        "webhook": webhook,
         "rules": [
             {
                 "name": r.name,

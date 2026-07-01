@@ -45,7 +45,31 @@ curl http://127.0.0.1:9100/healthz
 ```
 
 `run.sh` reads `.env` and starts uvicorn. `/healthz` returns the resolved
-rule set so you can see what's wired up.
+rule set so you can see what's wired up. It is **non-blocking** — it never
+calls the YouGile API, so it stays a reliable liveness signal even when the
+network is down. It reports the last-known webhook subscription snapshot
+(refreshed by the background watcher) under `webhook`, and `loop_heartbeat_age_s`
+(seconds since the event loop last ticked — see the watchdog below).
+
+### Network resilience
+
+The receiver is built to ride out an unstable network without losing work or
+going silently dead:
+
+- **Force IPv4** (`NETWORK_FORCE_IPV4=true`, default) — a broken/half-open IPv6
+  route is the usual cause of `SSL handshake timed out` on an otherwise-healthy
+  host: `urllib` has no Happy-Eyeballs, so it stalls on the dead AAAA address
+  until timeout while `curl` connects instantly over IPv4. Dropping AAAA results
+  avoids it. Falls back to IPv6 if a host has no A record.
+- **Retries everywhere** — every YouGile API call and every attachment download
+  retries transient failures (network error, timeout, HTTP 429/5xx) with capped
+  exponential backoff; a 4xx is permanent and never retried.
+- **Self-healing subscription** — the watcher revives a YouGile-disabled
+  subscription, and after a failed cycle retries in `WEBHOOK_ENSURE_RETRY_SECONDS`
+  (default 60s) instead of waiting the full sweep interval.
+- **Event-loop watchdog** — if the asyncio loop ever wedges, the process
+  force-exits so launchd (`KeepAlive`) restarts a fresh one. Network outages do
+  NOT trigger it (a restart wouldn't help those).
 
 ### Autostart (macOS launchd)
 
@@ -202,10 +226,14 @@ path / PR URL across turns.
 | `CLAUDE_RETRY_DELAYS` | Comma-separated backoff in seconds between retries. Default `30,120,300`. The last value repeats if there are more retries than entries. |
 | `RULES_FILE` | Default `rules.toml`. |
 | `WEBHOOK_ENSURE_INTERVAL_SECONDS` | How often the service sweeps its own YouGile subscription and revives it if YouGile auto-disabled it after a streak of failed deliveries (e.g. while we were down). Default `900` (15 min). The same check runs once at startup. Set to a large value to disable the timer; the startup check still fires. |
-| `YOUGILE_API_TIMEOUT` | Per-attempt timeout (seconds) for every call to the YouGile API. Default `15`. |
+| `WEBHOOK_ENSURE_RETRY_SECONDS` | After a *failed* ensure cycle (couldn't reach YouGile / couldn't revive the subscription), retry this soon instead of waiting the full interval — so recovery from an outage takes minutes. Default `60`. |
+| `YOUGILE_API_TIMEOUT` | Per-attempt timeout (seconds) for every call to the YouGile API. Default `30`. |
 | `YOUGILE_API_MAX_RETRIES` | Retries for data-plane calls (reaction, ack, history fetch, message post) on a *transient* failure — network error, timeout, HTTP 429/5xx — with capped exponential backoff. `0` = retry forever (default), so a flapping VPN or brief outage never drops a 👍 or an ack. A 4xx is permanent and never retried. |
 | `YOUGILE_API_BOOT_RETRIES` | Bounded retry budget for boot/control-plane calls (directory load, webhook (de)registration) so a dead API at startup can't hang the import; the watcher just retries next cycle. Default `2`. |
+| `YOUGILE_API_WATCHER_RETRIES` | Retry budget for the background subscription watcher's `ensure()` — it runs off the request path, so it affords more than the boot budget before backing off. Default `5`. |
 | `YOUGILE_API_RETRY_BASE_DELAY` / `YOUGILE_API_RETRY_MAX_DELAY` | Backoff between API retries — starts at base, doubles, capped at max (seconds). Defaults `1` / `30`. |
+| `NETWORK_FORCE_IPV4` | Force IPv4 for all outbound connections by dropping AAAA (IPv6) DNS results — sidesteps the `SSL handshake timed out` stalls a broken IPv6 route causes with `urllib` (no Happy-Eyeballs). Falls back to IPv6 if a host has no A record. Default `true`. |
+| `LOOP_WATCHDOG_TIMEOUT_SECONDS` / `LOOP_WATCHDOG_CHECK_SECONDS` | Event-loop watchdog: if the asyncio loop stops heart-beating for longer than the timeout, the process force-exits so launchd restarts it. Only catches a genuinely wedged loop (threshold ≫ any normal pause), never a network outage. `0` timeout disables. Defaults `180` / `15`. |
 | `SENDER_KEYS` | Payload keys checked (in order, top-level and nested) for the sender's user UUID. |
 | `COLUMN_KEYS` | Same, for column UUIDs. |
 | `CHAT_ID_KEYS` | Same, for the task/chat UUID used as the claude session id. |
@@ -213,7 +241,8 @@ path / PR URL across turns.
 | `CHAT_HISTORY_DELTA_LIMIT` | How many new messages to inject on subsequent triggers (default 50). |
 | `ATTACHMENTS_ENABLED` | Default `true`. Download `/root/#file:<url>` attachments from chat messages into `state/attachments/<chatId>/` and surface them to the agent. |
 | `ATTACHMENT_MAX_BYTES` | Per-file size cap (default 25 MiB). Larger files are skipped. |
-| `ATTACHMENT_TIMEOUT_SECONDS` | Per-file download timeout (default 30s). |
+| `ATTACHMENT_TIMEOUT_SECONDS` | Per-file download timeout (default 60s). |
+| `ATTACHMENT_MAX_RETRIES` | Retry a transient attachment download (network error, timeout, 5xx) this many times before giving up; a 4xx or over-size file is permanent and not retried. Default `3`. |
 | `ACK_REACTION_EMOJI` | Emoji reaction dropped on the trigger message the instant it matches a rule — fires before the agent spawns and before any `ack_message`, as an immediate "received" signal. Default `👍`. YouGile accepts ONLY `👍 👎 👏 🙂 😀 😕 🎉 ❤ 🚀 ✔` (👀 is rejected). Empty = disabled. Applies only to `chat_message-*` events. |
 
 After editing `.env` or `rules.toml`, reload:
@@ -273,8 +302,9 @@ A list of every downloaded path is also appended to the prompt under
 at a glance what's available without parsing the history.
 
 Caps: `ATTACHMENT_MAX_BYTES` (25 MiB default) and
-`ATTACHMENT_TIMEOUT_SECONDS` (30s default). Files that exceed the cap
-or time out are silently skipped and their markers stay unresolved.
+`ATTACHMENT_TIMEOUT_SECONDS` (60s default). A transient failure is retried up
+to `ATTACHMENT_MAX_RETRIES` times (default 3) with backoff; files that exceed
+the cap or still fail are silently skipped and their markers stay unresolved.
 
 To send files back to chat, the prompts point the agent at
 `mcp__yougile-mcp__send_task_file` (taskId = `payload.chatId`,
