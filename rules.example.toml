@@ -18,11 +18,14 @@
 #                           transitions into the column (prevData.columnId != payload.columnId).
 #                           Setting to false will fire on every task event while the task sits
 #                           in the target column — usually too noisy.
-#   skip_if_chat_known      bool (default false). Skip this rule if a claude session has already
-#                           been started for the task's chat (i.e. state/chats/<chatId>.json
-#                           exists). Useful for auto-kickoff rules like task_in_progress so they
+#   skip_if_chat_known      bool (default false). Skip this rule if the task's chat already has a
+#                           claude session — one that finished (state/chats/<chatId>.json exists)
+#                           or one being launched / running right now (the chat's turn lock is
+#                           held). Useful for auto-kickoff rules like task_in_progress so they
 #                           don't fire when someone has already pinged @Agent / !implement on the
-#                           same task — the existing LLM conversation takes precedence.
+#                           same task — the existing LLM conversation takes precedence. Such an
+#                           event is dropped rather than queued behind the live turn, so it can't
+#                           resurface as a stale kickoff when that turn ends.
 #   session_per_chat        bool (default true). When true, claude is run with --session-id (first
 #                           time) or --resume (subsequent), keyed to the task/chat UUID. The same
 #                           agent "remembers" prior turns. Set to false to make each invocation

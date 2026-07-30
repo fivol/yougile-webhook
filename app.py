@@ -737,6 +737,15 @@ def rule_matches(rule: Rule, payload) -> Tuple[bool, str]:
         chat_id = extract_chat_id(payload)
         if chat_id and chat_known(chat_id):
             return False, "chat-already-has-llm-session"
+        # A turn that is being launched right now counts as an existing session
+        # too — state/chats/<chatId>.json only lands mid-spawn (after the chat
+        # history fetch, which retries a flaky network for as long as it takes),
+        # so for the first @Agent turn there is a multi-second window where the
+        # chat still looks unknown on disk. A move to "In progress" landing in
+        # that window used to sail through this check. spawn_claude re-checks
+        # under the chat lock, which is what actually makes this race-free.
+        if chat_id and chat_turn_in_flight(chat_id):
+            return False, "chat-turn-in-flight"
     return True, "ok"
 
 
@@ -1201,6 +1210,18 @@ def _get_chat_lock(chat_id: str) -> threading.Lock:
         return lock
 
 
+def chat_turn_in_flight(chat_id: str) -> bool:
+    """True while a turn for this chat is being launched or is running.
+
+    The on-disk companion to chat_known(): the lock is taken at the very top of
+    spawn_claude, well before the state file is written, so together they cover
+    the whole lifetime of a chat's session.
+    """
+    with _chat_locks_mutex:
+        lock = _chat_busy.get(chat_id)
+    return lock is not None and lock.locked()
+
+
 def _terminate_proc_group(pid: int) -> None:
     """SIGTERM the turn's process group, escalating to SIGKILL if it lingers.
 
@@ -1427,6 +1448,20 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
     chat_lock: Optional[threading.Lock] = _get_chat_lock(chat_id) if chat_id else None
 
     if chat_lock is not None and not chat_lock.acquire(blocking=False):
+        if rule.skip_if_chat_known:
+            # Auto-kickoff rule (task moved to "In progress") vs. a live turn:
+            # a running turn IS the "chat already has an LLM session" this rule
+            # bows out for — the human is talking to the agent right now. Never
+            # queue it: a queued kickoff would simply be postponed until that
+            # conversation ends and then fire as a stale auto-research run
+            # minutes later. Drop it for good. This also swallows YouGile's
+            # duplicate task-moved deliveries, which otherwise pile up behind
+            # the first one and re-run the kickoff.
+            log.info(
+                "rule %s: chat %s has a live turn — dropping auto-kickoff",
+                rule.name, chat_id,
+            )
+            return False, "chat-turn-in-flight"
         # A turn is already running for this chat. Don't drop the new message —
         # queue it and interrupt the in-flight turn; the queued turn starts the
         # instant the current one dies (chained from _release_chat), resuming the
@@ -1452,6 +1487,19 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
             return True, "queued"
         rule, payload = pending
         interrupted = True  # treat the reclaimed turn as an interrupting one
+
+    # Last word on skip_if_chat_known, now that we hold the chat lock: the
+    # session may have been created while this event travelled from
+    # rule_matches to here (the state file is written mid-spawn by the turn
+    # that owned the lock), and a turn queued before this guard existed
+    # re-enters spawn_claude here long after it matched.
+    if chat_id and rule.skip_if_chat_known and chat_known(chat_id):
+        log.info(
+            "rule %s: chat %s already has a session — dropping auto-kickoff",
+            rule.name, chat_id,
+        )
+        _release_chat(chat_id, chat_lock)
+        return False, "chat-already-has-llm-session"
 
     # No per-chat session, or the chat is idle and we now hold its lock. Enforce
     # the global concurrency cap for genuinely new turns — an interrupt replaces

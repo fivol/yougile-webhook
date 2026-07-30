@@ -205,7 +205,7 @@ path / PR URL across turns.
 | `allowed_sender_emails` | Whitelist; resolved to user UUIDs at startup via `/api-v2/users`. Empty = no sender filter (not recommended). |
 | `column_names` | Match `payload.columnId` against the resolved UUIDs of these column titles. |
 | `column_transition_only` | Default `true`. When `column_names` is set, only fire on actual transitions (`prevData.columnId != payload.columnId`). |
-| `skip_if_chat_known` | Default `false`. Skip this rule if a claude session already exists for the task's chat (`state/chats/<chatId>.json` exists). Use it on auto-kickoff rules like `task_in_progress` so they don't pile a second LLM run on top of an already-active `@Agent` conversation. |
+| `skip_if_chat_known` | Default `false`. Skip this rule if the task's chat already has a claude session — either finished (`state/chats/<chatId>.json` exists) or **being launched / running right now** (the chat's turn lock is held). Use it on auto-kickoff rules like `task_in_progress` so they don't pile a second LLM run on top of an already-active `@Agent` conversation. Such a rule is never queued behind a live turn: if the chat is busy the event is dropped, not postponed, so moving a task to "In progress" while the agent is mid-reply can't fire a stale kickoff once that reply finishes. |
 | `session_per_chat` | Default `true`. Runs claude with `--session-id <chatId>` first time, `--resume <chatId>` after. |
 | `prompt_file` | Path to a text file used as the prompt. `{event_json}`, `{chat_history}`, `{first_turn}`, `{formatting}`, `{language}`, and `{session_id}` are substituted. |
 | `workdir` | Override `CLAUDE_WORKDIR` for this rule. |
