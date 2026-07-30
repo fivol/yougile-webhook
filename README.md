@@ -51,6 +51,11 @@ network is down. It reports the last-known webhook subscription snapshot
 (refreshed by the background watcher) under `webhook`, and `loop_heartbeat_age_s`
 (seconds since the event loop last ticked — see the watchdog below).
 
+`version` echoes `APP_VERSION` from `app.py` (also logged on startup and
+served as the OpenAPI version). It is hand-maintained: bump it with any
+change worth restarting for, then check `/healthz` after the restart to
+confirm the new code is the code that's actually running.
+
 ### Network resilience
 
 The receiver is built to ride out an unstable network without losing work or

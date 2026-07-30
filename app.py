@@ -25,6 +25,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, Request
 
+# Hand-maintained; bump on every change worth restarting the service for. The
+# launchd agent runs uvicorn from the checkout, so /healthz reporting this is
+# the quickest way to tell whether a restart actually picked up new code.
+APP_VERSION = "1.0.1"
+
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -52,6 +57,7 @@ load_dotenv(ROOT / ".env")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("yougile-webhook")
+log.info("yougile-webhook %s starting from %s", APP_VERSION, ROOT)
 
 
 YOUGILE_API_KEY = os.environ.get("YOUGILE_API_KEY", "")
@@ -1135,7 +1141,7 @@ def render_chat_history(
 
 # ---------------------------------------------------------------- spawning
 
-app = FastAPI(title="YouGile webhook receiver")
+app = FastAPI(title="YouGile webhook receiver", version=APP_VERSION)
 
 
 async def _loop_heartbeat_task() -> None:
@@ -1647,6 +1653,7 @@ async def healthz():
         }
     return {
         "ok": True,
+        "version": APP_VERSION,
         "loop_heartbeat_age_s": round(time.monotonic() - _loop_heartbeat, 1),
         "claude_bin": CLAUDE_BIN,
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,
