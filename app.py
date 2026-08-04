@@ -28,7 +28,7 @@ from fastapi import FastAPI, Request
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -221,19 +221,34 @@ ATTACHMENT_MAX_RETRIES = int(os.environ.get("ATTACHMENT_MAX_RETRIES", "3"))
 # empty string to disable reacting entirely.
 ACK_REACTION_EMOJI = os.environ.get("ACK_REACTION_EMOJI", "👍").strip()
 
-# --- The task checkbox as the agent's status light ---------------------------
-# A task's `completed` checkbox is repurposed to answer the one question a human
-# glancing at the board actually has: is the agent still working on this, or is
-# there something waiting for me to read?
+# --- The agent's status sticker ----------------------------------------------
+# A sticker on the task card answers the one question a human glancing at the
+# board has: is the agent still working on this, or is something waiting for me
+# to read?
 #
-#   unchecked -> a turn is running, the answer isn't in yet — wait
-#   checked   -> the agent stopped and left its reply in the chat — go read it
+#   "working"  -> a turn is running, the answer isn't in yet — wait
+#   "answered" -> the agent stopped and left its reply in the chat — go read it
 #
-# So a turn CLEARS the box the moment it spawns and TICKS it back when the
-# process exits. It deliberately does NOT mean "this task is finished" — a turn
-# that merely answered a question ticks it too. Set to false to leave the
-# checkbox alone.
-TASK_STATUS_FLAG = os.environ.get("TASK_STATUS_FLAG", "true").lower() not in ("0", "false", "no")
+# A turn sets `working` the moment it spawns and `answered` when the process
+# exits. `answered` deliberately does NOT mean "the task is done" — a turn that
+# merely answered a question sets it too. The signal is "your turn, human".
+#
+# Why a sticker and not the task's `completed` checkbox: YouGile refuses a
+# `completed` write (in BOTH directions, HTTP 400 "Не удалось изменить задачу")
+# from any account that isn't among the task's assignees, so the checkbox can't
+# carry the agent's status on a task assigned to a human. A string sticker is
+# writable on any task, shows on the card, and collides with nothing.
+AGENT_STATUS_STICKER = os.environ.get("AGENT_STATUS_STICKER", "true").lower() not in ("0", "false", "no")
+# Looked up by name and created on first use if missing. Enable it on the boards
+# you want it visible on (one-time, in the YouGile UI). State names must match
+# exactly — YouGile's API can rename a sticker but cannot edit its states, so a
+# typo here means adding the state by hand in the UI.
+AGENT_STICKER_NAME = os.environ.get("AGENT_STICKER_NAME", "Agent").strip()
+AGENT_STICKER_ICON = os.environ.get("AGENT_STICKER_ICON", "pin").strip()
+AGENT_STICKER_WORKING = os.environ.get("AGENT_STICKER_WORKING", "working").strip()
+AGENT_STICKER_ANSWERED = os.environ.get("AGENT_STICKER_ANSWERED", "answered").strip()
+AGENT_STICKER_WORKING_COLOR = os.environ.get("AGENT_STICKER_WORKING_COLOR", "#8CC2FF").strip()
+AGENT_STICKER_ANSWERED_COLOR = os.environ.get("AGENT_STICKER_ANSWERED_COLOR", "#79CE69").strip()
 
 # --- Replying to the agent counts as mentioning it ---------------------------
 # Replying to (or forwarding) one of the agent's own messages is how a user says
@@ -604,63 +619,188 @@ def react_to_message(chat_id: str, message_id: str, emoji: str) -> bool:
     return _api_put(f"/chats/{chat_id}/messages/{message_id}", {"react": [emoji]}) is not None
 
 
-# ------------------------------------------------- task status flag (checkbox)
-#
-# task_id -> the `completed` value YouGile should end up with. One worker thread
-# per task drains this map; a newer value simply overwrites one that hasn't been
-# delivered yet. Both properties matter. The API calls stay off the request path
-# (they retry a flaky network for as long as it takes), and "turn started" /
-# "turn finished" for the same task can never land out of order and leave the
-# checkbox lying about whether the agent is busy — the worker always applies the
-# most recent intent, not the one it was created with.
+# ------------------------------------------------------- agent status sticker
 
-_task_flag_lock = threading.Lock()
-_task_flag_desired: Dict[str, bool] = {}
-_task_flag_workers: Set[str] = set()
+# YouGile's "this sticker has no value" sentinel.
+STICKER_CLEAR = "-"
+# The two states we drive, and the labels/colours to create them with.
+MARKER_WORKING = "working"
+MARKER_ANSWERED = "answered"
+_MARKER_SPECS = {
+    MARKER_WORKING: (AGENT_STICKER_WORKING, AGENT_STICKER_WORKING_COLOR),
+    MARKER_ANSWERED: (AGENT_STICKER_ANSWERED, AGENT_STICKER_ANSWERED_COLOR),
+}
+
+_sticker_lock = threading.Lock()
+# (sticker id, {MARKER_* -> state id}) once resolved. Resolution is attempted
+# lazily and retried on the next call while it fails, so a YouGile outage at
+# boot doesn't permanently disarm the marker.
+_sticker: Optional[Tuple[str, Dict[str, str]]] = None
 
 
-def _apply_task_completed(task_id: str, completed: bool) -> None:
-    """Write the task's `completed` flag, skipping the write if it already matches.
+def _sticker_states(raw: dict) -> Dict[str, str]:
+    """Map our marker keys onto the sticker's state ids, by state name."""
+    by_name = {
+        (s.get("name") or "").strip().lower(): s.get("id")
+        for s in (raw.get("states") or [])
+        if isinstance(s, dict)
+    }
+    found: Dict[str, str] = {}
+    for marker, (label, _color) in _MARKER_SPECS.items():
+        state_id = by_name.get(label.strip().lower())
+        if state_id:
+            found[marker] = state_id
+        else:
+            log.warning(
+                "agent sticker: '%s' has no state named '%s' — YouGile's API can't "
+                "add one, so add it in the UI (or point AGENT_STICKER_%s at an "
+                "existing state)",
+                AGENT_STICKER_NAME, label, marker.upper(),
+            )
+    return found
+
+
+def agent_sticker() -> Optional[Tuple[str, Dict[str, str]]]:
+    """The status sticker as (id, {marker -> state id}), creating it if missing.
+
+    Looked up BY NAME rather than by a stored id, and only created when the
+    lookup genuinely finds nothing: YouGile has no endpoint that deletes a
+    string sticker, so a duplicate created by accident is permanent litter in
+    the workspace.
+    """
+    global _sticker
+    if not (AGENT_STATUS_STICKER and AGENT_STICKER_NAME):
+        return None
+    with _sticker_lock:
+        if _sticker is not None:
+            return _sticker
+        listing = _api_get("/string-stickers?limit=1000", retries=YOUGILE_API_BOOT_RETRIES)
+        if listing is None:
+            log.warning("agent sticker: can't list stickers — marker disarmed for now")
+            return None
+        wanted = AGENT_STICKER_NAME.strip().lower()
+        raw = next(
+            (
+                s for s in (listing.get("content") or [])
+                if isinstance(s, dict)
+                and not s.get("deleted")
+                and (s.get("name") or "").strip().lower() == wanted
+            ),
+            None,
+        )
+        if raw is None:
+            created = _api_post(
+                "/string-stickers",
+                {
+                    "name": AGENT_STICKER_NAME,
+                    "icon": AGENT_STICKER_ICON,
+                    "states": [
+                        {"name": label, "color": color}
+                        for label, color in _MARKER_SPECS.values()
+                    ],
+                },
+                retries=YOUGILE_API_BOOT_RETRIES,
+            )
+            if not (created and created.get("id")):
+                log.warning("agent sticker: could not create '%s'", AGENT_STICKER_NAME)
+                return None
+            log.info("agent sticker: created '%s' (%s)", AGENT_STICKER_NAME, created["id"])
+            # POST returns only the id — read it back for the state ids.
+            raw = _api_get(
+                f"/string-stickers/{created['id']}", retries=YOUGILE_API_BOOT_RETRIES
+            )
+            if raw is None:
+                return None
+        states = _sticker_states(raw)
+        if not states:
+            return None
+        _sticker = (raw["id"], states)
+        log.info(
+            "agent sticker: '%s' (%s) states=%s",
+            AGENT_STICKER_NAME, raw["id"], sorted(states),
+        )
+        return _sticker
+
+
+def _sticker_snapshot() -> Optional[Dict[str, Any]]:
+    """What /healthz reports: the sticker as already resolved, never resolving it
+    here — a health check must not depend on the network."""
+    if not AGENT_STATUS_STICKER:
+        return None
+    with _sticker_lock:
+        resolved = _sticker
+    return {
+        "name": AGENT_STICKER_NAME,
+        "id": resolved[0] if resolved else None,
+        "states": sorted(resolved[1]) if resolved else [],
+    }
+
+
+# task_id -> the marker the task should end up showing (None = clear it). One
+# worker thread per task drains this map; a newer value simply overwrites one
+# that hasn't been delivered yet. Both properties matter. The API calls stay off
+# the request path (they retry a flaky network for as long as it takes), and
+# "turn started" / "turn finished" for the same task can never land out of order
+# and leave the card lying about whether the agent is busy — the worker always
+# applies the most recent intent, not the one it was created with.
+
+_marker_lock = threading.Lock()
+_marker_desired: Dict[str, Optional[str]] = {}
+_marker_workers: Set[str] = set()
+
+
+def _apply_task_marker(task_id: str, marker: Optional[str]) -> None:
+    """Put the sticker into `marker` (None clears it), skipping the write when
+    the card already shows it.
 
     The read-before-write isn't just thrift: every real change echoes back to us
     as a `task-updated` webhook, so writing only on an actual transition keeps
-    the checkbox from generating an event on every single turn. It also means a
-    box a human toggled by hand mid-turn is corrected rather than ignored.
+    the marker from generating an event on every turn. It also means a value a
+    human changed by hand mid-turn gets corrected rather than ignored.
     """
+    resolved = agent_sticker()
+    if resolved is None:
+        return
+    sticker_id, states = resolved
+    value = STICKER_CLEAR if marker is None else states.get(marker)
+    if value is None:
+        return  # _sticker_states already explained which state is missing
     task = _api_get(f"/tasks/{task_id}")
     if task is None:
-        log.warning("task flag: can't read task %s — completed=%s not applied", task_id, completed)
+        log.warning("agent sticker: can't read task %s — marker=%s not applied", task_id, marker)
         return
-    if bool(task.get("completed")) is completed:
+    current = (task.get("stickers") or {}).get(sticker_id) or STICKER_CLEAR
+    if current == value:
         return
-    ok = _api_put(f"/tasks/{task_id}", {"completed": completed}) is not None
-    log.info("task flag: task=%s completed=%s ok=%s", task_id, completed, ok)
+    ok = _api_put(f"/tasks/{task_id}", {"stickers": {sticker_id: value}}) is not None
+    log.info("agent sticker: task=%s marker=%s ok=%s", task_id, marker, ok)
 
 
-def _task_flag_worker(task_id: str) -> None:
+def _marker_worker(task_id: str) -> None:
     while True:
-        with _task_flag_lock:
-            desired = _task_flag_desired.pop(task_id, None)
-            if desired is None:
-                _task_flag_workers.discard(task_id)
+        with _marker_lock:
+            if task_id not in _marker_desired:
+                _marker_workers.discard(task_id)
                 return
+            marker = _marker_desired.pop(task_id)
         try:
-            _apply_task_completed(task_id, desired)
+            _apply_task_marker(task_id, marker)
         except Exception:
-            log.exception("task flag: applying completed=%s to task %s failed", desired, task_id)
+            log.exception("agent sticker: applying marker=%s to task %s failed", marker, task_id)
 
 
-def set_task_completed(task_id: Optional[str], completed: bool) -> None:
-    """Tick (True) or clear (False) the task's checkbox. Fire-and-forget: returns
-    immediately, the write happens on the task's worker thread."""
-    if not (TASK_STATUS_FLAG and task_id):
+def set_task_marker(task_id: Optional[str], marker: Optional[str]) -> None:
+    """Show `marker` (MARKER_WORKING / MARKER_ANSWERED, or None to clear) on the
+    task card. Fire-and-forget: returns at once, the write happens on the task's
+    worker thread."""
+    if not (AGENT_STATUS_STICKER and task_id):
         return
-    with _task_flag_lock:
-        _task_flag_desired[task_id] = completed
-        if task_id in _task_flag_workers:
+    with _marker_lock:
+        _marker_desired[task_id] = marker
+        if task_id in _marker_workers:
             return  # the live worker will pick this value up on its next lap
-        _task_flag_workers.add(task_id)
-    threading.Thread(target=_task_flag_worker, args=(task_id,), daemon=True).start()
+        _marker_workers.add(task_id)
+    threading.Thread(target=_marker_worker, args=(task_id,), daemon=True).start()
 
 
 USERS_BY_ID: Dict[str, Dict[str, Any]] = {}
@@ -711,6 +851,10 @@ def resolve_rules(rules: List[Rule]) -> None:
 refresh_directories()
 RULES: List[Rule] = load_rules(RULES_FILE)
 resolve_rules(RULES)
+# Resolve (or create) the status sticker up front so /healthz can report it and
+# the first turn doesn't pay for the lookup. Bounded retries — a dead API at
+# boot must not hang the import; the next marker write resolves it lazily.
+agent_sticker()
 
 if WEBHOOK_URL:
     ensure_webhook_subscription()
@@ -1519,18 +1663,18 @@ def _post_capacity_message(chat_id: Optional[str]) -> None:
 
 
 def _mark_turn_finished(chat_id: Optional[str], task_id: Optional[str]) -> None:
-    """Tick the task's checkbox now that the agent has stopped — the user's cue
-    that the reply is in the chat and it's their turn.
+    """Flip the card to "answered" now that the agent has stopped — the user's
+    cue that the reply is in the chat and it's their turn.
 
     Skipped while another turn is already queued for this chat (an interrupt, or
-    a follow-up that landed mid-turn): the agent isn't actually done, so the box
-    stays clear instead of blinking "read me" and back a second later.
+    a follow-up that landed mid-turn): the agent isn't actually done, so the card
+    keeps saying "working" instead of blinking "read me" and back a second later.
     """
     if chat_id:
         with _active_lock:
             if chat_id in _pending_turns:
                 return
-    set_task_completed(task_id, True)
+    set_task_marker(task_id, MARKER_ANSWERED)
 
 
 def _release_chat(chat_id: Optional[str], chat_lock: Optional[threading.Lock]) -> None:
@@ -1855,11 +1999,11 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
             _release_chat(chat_id, chat_lock)
             return False, "spawn-failed"
 
-        # The turn is live — clear the task's checkbox so the board shows the
-        # agent is on it and the user knows to wait. on_exit ticks it back.
-        # Deliberately after the spawn: a launch that never happened must not
-        # leave the box lying about a running agent.
-        set_task_completed(task_id, False)
+        # The turn is live — mark the card "working" so the board shows the
+        # agent is on it and the user knows to wait. on_exit flips it to
+        # "answered". Deliberately after the spawn: a launch that never happened
+        # must not leave the card claiming a running agent.
+        set_task_marker(task_id, MARKER_WORKING)
 
         # Fast ack — let the user see "I'm on it" without waiting for claude
         # to finish. Only fire AFTER claude was actually spawned, so a failed
@@ -1924,7 +2068,7 @@ async def healthz():
         # Armed once known: without it, a reply to the agent can't be told from
         # a reply to a colleague and falls back to needing a literal mention.
         "agent_user_id": agent_user_id(),
-        "task_status_flag": TASK_STATUS_FLAG,
+        "status_sticker": _sticker_snapshot(),
         "tracked_chats": list_known_chats(),
         "webhook": webhook,
         "rules": [

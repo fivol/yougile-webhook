@@ -4,9 +4,10 @@ Receive YouGile webhooks and spawn `claude --dangerously-skip-permissions`
 on configurable triggers. Each YouGile task chat maps 1:1 to a persistent
 claude session, so the agent remembers prior turns when re-mentioned —
 whether you type `@Agent` or just
-[reply to its message](#addressing-the-agent--mention-or-reply). The
-task's [checkbox](#the-task-checkbox--is-the-agent-still-working) tracks
-the agent: cleared while it works, ticked when there's a reply to read.
+[reply to its message](#addressing-the-agent--mention-or-reply). A
+[sticker](#the-status-sticker--is-the-agent-still-working) on the task
+card tracks the agent: `working` while it runs, `answered` when there's a
+reply to read.
 
 ```
 YouGile ──POST──▶ https://your.domain/yougile/webhook
@@ -263,7 +264,10 @@ path / PR URL across turns.
 | `ATTACHMENT_MAX_BYTES` | Per-file size cap (default 25 MiB). Larger files are skipped. |
 | `ATTACHMENT_TIMEOUT_SECONDS` | Per-file download timeout (default 60s). |
 | `ATTACHMENT_MAX_RETRIES` | Retry a transient attachment download (network error, timeout, 5xx) this many times before giving up; a 4xx or over-size file is permanent and not retried. Default `3`. |
-| `TASK_STATUS_FLAG` | Default `true`. Drive the task's `completed` checkbox from the agent's state: cleared while a turn runs, ticked when the agent stops (see [The task checkbox](#the-task-checkbox--is-the-agent-still-working)). `false` leaves the checkbox alone. |
+| `AGENT_STATUS_STICKER` | Default `true`. Show the agent's state on the task card via a sticker: `working` while a turn runs, `answered` when it stops (see [The status sticker](#the-status-sticker--is-the-agent-still-working)). `false` leaves task cards alone. |
+| `AGENT_STICKER_NAME` / `AGENT_STICKER_ICON` | The sticker is looked up by name and created on first use if missing. Defaults `Agent` / `pin`. |
+| `AGENT_STICKER_WORKING` / `AGENT_STICKER_ANSWERED` | State names, matched exactly (case-insensitively) against the sticker's states. Defaults `working` / `answered`. YouGile's API can rename a sticker but **cannot edit its states**, so changing these after the sticker exists means adding the state by hand in the UI. |
+| `AGENT_STICKER_WORKING_COLOR` / `AGENT_STICKER_ANSWERED_COLOR` | Hex colours, used only when the sticker is created. Defaults `#8CC2FF` / `#79CE69`. |
 | `REPLY_TO_AGENT_IS_MENTION` | Default `true`. Treat a reply to (or forward of) one of the agent's own messages as a mention, so `@Agent` rules fire on it without the text containing the mention. |
 | `AGENT_MENTION` | The mention token your rules match on and that YouGile renders for the agent's account. Default `@Agent`. |
 | `AGENT_USER_EMAIL` / `AGENT_USER_ID` | Which account the agent posts as — needed to tell a reply to the *agent* from a reply to a colleague. Normally learned automatically from the first `@Agent …` message and cached in `state/agent.json`; set either to pin it (and to arm reply-detection before any mention has been seen). `/healthz` reports the resolved id. |
@@ -345,38 +349,55 @@ account, and it's cached in `state/agent.json`. Set `AGENT_USER_EMAIL` to
 skip the wait. Everything here is guarded by `REPLY_TO_AGENT_IS_MENTION`,
 costs one API call, and only for messages that actually carry a `replyTo`.
 
-## The task checkbox — "is the agent still working?"
+## The status sticker — "is the agent still working?"
 
-With `TASK_STATUS_FLAG=true` (default) the task's `completed` checkbox is
-driven by the agent rather than by the work:
+With `AGENT_STATUS_STICKER=true` (default) the task card carries a
+sticker saying what the agent is doing:
 
-| Box | Meaning |
+| Sticker | Meaning |
 |---|---|
-| ☐ unchecked | A turn is running. The answer isn't in yet — wait. |
-| ☑ checked | The agent stopped and left its reply in the chat — go read it. |
+| `working` | A turn is running. The answer isn't in yet — wait. |
+| `answered` | The agent stopped and left its reply in the chat — go read it. |
+| (none) | The agent has never run on this task. |
 
-So a turn **clears** the box the instant its process spawns and **ticks**
-it when that process exits. It deliberately does *not* mean "this task is
-finished" — a turn that merely answered a question ticks it too. The
+A turn sets `working` the instant its process spawns and `answered` when
+that process exits. `answered` deliberately does *not* mean "this task is
+finished" — a turn that merely answered a question sets it too. The
 signal is "your turn, human".
+
+**Why not the `completed` checkbox.** It looks like the natural place for
+this, but YouGile rejects a `completed` write — in *both* directions,
+`400 Не удалось изменить задачу` — from any account that isn't among the
+task's assignees. The checkbox is the assignee's own, so a bot can only
+touch it on tasks nobody is assigned to. Stickers have no such rule.
+
+**Setup.** The sticker is looked up by `AGENT_STICKER_NAME` and created
+on first use if missing, so there's nothing to do beyond enabling it on
+the boards where you want it visible (one-time, in the YouGile UI). Note
+that YouGile's API can rename a sticker but **cannot edit its states**:
+if you rename `AGENT_STICKER_WORKING` / `_ANSWERED` after the sticker
+exists, add the matching state by hand — the receiver logs exactly which
+one it couldn't find.
 
 Details worth knowing:
 
-- An interrupt or a follow-up queued mid-turn keeps the box clear: the
-  agent isn't done, so it never blinks "read me" and back.
-- A transient-API retry (`CLAUDE_API_RETRIES`) keeps it clear too — the
-  turn is still alive.
+- An interrupt or a follow-up queued mid-turn keeps it on `working`: the
+  agent isn't done, so the card never blinks "read me" and back.
+- A transient-API retry (`CLAUDE_API_RETRIES`) keeps it on `working` too
+  — the turn is still alive.
 - A turn that never starts (spawn failure, `CLAUDE_MAX_CONCURRENT`
   saturated, an auto-kickoff that bowed out via `skip_if_chat_known`)
-  doesn't touch the box at all.
-- The flag is written only when it actually differs from what YouGile
+  doesn't touch the card at all.
+- The value is written only when it actually differs from what YouGile
   holds, so it neither spams `task-updated` events nor fights a human who
-  toggled the box by hand mid-turn.
+  changed it by hand mid-turn.
 - Writes for one task are serialized and always apply the latest intent,
   so "started" and "finished" can't land out of order over a flaky link.
-- If the service dies mid-turn the box stays clear until the next turn
-  for that task ends — nothing reconciles it at startup, because a
-  cleared box is indistinguishable from one a human left cleared.
+- If the service dies mid-turn the card stays on `working` until the next
+  turn for that task ends. Nothing reconciles it at startup — the state
+  can't be told apart from a turn that is genuinely still running.
+- `/healthz` reports the resolved sticker (`status_sticker`), so you can
+  see at a glance whether the marker is armed.
 
 ## Attachments (images & files)
 
