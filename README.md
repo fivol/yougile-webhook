@@ -2,7 +2,11 @@
 
 Receive YouGile webhooks and spawn `claude --dangerously-skip-permissions`
 on configurable triggers. Each YouGile task chat maps 1:1 to a persistent
-claude session, so the agent remembers prior turns when re-mentioned.
+claude session, so the agent remembers prior turns when re-mentioned —
+whether you type `@Agent` or just
+[reply to its message](#addressing-the-agent--mention-or-reply). The
+task's [checkbox](#the-task-checkbox--is-the-agent-still-working) tracks
+the agent: cleared while it works, ticked when there's a reply to read.
 
 ```
 YouGile ──POST──▶ https://your.domain/yougile/webhook
@@ -166,8 +170,11 @@ skip_if_chat_known = true                                    # don't double-fire
 
 ### `@Agent` flow
 
-`@Agent` is the only chat entry point. The moment a mention matches a
-rule, the receiver drops a 👍 reaction on that message (configurable via
+`@Agent` is the only chat entry point — either typed, or **implied by
+replying to one of the agent's own messages** (see
+[Addressing the agent](#addressing-the-agent--mention-or-reply)). The
+moment a mention matches a rule, the receiver drops a 👍 reaction on that
+message (configurable via
 `ACK_REACTION_EMOJI`) as an instant "received" signal — before the agent
 even spawns. The agent then reads the latest mention together with the
 task title/description, chat history, and any attached screenshots, then
@@ -256,6 +263,11 @@ path / PR URL across turns.
 | `ATTACHMENT_MAX_BYTES` | Per-file size cap (default 25 MiB). Larger files are skipped. |
 | `ATTACHMENT_TIMEOUT_SECONDS` | Per-file download timeout (default 60s). |
 | `ATTACHMENT_MAX_RETRIES` | Retry a transient attachment download (network error, timeout, 5xx) this many times before giving up; a 4xx or over-size file is permanent and not retried. Default `3`. |
+| `TASK_STATUS_FLAG` | Default `true`. Drive the task's `completed` checkbox from the agent's state: cleared while a turn runs, ticked when the agent stops (see [The task checkbox](#the-task-checkbox--is-the-agent-still-working)). `false` leaves the checkbox alone. |
+| `REPLY_TO_AGENT_IS_MENTION` | Default `true`. Treat a reply to (or forward of) one of the agent's own messages as a mention, so `@Agent` rules fire on it without the text containing the mention. |
+| `AGENT_MENTION` | The mention token your rules match on and that YouGile renders for the agent's account. Default `@Agent`. |
+| `AGENT_USER_EMAIL` / `AGENT_USER_ID` | Which account the agent posts as — needed to tell a reply to the *agent* from a reply to a colleague. Normally learned automatically from the first `@Agent …` message and cached in `state/agent.json`; set either to pin it (and to arm reply-detection before any mention has been seen). `/healthz` reports the resolved id. |
+| `REPLY_QUOTE_MAX_CHARS` | How much of the replied-to message to quote into the prompt so the agent knows which of its own messages the user is answering. Default `2000`. |
 | `ACK_REACTION_EMOJI` | Emoji reaction dropped on the trigger message the instant it matches a rule — fires before the agent spawns and before any `ack_message`, as an immediate "received" signal. Default `👍`. YouGile accepts ONLY `👍 👎 👏 🙂 😀 😕 🎉 ❤ 🚀 ✔` (👀 is rejected). Empty = disabled. Applies only to `chat_message-*` events. |
 
 After editing `.env` or `rules.toml`, reload:
@@ -299,6 +311,72 @@ This is how you redirect the agent mid-task — just `@Agent` again with the
 new instruction. Webhook returns `spawn_reason: interrupting`. Because an
 interrupt replaces an existing turn 1-for-1, it never counts against
 `CLAUDE_MAX_CONCURRENT`; that cap only limits genuinely distinct chats.
+
+## Addressing the agent — mention or reply
+
+Two things count as "I'm talking to you, agent":
+
+1. Typing the mention (`@Agent …`) — matched by the rule's `pattern`.
+2. **Replying to / forwarding one of the agent's own messages.** YouGile
+   records that as `properties.replyTo = <message id>` and leaves the text
+   mention-free, so on its own it would match no rule. The receiver looks
+   the quoted message up and, when the agent wrote it, injects
+   `AGENT_MENTION` into the payload:
+
+   ```json
+   "_addressedToAgent": {
+     "mention": "@Agent",
+     "reason": "the user replied to a message the agent posted",
+     "replyToMessageId": "<message-id>",
+     "replyToText": "…the agent message being answered…"
+   }
+   ```
+
+   The existing `@Agent` rules then fire unchanged, and the spawned agent
+   sees in `{event_json}` both why it was triggered and which of its own
+   messages the user is answering. The webhook response reports
+   `reply_to_agent: true`.
+
+Replies to a *colleague's* message are ignored, which is why the receiver
+has to know the agent's own account. It learns that by itself: YouGile
+renders a mention as a `{"type": "user", "replacement": "@Agent", "data":
+{"userId": …}}` chunk, so the first real `@Agent …` message names the
+account, and it's cached in `state/agent.json`. Set `AGENT_USER_EMAIL` to
+skip the wait. Everything here is guarded by `REPLY_TO_AGENT_IS_MENTION`,
+costs one API call, and only for messages that actually carry a `replyTo`.
+
+## The task checkbox — "is the agent still working?"
+
+With `TASK_STATUS_FLAG=true` (default) the task's `completed` checkbox is
+driven by the agent rather than by the work:
+
+| Box | Meaning |
+|---|---|
+| ☐ unchecked | A turn is running. The answer isn't in yet — wait. |
+| ☑ checked | The agent stopped and left its reply in the chat — go read it. |
+
+So a turn **clears** the box the instant its process spawns and **ticks**
+it when that process exits. It deliberately does *not* mean "this task is
+finished" — a turn that merely answered a question ticks it too. The
+signal is "your turn, human".
+
+Details worth knowing:
+
+- An interrupt or a follow-up queued mid-turn keeps the box clear: the
+  agent isn't done, so it never blinks "read me" and back.
+- A transient-API retry (`CLAUDE_API_RETRIES`) keeps it clear too — the
+  turn is still alive.
+- A turn that never starts (spawn failure, `CLAUDE_MAX_CONCURRENT`
+  saturated, an auto-kickoff that bowed out via `skip_if_chat_known`)
+  doesn't touch the box at all.
+- The flag is written only when it actually differs from what YouGile
+  holds, so it neither spams `task-updated` events nor fights a human who
+  toggled the box by hand mid-turn.
+- Writes for one task are serialized and always apply the latest intent,
+  so "started" and "finished" can't land out of order over a flaky link.
+- If the service dies mid-turn the box stays clear until the next turn
+  for that task ends — nothing reconciles it at startup, because a
+  cleared box is indistinguishable from one a human left cleared.
 
 ## Attachments (images & files)
 
@@ -370,6 +448,18 @@ drop it from `prompts/_formatting.txt`.
 }
 ```
 
+A mention is rendered as a chunk inside
+`payload.properties.params.chunks` — this is what identifies the agent's
+account (see [Addressing the agent](#addressing-the-agent--mention-or-reply)):
+
+```json
+{"type": "user", "replacement": "@Agent", "data": {"userId": "<user-uuid>"}}
+```
+
+A reply carries `payload.properties.replyTo = <id of the quoted message>`
+and nothing else — the quoted text is not in the payload, which is why
+resolving it costs one API call.
+
 `task-created`:
 
 ```json
@@ -405,6 +495,7 @@ previous column.
 | `rules.toml`, `prompts/*.txt` | Your real rules and prompts (**gitignored**). |
 | `.env.example` / `.env` | Runtime config (`.env` gitignored). |
 | `state/chats/<chatId>.json` | Per-chat session state (gitignored). |
+| `state/agent.json` | The agent's own YouGile user id, learned from a mention (gitignored). |
 | `state/attachments/<chatId>/` | Locally-cached chat attachments (gitignored). |
 | `logs/events.jsonl` | All inbound webhooks. |
 | `logs/claude.log` | Spawned claude stdout/stderr. |

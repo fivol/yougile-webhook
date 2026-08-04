@@ -28,7 +28,7 @@ from fastapi import FastAPI, Request
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.2.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -220,6 +220,41 @@ ATTACHMENT_MAX_RETRIES = int(os.environ.get("ATTACHMENT_MAX_RETRIES", "3"))
 # (👍 👎 👏 🙂 😀 😕 🎉 ❤ 🚀 ✔) — 👀 (eyes) is rejected with HTTP 400. Set to an
 # empty string to disable reacting entirely.
 ACK_REACTION_EMOJI = os.environ.get("ACK_REACTION_EMOJI", "👍").strip()
+
+# --- The task checkbox as the agent's status light ---------------------------
+# A task's `completed` checkbox is repurposed to answer the one question a human
+# glancing at the board actually has: is the agent still working on this, or is
+# there something waiting for me to read?
+#
+#   unchecked -> a turn is running, the answer isn't in yet — wait
+#   checked   -> the agent stopped and left its reply in the chat — go read it
+#
+# So a turn CLEARS the box the moment it spawns and TICKS it back when the
+# process exits. It deliberately does NOT mean "this task is finished" — a turn
+# that merely answered a question ticks it too. Set to false to leave the
+# checkbox alone.
+TASK_STATUS_FLAG = os.environ.get("TASK_STATUS_FLAG", "true").lower() not in ("0", "false", "no")
+
+# --- Replying to the agent counts as mentioning it ---------------------------
+# Replying to (or forwarding) one of the agent's own messages is how a user says
+# "you — keep going" without retyping the mention. YouGile records it as
+# properties.replyTo = <message id> and leaves the text mention-free, so such a
+# message would otherwise match no rule. When one arrives we look up the message
+# it answers and, if the agent wrote it, inject AGENT_MENTION into the payload —
+# the ordinary `@Agent` rules then fire on it unchanged.
+REPLY_TO_AGENT_IS_MENTION = os.environ.get(
+    "REPLY_TO_AGENT_IS_MENTION", "true"
+).lower() not in ("0", "false", "no")
+AGENT_MENTION = os.environ.get("AGENT_MENTION", "@Agent").strip()
+# The agent's own YouGile account, needed to tell "reply to the agent" from
+# "reply to a colleague". Normally learned by itself from the mention chunks
+# YouGile embeds in "@Agent ..." messages (cached in state/agent.json); set
+# either variable to pin it explicitly instead.
+AGENT_USER_ID = os.environ.get("AGENT_USER_ID", "").strip()
+AGENT_USER_EMAIL = os.environ.get("AGENT_USER_EMAIL", "").strip().lower()
+# How much of the replied-to message to quote back into the prompt so the agent
+# knows which of its own messages the user is answering.
+REPLY_QUOTE_MAX_CHARS = int(os.environ.get("REPLY_QUOTE_MAX_CHARS", "2000"))
 
 RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
 
@@ -569,6 +604,65 @@ def react_to_message(chat_id: str, message_id: str, emoji: str) -> bool:
     return _api_put(f"/chats/{chat_id}/messages/{message_id}", {"react": [emoji]}) is not None
 
 
+# ------------------------------------------------- task status flag (checkbox)
+#
+# task_id -> the `completed` value YouGile should end up with. One worker thread
+# per task drains this map; a newer value simply overwrites one that hasn't been
+# delivered yet. Both properties matter. The API calls stay off the request path
+# (they retry a flaky network for as long as it takes), and "turn started" /
+# "turn finished" for the same task can never land out of order and leave the
+# checkbox lying about whether the agent is busy — the worker always applies the
+# most recent intent, not the one it was created with.
+
+_task_flag_lock = threading.Lock()
+_task_flag_desired: Dict[str, bool] = {}
+_task_flag_workers: Set[str] = set()
+
+
+def _apply_task_completed(task_id: str, completed: bool) -> None:
+    """Write the task's `completed` flag, skipping the write if it already matches.
+
+    The read-before-write isn't just thrift: every real change echoes back to us
+    as a `task-updated` webhook, so writing only on an actual transition keeps
+    the checkbox from generating an event on every single turn. It also means a
+    box a human toggled by hand mid-turn is corrected rather than ignored.
+    """
+    task = _api_get(f"/tasks/{task_id}")
+    if task is None:
+        log.warning("task flag: can't read task %s — completed=%s not applied", task_id, completed)
+        return
+    if bool(task.get("completed")) is completed:
+        return
+    ok = _api_put(f"/tasks/{task_id}", {"completed": completed}) is not None
+    log.info("task flag: task=%s completed=%s ok=%s", task_id, completed, ok)
+
+
+def _task_flag_worker(task_id: str) -> None:
+    while True:
+        with _task_flag_lock:
+            desired = _task_flag_desired.pop(task_id, None)
+            if desired is None:
+                _task_flag_workers.discard(task_id)
+                return
+        try:
+            _apply_task_completed(task_id, desired)
+        except Exception:
+            log.exception("task flag: applying completed=%s to task %s failed", desired, task_id)
+
+
+def set_task_completed(task_id: Optional[str], completed: bool) -> None:
+    """Tick (True) or clear (False) the task's checkbox. Fire-and-forget: returns
+    immediately, the write happens on the task's worker thread."""
+    if not (TASK_STATUS_FLAG and task_id):
+        return
+    with _task_flag_lock:
+        _task_flag_desired[task_id] = completed
+        if task_id in _task_flag_workers:
+            return  # the live worker will pick this value up on its next lap
+        _task_flag_workers.add(task_id)
+    threading.Thread(target=_task_flag_worker, args=(task_id,), daemon=True).start()
+
+
 USERS_BY_ID: Dict[str, Dict[str, Any]] = {}
 USERS_BY_EMAIL: Dict[str, str] = {}
 COLUMNS_BY_NAME: Dict[str, Set[str]] = {}
@@ -665,6 +759,149 @@ def extract_message_id(payload) -> Optional[str]:
         if isinstance(mid, int) or (isinstance(mid, str) and mid.isdigit()):
             return str(mid)
     return None
+
+
+# ------------------------------------------------- "who is @Agent?" / replies
+#
+# Resolution order for the agent's own YouGile account: AGENT_USER_ID ->
+# AGENT_USER_EMAIL -> the id learned from a mention chunk (cached in
+# state/agent.json). The learning step is what lets a stock install work with no
+# configuration at all: the first genuine "@Agent ..." message names the account.
+
+_AGENT_STATE_FILE = STATE_DIR / "agent.json"
+_agent_user_lock = threading.Lock()
+_agent_user_id: Optional[str] = None
+
+
+def _cached_agent_user_id() -> Optional[str]:
+    try:
+        data = json.loads(_AGENT_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    uid = data.get("agent_user_id") if isinstance(data, dict) else None
+    return uid if isinstance(uid, str) and _UUID_RE.match(uid) else None
+
+
+def agent_user_id() -> Optional[str]:
+    """The account the agent posts as, or None while it's still unknown."""
+    global _agent_user_id
+    if AGENT_USER_ID:
+        return AGENT_USER_ID
+    with _agent_user_lock:
+        if _agent_user_id is None:
+            _agent_user_id = (
+                (USERS_BY_EMAIL.get(AGENT_USER_EMAIL) if AGENT_USER_EMAIL else None)
+                or _cached_agent_user_id()
+            )
+        return _agent_user_id
+
+
+def learn_agent_user_id(payload) -> None:
+    """Pick the agent's user id out of an @-mention chunk and remember it.
+
+    YouGile renders a mention as a chunk
+    {"type": "user", "replacement": "@Agent", "data": {"userId": "<uuid>"}}, so
+    every real mention identifies the account for free. Cached to
+    state/agent.json so a restart doesn't have to wait for the next mention.
+    """
+    global _agent_user_id
+    if not (AGENT_MENTION and isinstance(payload, dict)):
+        return
+    message = payload.get("payload")
+    if not isinstance(message, dict):
+        return
+    props = message.get("properties")
+    params = props.get("params") if isinstance(props, dict) else None
+    chunks = params.get("chunks") if isinstance(params, dict) else None
+    if not isinstance(chunks, list):
+        return
+    for chunk in chunks:
+        if not isinstance(chunk, dict) or chunk.get("type") != "user":
+            continue
+        if (chunk.get("replacement") or "").strip() != AGENT_MENTION:
+            continue
+        data = chunk.get("data")
+        uid = data.get("userId") if isinstance(data, dict) else None
+        if not (isinstance(uid, str) and _UUID_RE.match(uid)):
+            continue
+        with _agent_user_lock:
+            if _agent_user_id == uid:
+                return
+            _agent_user_id = uid
+        try:
+            _AGENT_STATE_FILE.write_text(
+                json.dumps({"agent_user_id": uid}, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            log.exception("agent identity: could not cache %s", _AGENT_STATE_FILE)
+        log.info("agent identity: %s resolved to user %s", AGENT_MENTION, uid)
+        return
+
+
+def _fetch_message(chat_id: str, message_id: str) -> Optional[dict]:
+    """Read a single chat message. Deliberately a SMALL retry budget: this runs
+    on the request path, before the rules are even evaluated, and YouGile
+    re-delivers a webhook it considers slow."""
+    msg = _api_get(
+        f"/chats/{chat_id}/messages/{message_id}", retries=YOUGILE_API_BOOT_RETRIES
+    )
+    return msg if isinstance(msg, dict) else None
+
+
+def annotate_agent_reply(payload) -> bool:
+    """Treat a reply to one of the agent's own messages as addressing the agent.
+
+    Replying to (or forwarding) an agent message is the natural way to say "you,
+    keep going" — but YouGile only records `properties.replyTo = <message id>`
+    and the text carries no mention, so no `@Agent` rule would match it. We
+    resolve that message and, when the agent is its author, inject AGENT_MENTION
+    into the payload under `_addressedToAgent` — the existing rules then fire on
+    it unchanged, and the spawned agent sees in `{event_json}` both why it was
+    triggered and what the user was replying to.
+
+    Mutates `payload` in place. Returns True when it marked the payload. Costs
+    one API call, and only for messages that actually carry a replyTo.
+    """
+    if not (REPLY_TO_AGENT_IS_MENTION and AGENT_MENTION):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if not str(payload.get("event") or "").startswith("chat_message-"):
+        return False
+    message = payload.get("payload")
+    if not isinstance(message, dict):
+        return False
+    props = message.get("properties")
+    reply_to = props.get("replyTo") if isinstance(props, dict) else None
+    if reply_to is None or not str(reply_to).isdigit():
+        return False
+    if AGENT_MENTION in (message.get("text") or ""):
+        return False  # already an explicit mention — nothing to add
+    chat_id = extract_chat_id(payload)
+    agent_id = agent_user_id()
+    if not chat_id:
+        return False
+    if not agent_id:
+        log.info(
+            "reply-to-agent: agent account still unknown (no mention seen yet) — "
+            "set AGENT_USER_EMAIL to enable this immediately"
+        )
+        return False
+    replied_to = _fetch_message(chat_id, str(reply_to))
+    if replied_to is None or replied_to.get("fromUserId") != agent_id:
+        return False
+    quoted = (replied_to.get("text") or "")[:REPLY_QUOTE_MAX_CHARS]
+    payload["_addressedToAgent"] = {
+        "mention": AGENT_MENTION,
+        "reason": "the user replied to a message the agent posted",
+        "replyToMessageId": str(reply_to),
+        "replyToText": quoted,
+    }
+    log.info(
+        "reply-to-agent: chat=%s replyTo=%s — treating as %s",
+        chat_id, reply_to, AGENT_MENTION,
+    )
+    return True
 
 
 # YouGile delivers webhooks at-least-once: when our 200 is slow — e.g. a first
@@ -1281,6 +1518,21 @@ def _post_capacity_message(chat_id: Optional[str]) -> None:
     threading.Thread(target=_send, daemon=True).start()
 
 
+def _mark_turn_finished(chat_id: Optional[str], task_id: Optional[str]) -> None:
+    """Tick the task's checkbox now that the agent has stopped — the user's cue
+    that the reply is in the chat and it's their turn.
+
+    Skipped while another turn is already queued for this chat (an interrupt, or
+    a follow-up that landed mid-turn): the agent isn't actually done, so the box
+    stays clear instead of blinking "read me" and back a second later.
+    """
+    if chat_id:
+        with _active_lock:
+            if chat_id in _pending_turns:
+                return
+    set_task_completed(task_id, True)
+
+
 def _release_chat(chat_id: Optional[str], chat_lock: Optional[threading.Lock]) -> None:
     """Release a chat's turn lock, then run any turn queued while it was busy.
 
@@ -1451,6 +1703,10 @@ def _output_is_transient(start: int, end: int) -> bool:
 
 def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, str]:
     chat_id = extract_chat_id(payload) if rule.session_per_chat else None
+    # The task whose checkbox tracks this turn. Same UUID as the chat, but
+    # resolved independently of session_per_chat so the status flag works for
+    # every rule.
+    task_id = extract_chat_id(payload)
     chat_lock: Optional[threading.Lock] = _get_chat_lock(chat_id) if chat_id else None
 
     if chat_lock is not None and not chat_lock.acquire(blocking=False):
@@ -1590,6 +1846,7 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
             try:
                 if chat_id and newest_msg_id:
                     update_chat_state(chat_id, last_message_id=newest_msg_id)
+                _mark_turn_finished(chat_id, task_id)
             finally:
                 _release_chat(chat_id, chat_lock)
 
@@ -1597,6 +1854,12 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
         if proc is None:
             _release_chat(chat_id, chat_lock)
             return False, "spawn-failed"
+
+        # The turn is live — clear the task's checkbox so the board shows the
+        # agent is on it and the user knows to wait. on_exit ticks it back.
+        # Deliberately after the spawn: a launch that never happened must not
+        # leave the box lying about a running agent.
+        set_task_completed(task_id, False)
 
         # Fast ack — let the user see "I'm on it" without waiting for claude
         # to finish. Only fire AFTER claude was actually spawned, so a failed
@@ -1658,6 +1921,10 @@ async def healthz():
         "claude_bin": CLAUDE_BIN,
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,
         "active_claude_procs": len(_active_procs),
+        # Armed once known: without it, a reply to the agent can't be told from
+        # a reply to a colleague and falls back to needing a literal mention.
+        "agent_user_id": agent_user_id(),
+        "task_status_flag": TASK_STATUS_FLAG,
         "tracked_chats": list_known_chats(),
         "webhook": webhook,
         "rules": [
@@ -1693,14 +1960,26 @@ async def yougile_webhook(req: Request):
     with EVENT_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    # Drop re-deliveries FIRST, before anything with a side effect. YouGile
+    # re-sends a message it considers slow-acked, and a duplicate that reached
+    # spawn_claude would interrupt the very turn the first delivery started —
+    # fatally so while that turn is still creating the session. Screening here
+    # (rather than after rule matching) also keeps the reply lookup below from
+    # firing several times for one message; unmatched messages now occupy the
+    # dedup LRU too, which it has ample room for.
+    duplicate = is_duplicate_delivery(payload)
+    replied_to_agent = False
+    if not duplicate:
+        # A reply to the agent's own message is a mention in every sense except
+        # the literal text — mark it before the rules look at the payload.
+        learn_agent_user_id(payload)
+        replied_to_agent = await asyncio.to_thread(annotate_agent_reply, payload)
+
     rule, reasons = find_matching_rule(payload)
     fired_rule: Optional[str] = None
     spawn_reason: Optional[str] = None
-    if rule and is_duplicate_delivery(payload):
-        # YouGile re-sent a message we already dispatched. Re-running it would
-        # interrupt the in-flight turn — fatally so while that turn is still
-        # creating the session. The first delivery already reacted and spawned,
-        # so this one is a pure no-op.
+    if duplicate:
+        # The first delivery already reacted and spawned — this one is a no-op.
         spawn_reason = "duplicate"
     elif rule:
         # Fast "received" signal: react to the trigger message the instant it
@@ -1730,12 +2009,13 @@ async def yougile_webhook(req: Request):
 
     event = isinstance(payload, dict) and payload.get("event")
     log.info(
-        "event=%s fired=%s spawn_reason=%s match_reasons=%s",
-        event, fired_rule, spawn_reason, reasons,
+        "event=%s fired=%s spawn_reason=%s reply_to_agent=%s match_reasons=%s",
+        event, fired_rule, spawn_reason, replied_to_agent, reasons,
     )
     return {
         "ok": True,
         "fired_rule": fired_rule,
         "spawn_reason": spawn_reason,
+        "reply_to_agent": replied_to_agent,
         "match_reasons": reasons,
     }
