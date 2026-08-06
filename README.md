@@ -324,6 +324,13 @@ Off by default (`SESSION_ROTATE_MODE=manual` only advises). See
 **[docs/session-rotation.md](docs/session-rotation.md)** for the measured
 numbers, the cost model, and how to tune it.
 
+A rotation is **not** a message of its own. It rides on the ack the agent
+posts when it takes the task on — one turn, one message — and reports the
+three numbers behind the decision: context, spend so far, and the threshold
+that tripped. Same for the `manual`-mode advice. Costs quoted there are the
+estimate for the turn *ahead*, since that is what is knowable when the task
+is accepted; what a turn actually cost shows up in `/status` afterwards.
+
 ### Asking without spending — chat commands
 
 `/status` answers "how big has this chat got, what has it cost, and will the

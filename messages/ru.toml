@@ -39,29 +39,23 @@ turn_cost = "этот ход ≈ {cost}"
 session_cost = "за сессию ≈ {cost}"
 
 
-# Posted once per session when a turn crosses the cost threshold in `manual`
-# rotation mode — the receiver advises, the human decides.
+# Both of these are folded into the ack the agent posts when it takes the task
+# on, never sent as a message of their own — one turn, one message.
+
+# `manual` rotation mode: the threshold is crossed but the human decides.
+# Said once per session.
 [advisory]
-text = """
-{prefix} Контекст этой сессии — {tokens} токенов, и следующий ход обойдётся примерно в {cost} (порог {threshold}).
-Имеет смысл начать новую сессию — команда /new. Подробности: /status"""
+line = "{prefix} Контекст {tokens} токенов, следующий ход ≈ {cost} при пороге {threshold} — пора начать новую сессию: /new"
 
 
-# Posted when a chat's session is actually retired and work continues in a new one.
+# `auto` rotation mode: the session was actually retired and this turn runs in
+# a fresh one. The retired session's full breakdown stays one /sessions away.
 [rotation]
-title = "{prefix} Новая сессия"
+started = "{prefix} Начал новую сессию — {why}. Продолжаю в ней."
+previous = "прошлая {id} — контекст {tokens} · потрачено ≈ {spent} · следующий ход на ней стоил бы ≈ {expected} при пороге {threshold}"
 reason_cost = "пауза {age}, кеш почти наверняка мёртв"
 reason_hard_ctx = "контекст подошёл к пределу окна"
 reason_command = "запрошено командой /new"
-old = "Прошлая — {id}"
-old_context = "  контекст     {tokens} токенов · {turns} запросов к API"
-old_spent = "  потрачено    ≈ {total}   (запись {write} · чтение {read} · вывод {output})"
-old_cold = "  мимо кеша    {cold} запросов из {turns}"
-why = "Причина: {why} → следующий ход на этом контексте стоил бы ≈ {expected} (порог {threshold})."
-new = "Новая — {id}. Перенесены история задачи, ветки, PR и дифф."
-handoff = "Handoff: {path}"
-old_kept = "Старая сессия никуда не делась:"
-resume_hint = "claude --resume {id}"
 
 
 # /help

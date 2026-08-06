@@ -37,8 +37,10 @@ STEP 1 — CLASSIFY the request:
 
 STEP 2 — Post the ack IMMEDIATELY with `mcp__yougile-mcp__send_task_message`
 (taskId = `payload.chatId`). Always end it with the stats block below, copied
-VERBATIM — do not reword it or recompute the numbers. It carries the session
-id and what this turn is costing.
+VERBATIM — do not reword it, do not recompute the numbers, do not drop a line.
+It carries the session id and what this turn is costing, and — when the chat
+has just moved to a fresh session — the line announcing that. This ack is the
+only message the user gets about it, so a dropped line is information lost.
 
 Stats block to paste:
 {session_stats}

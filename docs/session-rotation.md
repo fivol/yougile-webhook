@@ -117,30 +117,36 @@ the same workspace.
 | `SESSION_ROTATE_MODE` | behaviour |
 |---|---|
 | `off` | disabled; identical to v1.3 |
-| `manual` | never rotates; posts one advisory per session when the threshold trips, suggesting `/new` |
-| `auto` | rotates and posts a notice with the full cost breakdown |
+| `manual` | never rotates; advises `/new` once per session when the threshold trips |
+| `auto` | rotates, and says so in the same message |
 
 **Ship on `manual`.** Watch the advisories for a few days, confirm they fire
 where you would have wanted them to, then switch to `auto`.
 
-The notice the chat gets on rotation:
+### One turn, one message
+
+Neither mode posts a message of its own. Both fold their line into the ack the
+agent is about to post anyway (the `{session_stats}` block), because the two
+used to arrive seconds apart saying overlapping things — and the advisory read
+as a decision the receiver had not actually made:
 
 ```
-⚙️ Новая сессия
+Продолжаю в ветке task-app-languages-fr-de-es      ← the agent's own words
+⚙️ Начал новую сессию — пауза 9 д 13 ч, кеш почти наверняка мёртв. Продолжаю в ней.
+прошлая <session-uuid> — контекст 395 181 · потрачено ≈ $88.01 · следующий ход на ней стоил бы ≈ $3.76 при пороге $1.50
+session: <new-session-uuid>  (2-я в цепочке)
+```
 
-Прошлая — <session-uuid>
-  контекст     395 181 токенов · 360 запросов к API
-  потрачено    ≈ $88.01   (запись $39.46 · чтение $41.18 · вывод $7.34)
-  мимо кеша    13 запросов из 360
+The three numbers that justify the decision — context, spend, threshold — are
+in there; the retired session's full breakdown (per-kind spend, cache misses,
+the `claude --resume` line) is one `/sessions` away and no longer clutters the
+chat. Costs are reported when the task is *taken on*, so they are the estimate
+for the turn ahead; what the turn actually cost lands in the next `/status`.
 
-Причина: пауза 9 д 13 ч, кеш почти наверняка мёртв → следующий ход на
-этом контексте стоил бы ≈ $3.76 (порог $1.50).
+In `manual` mode the same slot carries the advice instead, once per session:
 
-Новая — <session-uuid>. Перенесены история задачи,
-ветки, PR и дифф.
-
-Старая сессия никуда не делась:
-claude --resume <session-uuid>
+```
+⚙️ Контекст 495 281 токенов, следующий ход ≈ $4.72 при пороге $1.50 — пора начать новую сессию: /new
 ```
 
 Nothing is deleted — every retired session is still openable locally with

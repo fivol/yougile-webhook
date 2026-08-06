@@ -2095,24 +2095,23 @@ def _record_turn_metrics(
         log.exception("failed to record turn metrics for chat %s", chat_id)
 
 
-def _post_rotation_advisory(chat_id: str, facts: Dict[str, Any]) -> None:
-    """`manual` mode: flag the threshold, let the human decide."""
+def render_rotation_advice(chat_id: str, facts: Dict[str, Any]) -> str:
+    """`manual` mode: flag the threshold, let the human decide.
+
+    Returns the line to fold into this turn's ack, once per session — repeating
+    "you should rotate" on every turn would train the user to ignore it.
+    """
     state = get_chat_state(chat_id)
     if state.get("advisory_at_seq") == facts["session"]["seq"]:
-        return  # already told them about this session
+        return ""  # already told them about this session
     update_chat_state(chat_id, advisory_at_seq=facts["session"]["seq"])
-    text = msg(
-        "advisory.text",
+    return msg(
+        "advisory.line",
         prefix=COMMAND_REPLY_PREFIX,
         tokens=_fmt_int(facts.get("ctx_tokens")),
         cost=_fmt_usd(facts.get("expected_cost")),
         threshold=_fmt_usd(ROTATE_TURN_COST_USD),
     )
-    threading.Thread(
-        target=send_chat_message,
-        args=(chat_id, text, f"<p>{_html_escape(text)}</p>"),
-        daemon=True,
-    ).start()
 
 
 # ------------------------------------------------------------- session chain
@@ -2449,8 +2448,17 @@ def maybe_digest(path: Optional[Path], rule: "Rule") -> None:
 # ------------------------------------------------------------------ rendering
 
 
-def render_session_stats(facts: Dict[str, Any], state: Dict[str, Any]) -> str:
-    """The block the agent appends verbatim to its ack."""
+def render_session_stats(
+    facts: Dict[str, Any], state: Dict[str, Any], note: str = "",
+) -> str:
+    """The block the agent appends verbatim to its ack.
+
+    Also the only place a session change is announced. A rotation used to arrive
+    as its own message moments before the agent's ack, so crossing the threshold
+    cost the chat two messages that talked about the same numbers — and the
+    second one silently contradicted the first by carrying on regardless. One
+    turn, one message: `note` rides along here.
+    """
     sv = facts["session"]
     chain = len(state.get("sessions") or []) + 1
     ctx = facts.get("ctx_tokens")
@@ -2466,53 +2474,33 @@ def render_session_stats(facts: Dict[str, Any], state: Dict[str, Any]) -> str:
         bits.append(msg("stats.turn_cost", cost=_fmt_usd(cost)))
     if spent:
         bits.append(msg("stats.session_cost", cost=_fmt_usd(spent)))
-    return line + ("\n" + " · ".join(bits) if bits else "")
+    stats = line + ("\n" + " · ".join(bits) if bits else "")
+    return f"{note}\n{stats}" if note else stats
 
 
-def render_rotation_notice(
-    chat_id: str, old_id: str, new_id: str, reason: str,
-    facts: Dict[str, Any], totals: Dict[str, Any], handoff: Optional[Path],
-) -> Tuple[str, str]:
+def render_rotation_note(
+    old_id: str, reason: str, facts: Dict[str, Any], totals: Dict[str, Any],
+) -> str:
+    """Two lines for the ack: a new session started, and what the old one cost.
+
+    Everything the retired session's full breakdown used to say is still one
+    `/sessions` away — what belongs in the chat is the decision (new session),
+    the reason, and the three numbers behind it: context, spend, threshold.
+    """
     why = {
         "cost": msg("rotation.reason_cost", age=_fmt_age(facts.get("idle_min"))),
         "hard-ctx": msg("rotation.reason_hard_ctx"),
         "command": msg("rotation.reason_command"),
     }.get(reason, reason)
-    cold = totals.get("cold_turns") or 0
-    turns = totals.get("turns") or 0
-    lines = [
-        msg("rotation.title", prefix=COMMAND_REPLY_PREFIX),
-        "",
-        msg("rotation.old", id=old_id),
-        msg("rotation.old_context",
-            tokens=_fmt_int(facts.get("ctx_tokens")), turns=turns),
-        msg("rotation.old_spent",
-            total=_fmt_usd(totals.get("cost_usd")),
-            write=_fmt_usd(totals.get("write_usd")),
-            read=_fmt_usd(totals.get("read_usd")),
-            output=_fmt_usd(totals.get("output_usd"))),
-    ]
-    if turns:
-        lines.append(msg("rotation.old_cold", cold=cold, turns=turns))
-    exp = facts.get("expected_cost")
-    lines += [
-        "",
-        msg("rotation.why", why=why, expected=_fmt_usd(exp),
+    return "\n".join([
+        msg("rotation.started", prefix=COMMAND_REPLY_PREFIX, why=why),
+        msg("rotation.previous",
+            id=old_id,
+            tokens=_fmt_int(facts.get("ctx_tokens")),
+            spent=_fmt_usd(totals.get("cost_usd")),
+            expected=_fmt_usd(facts.get("expected_cost")),
             threshold=_fmt_usd(ROTATE_TURN_COST_USD)),
-        "",
-        msg("rotation.new", id=new_id),
-    ]
-    if handoff:
-        lines.append(msg("rotation.handoff", path=handoff))
-    lines += [
-        "",
-        msg("rotation.old_kept"),
-        msg("rotation.resume_hint", id=old_id),
-    ]
-    text = "\n".join(lines)
-    html = "<p>" + "</p><p>".join(
-        _html_escape(b).replace("\n", "<br>") for b in text.split("\n\n")) + "</p>"
-    return text, html
+    ])
 
 
 def _html_escape(s: str) -> str:
@@ -3368,6 +3356,7 @@ def spawn_claude(
             rotate, rotate_reason, facts = should_rotate(
                 chat_id, chat_state, rule, interrupted)
             handoff_path: Optional[Path] = None
+            session_note = ""
             if rotate:
                 old_id = facts["session"]["id"]
                 old_totals = _usage_totals(_transcript_path(rule.workdir, old_id))
@@ -3388,17 +3377,13 @@ def spawn_claude(
                 if ws:
                     patch_feature_json(ws, new_id, chat_id)
                     update_chat_state(chat_id, workspace_path=str(ws))
-                notice, notice_html = render_rotation_notice(
-                    chat_id, old_id, new_id, rotate_reason, facts,
-                    old_totals, handoff_path,
-                )
-                threading.Thread(
-                    target=send_chat_message,
-                    args=(chat_id, notice, notice_html), daemon=True,
-                ).start()
+                # Not a message of its own: it rides on the ack the agent is
+                # about to post, so the chat sees one message per turn.
+                session_note = render_rotation_note(
+                    old_id, rotate_reason, facts, old_totals)
                 facts = session_facts(chat_id, chat_state, rule)
             elif rotate_reason.startswith("advisory:"):
-                _post_rotation_advisory(chat_id, facts)
+                session_note = render_rotation_advice(chat_id, facts)
             elif rotate_reason == "kept":
                 update_chat_state(chat_id, skip_rotation_once=False)
 
@@ -3437,8 +3422,12 @@ def spawn_claude(
                 )
                 session_flag = ["--resume", session_id]
 
+            # Stats are opt-out; a session change is not. If ACK_STATS is off,
+            # the note still has to reach the chat — the user needs to know the
+            # conversation moved to a new session.
             session_stats = (
-                render_session_stats(facts, chat_state) if ACK_STATS else "")
+                render_session_stats(facts, chat_state, note=session_note)
+                if ACK_STATS else session_note)
             history_text, attachment_paths = render_chat_history(history, chat_id)
             newest_msg_id = max(
                 [int(m["id"]) for m in history if m.get("id")] + [last_msg_id or 0]
