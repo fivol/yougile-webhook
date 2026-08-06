@@ -1754,9 +1754,42 @@ def _fmt_usd(x: Optional[float]) -> str:
     return f"${x:,.2f}".replace(",", " ") if x >= 10 else f"${x:.2f}"
 
 
+def _plural_form(n: Any) -> str:
+    """Which of the three Slavic plural forms `n` takes: 1 ход, 2 хода, 5 ходов.
+
+    The forms themselves live in the messages file; a language that doesn't work
+    this way just repeats the same word in all three keys.
+    """
+    try:
+        n = abs(int(n))
+    except (TypeError, ValueError):
+        return "many"
+    if n % 10 == 1 and n % 100 != 11:
+        return "one"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "few"
+    return "many"
+
+
+def _fmt_count(n: Any, kind: str) -> str:
+    """"61 ход" / "623 хода" — a number with its noun in the right form."""
+    return f"{_fmt_int(n)} {msg(f'plural.{kind}_{_plural_form(n)}')}"
+
+
+def _fmt_when(iso: Optional[str]) -> str:
+    """An ISO timestamp as "02.08 09:30" — a chat line has no room for more."""
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return msg("age.unknown")
+    return dt.astimezone().strftime("%d.%m %H:%M")
+
+
 def _fmt_age(minutes: Optional[float]) -> str:
     if minutes is None:
         return msg("age.unknown")
+    if minutes < 1:
+        return msg("age.just_now")
     if minutes < 60:
         return msg("age.minutes", minutes=int(minutes))
     if minutes < 60 * 24:
@@ -2464,7 +2497,9 @@ def render_session_stats(
     ctx = facts.get("ctx_tokens")
     cost = facts.get("expected_cost")
     spent = (state.get("session_totals") or {}).get("cost_usd")
-    line = f"session: {sv['id']}"
+    # Plain text, no markup: the agent pastes this into `text` as well as into
+    # `textHtml`, and a mark would show up as a literal character there.
+    line = msg("stats.session", id=sv["id"])
     if chain > 1:
         line += msg("stats.chain_position", position=sv["seq"] + 1)
     bits = []
@@ -2507,26 +2542,110 @@ def _html_escape(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+# --- Message layout ----------------------------------------------------------
+# YouGile renders `textHtml` and shows `text` verbatim, so every message we post
+# needs both: the HTML the user reads, and a plain fallback for notifications
+# and search, where markup would show up as literal characters. Both come from
+# the same source — the messages file — written with four marks:
+#
+#     # heading         ->  <h4>
+#     - item            ->  <ul><li>
+#     **emphasis**      ->  <b>
+#     `literal`         ->  <code>
+#     [label](url)      ->  <a href="url">label</a>
+#
+# A blank line starts a new paragraph; single newlines inside one become <br>.
+# Everything else is literal, and every value the code interpolates is escaped,
+# so a branch name with an angle bracket in it cannot break the message.
+#
+# Deliberately NOT used for: the ack block the agent pastes into its own message
+# (plain text only — it lands in `text` as well), and the quoted claude output in
+# a failure report (raw output, whose backticks would be read as markup).
+_MARK_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+_MARK_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_MARK_CODE = re.compile(r"`([^`]+)`")
+
+
+def _inline_text(s: str) -> str:
+    s = _MARK_LINK.sub(lambda m: f"{m.group(1)}: {m.group(2)}", s)
+    s = _MARK_BOLD.sub(r"\1", s)
+    return _MARK_CODE.sub(r"\1", s)
+
+
+def _inline_html(s: str) -> str:
+    s = _html_escape(s)
+    s = _MARK_LINK.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', s)
+    s = _MARK_BOLD.sub(r"<b>\1</b>", s)
+    return _MARK_CODE.sub(r"<code>\1</code>", s)
+
+
+def render_message(lines: List[str]) -> Tuple[str, str]:
+    """(text, textHtml) from a list of marked-up lines. "" starts a paragraph."""
+    text_out: List[str] = []
+    html_out: List[str] = []
+    para: List[str] = []
+    bullets: List[str] = []
+
+    def flush() -> None:
+        if bullets:
+            html_out.append(
+                "<ul>" + "".join(f"<li>{_inline_html(b)}</li>" for b in bullets) + "</ul>")
+            text_out.append("\n".join("• " + _inline_text(b) for b in bullets))
+            bullets.clear()
+        if para:
+            html_out.append(
+                "<p>" + "<br>".join(_inline_html(p) for p in para) + "</p>")
+            text_out.append("\n".join(_inline_text(p) for p in para))
+            para.clear()
+
+    for raw in lines:
+        line = (raw or "").rstrip()
+        if not line:
+            flush()
+        elif line.startswith("# "):
+            flush()
+            html_out.append(f"<h4>{_inline_html(line[2:])}</h4>")
+            text_out.append(_inline_text(line[2:]))
+        elif line.startswith("- "):
+            if para:  # a bullet list closes the paragraph above it
+                flush()
+            bullets.append(line[2:])
+        else:
+            if bullets:
+                flush()
+            para.append(line)
+    flush()
+    return "\n\n".join(text_out), "".join(html_out)
+
+
 def render_help() -> Tuple[str, str]:
     # Numbers arrive pre-formatted: a format spec inside a translatable string
     # is a landmine for whoever edits the file next.
-    text = msg(
-        "help.text",
-        prefix=COMMAND_REPLY_PREFIX,
-        mention=AGENT_MENTION,
-        price_in=f"{PRICE_IN_PER_MTOK:.0f}",
-        price_out=f"{PRICE_OUT_PER_MTOK:.0f}",
-        cache_write=f"{CACHE_WRITE_MULT:g}",
-        cache_read=f"{CACHE_READ_MULT:g}",
-    )
-    return text, f"<pre>{_html_escape(text)}</pre>"
+    return render_message([
+        msg("help.title", prefix=COMMAND_REPLY_PREFIX),
+        msg("help.intro"),
+        "",
+        msg("help.status"),
+        msg("help.sessions"),
+        msg("help.new"),
+        msg("help.keep"),
+        msg("help.stop"),
+        msg("help.help"),
+        "",
+        msg("help.mention", mention=AGENT_MENTION),
+        msg("help.prices",
+            price_in=f"{PRICE_IN_PER_MTOK:.0f}",
+            price_out=f"{PRICE_OUT_PER_MTOK:.0f}",
+            cache_write=f"{CACHE_WRITE_MULT:g}",
+            cache_read=f"{CACHE_READ_MULT:g}"),
+    ])
 
 
 def render_status(chat_id: str, rule: "Rule") -> Tuple[str, str]:
     state = get_chat_state(chat_id)
     if not state:
-        never = msg("status.never_ran", prefix=COMMAND_REPLY_PREFIX)
-        return never, f"<p>{_html_escape(never)}</p>"
+        return render_message(
+            [msg("status.never_ran", prefix=COMMAND_REPLY_PREFIX)])
     facts = session_facts(chat_id, state, rule)
     sv = facts["session"]
     tp = _transcript_path(rule.workdir, sv["id"])
@@ -2534,97 +2653,123 @@ def render_status(chat_id: str, rule: "Rule") -> Tuple[str, str]:
     chain = list(state.get("sessions") or [])
     chain_cost = sum((s.get("cost_usd") or 0) for s in chain) + (totals.get("cost_usd") or 0)
     last = facts.get("last_turn") or {}
+    busy = chat_turn_in_flight(chat_id)
 
-    L = [msg("status.title", prefix=COMMAND_REPLY_PREFIX),
+    # Four short blocks, in the order the questions get asked: what is this
+    # session, what happens next, where is the work, and housekeeping. No column
+    # alignment — the chat panel is narrow and wraps, which is exactly what made
+    # the old <pre> dump unreadable.
+    L = [msg("status.title", prefix=COMMAND_REPLY_PREFIX,
+             agent=msg("status.agent_busy" if busy else "status.agent_idle")),
          "",
-         msg("status.session_header"),
-         msg("status.session_id", id=sv["id"], position=sv["seq"] + 1,
-             total=len(chain) + 1)]
+         msg("status.session", position=sv["seq"] + 1, total=len(chain) + 1,
+             id=sv["id"])]
     if facts.get("ctx_tokens"):
-        L.append(msg("status.session_context",
-                     tokens=_fmt_int(facts["ctx_tokens"]),
-                     turns=totals.get("turns", 0),
+        L.append(msg("status.context",
+                     tokens=_fmt_count(facts["ctx_tokens"], "tokens"),
+                     turns=_fmt_count(totals.get("turns", 0), "turns"),
                      age=_fmt_age(facts.get("idle_min"))))
     else:
-        L.append(msg("status.session_context_unknown"))
+        L.append(msg("status.context_unknown"))
     if last:
-        mark = msg("status.last_turn_cold" if last.get("cold")
-                   else "status.last_turn_warm")
-        L.append(msg("status.last_turn", mark=mark,
+        L.append(msg("status.last_turn_cold" if last.get("cold")
+                     else "status.last_turn_warm",
+                     cost=_fmt_usd(last.get("cost_usd")),
                      read=_fmt_int(last.get("cache_read")),
-                     write=_fmt_int(last.get("cache_creation")),
-                     cost=_fmt_usd(last.get("cost_usd"))))
-    L.append(msg("status.session_cost",
+                     write=_fmt_int(last.get("cache_creation"))))
+    L.append(msg("status.spent",
                  total=_fmt_usd(totals.get("cost_usd")),
                  write=_fmt_usd(totals.get("write_usd")),
                  read=_fmt_usd(totals.get("read_usd")),
                  output=_fmt_usd(totals.get("output_usd"))))
     if chain:
-        L.append(msg("status.task_cost", cost=_fmt_usd(chain_cost),
-                     sessions=len(chain) + 1))
+        L.append(msg("status.spent_task", cost=_fmt_usd(chain_cost),
+                     sessions=_fmt_count(len(chain) + 1, "sessions")))
 
-    L += ["", msg("status.rotation_header"),
-          msg("status.rotation_policy", mode=SESSION_ROTATE_MODE,
-              threshold=_fmt_usd(ROTATE_TURN_COST_USD),
-              ctx_cap=_fmt_int(ROTATE_HARD_CTX))]
+    L += ["", msg("status.next_header")]
     exp = facts.get("expected_cost")
     if exp is None:
-        L.append(msg("status.rotation_unknown"))
+        L.append(msg("status.next_unknown"))
     else:
         rotate_now = (facts.get("ctx_tokens") or 0) >= ROTATE_HARD_CTX or exp > ROTATE_TURN_COST_USD
         verdict = msg("status.verdict_rotate" if rotate_now else "status.verdict_keep")
         if SESSION_ROTATE_MODE != "auto" and rotate_now:
             verdict += msg("status.verdict_advisory_only", mode=SESSION_ROTATE_MODE)
-        L.append(msg("status.rotation_now", cost=_fmt_usd(exp), verdict=verdict))
+        L.append(msg("status.next_turn", cost=_fmt_usd(exp), verdict=verdict))
         cold_cost = expected_turn_cost(facts.get("ctx_tokens"), 999)
         if cold_cost and not rotate_now:
-            L.append(msg("status.rotation_if_idle", cost=_fmt_usd(cold_cost)))
-    stats = _load_cache_stats()
-    L.append(msg("status.cache_miss", buckets=" · ".join(
-        msg("status.cache_miss_bucket", bucket=k,
-            percent=f"{100 * miss_probability(k):.0f}")
+            L.append(msg("status.next_if_idle", cost=_fmt_usd(cold_cost)))
+    L.append(msg("status.policy", mode=SESSION_ROTATE_MODE,
+                 threshold=_fmt_usd(ROTATE_TURN_COST_USD),
+                 ctx_cap=_fmt_int(ROTATE_HARD_CTX)))
+    L.append(msg("status.cache_decay", buckets=" · ".join(
+        msg("status.cache_decay_bucket",
+            percent=f"{100 * miss_probability(k):.0f}",
+            after=msg(f"status.cache_decay_after_{k.replace('-', '_').replace('+', 'plus')}"))
         for k in ("0-10", "10-30", "30-60", "60+"))))
 
     ws = find_workspace(rule.workdir, [s.get("id") for s in chain] + [sv["id"]], chat_id)
     if ws:
-        L += ["", msg("status.workspace_header", path=ws)]
-        try:
-            data = json.loads((ws / ".feature.json").read_text(encoding="utf-8"))
-            for name, r in (data.get("repos") or {}).items():
-                L.append(msg("status.workspace_repo", repo=f"{name:<10}",
-                             branch=r.get("branch"), base=r.get("base"),
-                             pr=r.get("pr") or msg("status.workspace_no_pr"),
-                             url=r.get("url") or ""))
-        except (OSError, json.JSONDecodeError):
-            L.append(msg("status.workspace_unreadable"))
+        L += ["", *_render_workspace(ws)]
 
-    busy = chat_turn_in_flight(chat_id)
-    L += ["", msg("status.chat_header"),
-          msg("status.chat_processed", last_message_id=state.get("last_message_id")),
-          msg("status.chat_agent", state=msg(
-              "status.agent_busy" if busy else "status.agent_idle"))]
-    text = "\n".join(L)
-    return text, f"<pre>{_html_escape(text)}</pre>"
+    L += ["", msg("status.processed_up_to",
+                  last_message_id=state.get("last_message_id"))]
+    return render_message(L)
+
+
+def _render_workspace(ws: Path) -> List[str]:
+    """The workspace block of /status: one bullet per repo, PRs as links.
+
+    The branch is named once for the whole workspace — all repos of a feature
+    share it in practice, and a repo that wandered off says so itself.
+    """
+    try:
+        data = json.loads((ws / ".feature.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [msg("status.workspace_unreadable", name=ws.name)]
+    repos = data.get("repos") or {}
+    branches = [r.get("branch") for r in repos.values() if r.get("branch")]
+    common = branches[0] if branches and len(set(branches)) == 1 else ""
+    lines = [msg("status.workspace" if common else "status.workspace_mixed",
+                 name=ws.name, branch=common)]
+    for name, r in repos.items():
+        bits = [msg("status.repo_base", base=r.get("base") or "?")]
+        if not common and r.get("branch"):
+            bits.append(msg("status.repo_branch", branch=r["branch"]))
+        pr = r.get("pr")
+        bits.append(msg("status.repo_pr", label=_pr_label(pr), url=pr) if pr
+                    else msg("status.repo_no_pr"))
+        if r.get("url"):
+            bits.append(msg("status.repo_preview", url=r["url"]))
+        lines.append(msg("status.repo", repo=name, bits=" · ".join(bits)))
+    return lines
+
+
+def _pr_label(pr: str) -> str:
+    """"PR 161" from a pull-request URL; the raw value if it isn't one."""
+    tail = str(pr).rstrip("/").rsplit("/", 1)[-1]
+    return msg("status.pr_number", number=tail) if tail.isdigit() else str(pr)
 
 
 def render_sessions(chat_id: str, rule: "Rule") -> Tuple[str, str]:
     state = get_chat_state(chat_id)
     sv = session_view(chat_id, state)
     chain = list(state.get("sessions") or [])
-    L = [msg("sessions.title", prefix=COMMAND_REPLY_PREFIX), ""]
-    for s in chain:
-        L.append(msg("sessions.retired", seq=s.get("seq"), id=s.get("id")))
-        L.append(msg("sessions.retired_detail", turns=s.get("turns"),
-                     cost=_fmt_usd(s.get("cost_usd")),
-                     retired_at=s.get("retired_at", "?")[:16],
-                     reason=s.get("reason")))
     totals = _usage_totals(_transcript_path(rule.workdir, sv["id"]))
-    L.append(msg("sessions.current", seq=sv["seq"], id=sv["id"]))
-    L.append(msg("sessions.current_detail", turns=totals.get("turns"),
+    spent = sum((s.get("cost_usd") or 0) for s in chain) + (totals.get("cost_usd") or 0)
+    L = [msg("sessions.title", prefix=COMMAND_REPLY_PREFIX,
+             count=len(chain) + 1, spent=_fmt_usd(spent)), ""]
+    for s in chain:
+        L.append(msg("sessions.retired", seq=s.get("seq"), id=s.get("id"),
+                     turns=_fmt_count(s.get("turns"), "turns"),
+                     cost=_fmt_usd(s.get("cost_usd")),
+                     retired_at=_fmt_when(s.get("retired_at")),
+                     reason=s.get("reason")))
+    L.append(msg("sessions.current", seq=sv["seq"], id=sv["id"],
+                 turns=_fmt_count(totals.get("turns"), "turns"),
                  cost=_fmt_usd(totals.get("cost_usd"))))
     L += ["", msg("sessions.footer")]
-    text = "\n".join(L)
-    return text, f"<pre>{_html_escape(text)}</pre>"
+    return render_message(L)
 
 
 # ------------------------------------------------------------------- commands
@@ -2683,11 +2828,12 @@ def _post_command_refusal(chat_id: Optional[str], cmd: str) -> None:
     """Tell the sender their command was recognised but not theirs to run."""
     if not chat_id:
         return
-    text = msg("command.not_allowed", prefix=COMMAND_REPLY_PREFIX, command=cmd)
+    text, html = render_message(
+        [msg("command.not_allowed", prefix=COMMAND_REPLY_PREFIX, command=cmd)])
 
     def _send() -> None:
         try:
-            send_chat_message(chat_id, text, f"<p>{_html_escape(text)}</p>")
+            send_chat_message(chat_id, text, html)
         except Exception:
             log.exception("command refusal send failed chat=%s", chat_id)
 
@@ -2714,17 +2860,17 @@ def handle_command(cmd: str, arg: str, payload: Any) -> Dict[str, Any]:
     elif cmd == "new":
         update_chat_state(chat_id, pending_rotation=True, skip_rotation_once=False)
         extra = msg("command.new_reason", reason=arg) if arg else ""
-        text = msg("command.new_ok", prefix=COMMAND_REPLY_PREFIX) + extra
-        html = f"<p>{_html_escape(text)}</p>"
+        text, html = render_message(
+            [msg("command.new_ok", prefix=COMMAND_REPLY_PREFIX) + extra])
     elif cmd == "keep":
         update_chat_state(chat_id, skip_rotation_once=True, pending_rotation=False)
-        text = msg("command.keep_ok", prefix=COMMAND_REPLY_PREFIX)
-        html = f"<p>{_html_escape(text)}</p>"
+        text, html = render_message(
+            [msg("command.keep_ok", prefix=COMMAND_REPLY_PREFIX)])
     elif cmd == "stop":
         stopped = _interrupt_chat(chat_id)
-        text = msg("command.stop_ok" if stopped else "command.stop_idle",
-                   prefix=COMMAND_REPLY_PREFIX)
-        html = f"<p>{_html_escape(text)}</p>"
+        text, html = render_message(
+            [msg("command.stop_ok" if stopped else "command.stop_idle",
+                 prefix=COMMAND_REPLY_PREFIX)])
     else:
         return {"handled": False}
 
@@ -2876,13 +3022,6 @@ def _post_capacity_message(chat_id: Optional[str]) -> None:
     threading.Thread(target=_send, daemon=True).start()
 
 
-def _paragraph_html(text: str) -> str:
-    """Blank-line-separated text as YouGile-friendly HTML paragraphs."""
-    return "<p>" + "</p><p>".join(
-        _html_escape(block).replace("\n", "<br>") for block in text.split("\n\n")
-    ) + "</p>"
-
-
 def _post_turn_failure(
     chat_id: Optional[str], headline: str, reason: str = "", footer: str = "",
 ) -> None:
@@ -2895,16 +3034,22 @@ def _post_turn_failure(
     """
     if not (chat_id and TURN_FAILURE_REPORT):
         return
-    blocks = [f"{TURN_FAILURE_PREFIX} {headline}".strip()]
+    headline = f"{TURN_FAILURE_PREFIX} {headline}".strip()
+    blocks = [headline]
+    html = [f"<p>{_inline_html(headline)}</p>"]
     if reason:
         blocks.append(reason)
+        # Claude's own output, set apart as a quote and NEVER read as markup:
+        # backticks and asterisks are ordinary characters in an error message.
+        html.append(f"<pre><code>{_html_escape(reason)}</code></pre>")
     if footer:
         blocks.append(footer)
+        html.append(f"<p>{_inline_html(footer)}</p>")
     text = "\n\n".join(blocks)
 
     def _send() -> None:
         try:
-            ok = send_chat_message(chat_id, text, _paragraph_html(text))
+            ok = send_chat_message(chat_id, text, "".join(html))
             log.info("turn failure reported to chat=%s ok=%s", chat_id, ok)
         except Exception:
             log.exception("turn failure report failed chat=%s", chat_id)

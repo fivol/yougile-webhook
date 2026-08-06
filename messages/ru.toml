@@ -13,17 +13,39 @@
 #     reorder them freely, but don't invent new ones — an unknown name renders
 #     the template unfilled.
 #   * A literal brace must be doubled: {{ }}.
-#   * The /status, /sessions and /help replies are sent as <pre>, so their
-#     column alignment is what the user sees. Keep the padding.
+#   * Four marks are understood, and turn into HTML for the chat and into
+#     plain text for notifications:
+#         # heading      - list item      **emphasis**
+#         `literal`      [label](url)
+#     A line of its own that is empty starts a new paragraph. Write no HTML
+#     here: the chat panel is narrow and wraps, so lay messages out in short
+#     lines separated by " · ", never in aligned columns.
 #
 # What is NOT here: prompts (prompts/*.txt), CONCURRENCY_BUSY_MESSAGE (.env,
 # for backwards compatibility), and text sent to the agent rather than to the
 # user (interrupt notices, prompt scaffolding) — that one is English on purpose.
 
 
-# Ages, as used in "последний 2 ч 05 мин назад" and "пауза 3 д 4 ч".
+# Nouns that follow a number. The code picks one of the three by the Slavic
+# rule (1 ход · 2 хода · 5 ходов); a language without that distinction repeats
+# the same word in all three keys.
+[plural]
+turns_one = "ход"
+turns_few = "хода"
+turns_many = "ходов"
+tokens_one = "токен"
+tokens_few = "токена"
+tokens_many = "токенов"
+sessions_one = "сессии"
+sessions_few = "сессий"
+sessions_many = "сессий"
+
+
+# Ages, as used in "последний 2 ч 05 мин назад" and "пауза 3 д 4 ч" — always a
+# duration, never a moment, because the templates put "назад" after it.
 [age]
 unknown = "?"
+just_now = "меньше минуты"
 minutes = "{minutes} мин"
 hours = "{hours} ч {minutes:02d} мин"
 hours_flat = "{hours} ч"
@@ -32,8 +54,11 @@ days_flat = "{days} д"
 
 
 # The block the agent appends to its own ack ("Продолжаю …"), when ACK_STATS=true.
+# PLAIN TEXT ONLY — the agent pastes it into `text` too, where a mark would show
+# as a literal character. Two short lines at most.
 [stats]
-chain_position = "  ({position}-я в цепочке)"
+session = "сессия {id}"
+chain_position = " · {position}-я в цепочке"
 context = "контекст {tokens}"
 turn_cost = "этот ход ≈ {cost}"
 session_cost = "за сессию ≈ {cost}"
@@ -45,14 +70,14 @@ session_cost = "за сессию ≈ {cost}"
 # `manual` rotation mode: the threshold is crossed but the human decides.
 # Said once per session.
 [advisory]
-line = "{prefix} Контекст {tokens} токенов, следующий ход ≈ {cost} при пороге {threshold} — пора начать новую сессию: /new"
+line = "{prefix} Контекст {tokens} · следующий ход ≈ {cost} при пороге {threshold} — пора начать новую сессию: /new"
 
 
 # `auto` rotation mode: the session was actually retired and this turn runs in
 # a fresh one. The retired session's full breakdown stays one /sessions away.
 [rotation]
-started = "{prefix} Начал новую сессию — {why}. Продолжаю в ней."
-previous = "прошлая {id} — контекст {tokens} · потрачено ≈ {spent} · следующий ход на ней стоил бы ≈ {expected} при пороге {threshold}"
+started = "{prefix} Новая сессия: {why} — продолжаю в ней"
+previous = "прошлая {id} · контекст {tokens} · потрачено ≈ {spent} · ход на ней стоил бы ≈ {expected} при пороге {threshold}"
 reason_cost = "пауза {age}, кеш почти наверняка мёртв"
 reason_hard_ctx = "контекст подошёл к пределу окна"
 reason_command = "запрошено командой /new"
@@ -60,71 +85,69 @@ reason_command = "запрошено командой /new"
 
 # /help
 [help]
-text = """
-{prefix} Команды — их обрабатывает обвязка, агент не запускается и токены не тратятся
-
-/status     контекст, кеш, траты, воркспейс, и начнётся ли следующий ход
-            в новой сессии
-/sessions   цепочка сессий этой задачи: id, причины смены, траты
-            (любую можно открыть локально: claude --resume <id>)
-/new [что]  следующий ход — принудительно в новой сессии
-/keep       разово отменить запланированную авто-ротацию
-/stop       прервать текущий ход агента
-/help       это сообщение
-
-{mention} <текст>        обычное обращение к агенту
-{mention} /new <текст>   ротация + сразу задача
-
-Суммы — оценка по прайсу API (${price_in}/${price_out} за Mtok,
-запись в кеш ×{cache_write}, чтение ×{cache_read})."""
+title = "# {prefix} Команды"
+intro = "Отвечает обвязка — агент не запускается, токены не тратятся."
+status = "- **/status** — контекст, кеш, траты, воркспейс, будет ли новая сессия"
+sessions = "- **/sessions** — цепочка сессий задачи: id, причины смены, траты"
+new = "- **/new** [что] — следующий ход принудительно в новой сессии"
+keep = "- **/keep** — разово отменить запланированную авто-ротацию"
+stop = "- **/stop** — прервать текущий ход агента"
+help = "- **/help** — это сообщение"
+mention = "**{mention}** «текст» — обращение к агенту · **{mention} /new** «текст» — ротация и сразу задача"
+prices = "Суммы — оценка по прайсу API: ${price_in}/${price_out} за Mtok, запись в кеш ×{cache_write}, чтение ×{cache_read}"
 
 
-# /status
+# /status. Four blocks, in the order the questions get asked: what this session
+# is, what happens next, where the work lives, housekeeping.
 [status]
 never_ran = "{prefix} По этому чату ещё не было ни одного хода агента."
-title = "{prefix} Статус"
-
-session_header = "Сессия"
-session_id = "  id            {id}   ({position}-я из {total} в цепочке)"
-session_context = "  контекст      {tokens} токенов · {turns} запросов · последний {age} назад"
-session_context_unknown = "  контекст      нет данных (транскрипт не найден)"
-last_turn = "  прошлый ход   {mark} (read {read}, write {write}) — факт {cost}"
-last_turn_cold = "❌ мимо кеша"
-last_turn_warm = "✅ попал в кеш"
-session_cost = "  за сессию     ≈ {total}   (запись {write} · чтение {read} · вывод {output})"
-task_cost = "  за задачу     ≈ {cost} по цепочке из {sessions} сессий"
-
-rotation_header = "Ротация"
-rotation_policy = "  режим         {mode} · порог {threshold} за ход · потолок {ctx_cap} токенов"
-rotation_unknown = "  сейчас        нет данных для оценки"
-rotation_now = "  сейчас        следующий ход ≈ {cost} → {verdict}"
-verdict_rotate = "начнётся НОВАЯ сессия"
-verdict_keep = "продолжу текущую сессию"
-verdict_advisory_only = " (режим {mode} — только предупрежу)"
-rotation_if_idle = "  если пауза    > часа → ≈ {cost}, и тогда новая сессия"
-cache_miss = "  промах кеша   {buckets}"
-cache_miss_bucket = "{bucket} мин {percent}%"
-
-workspace_header = "Воркспейс  {path}"
-workspace_repo = "  {repo} {branch} → {base}   {pr}   {url}"
-workspace_no_pr = "PR нет"
-workspace_unreadable = "  (.feature.json нечитаем)"
-
-chat_header = "Чат"
-chat_processed = "  обработано до {last_message_id}"
-chat_agent = "  агент: {state}"
+title = "# {prefix} Статус — агент {agent}"
 agent_busy = "работает"
 agent_idle = "свободен"
+
+session = "**Сессия** {position}-я из {total} · `{id}`"
+context = "{tokens} · {turns} · последний {age} назад"
+context_unknown = "контекста ещё нет — транскрипт не найден"
+last_turn_warm = "✅ прошлый ход попал в кеш — {cost}"
+last_turn_cold = "❌ прошлый ход мимо кеша — {cost} (read {read} · write {write})"
+spent = "за сессию ≈ {total} — запись {write} · чтение {read} · вывод {output}"
+spent_task = "за всю задачу ≈ {cost} по цепочке из {sessions}"
+
+next_header = "**Дальше**"
+next_unknown = "оценить нечем — сессия ещё ничего не потратила"
+next_turn = "следующий ход ≈ {cost} → {verdict}"
+verdict_rotate = "начнётся НОВАЯ сессия"
+verdict_keep = "продолжу текущую"
+verdict_advisory_only = " (режим {mode} — только предупрежу)"
+next_if_idle = "после часа простоя ≈ {cost} → и тогда новая"
+policy = "порог {threshold} за ход · потолок {ctx_cap} токенов · режим {mode}"
+cache_decay = "кеш стынет: {buckets}"
+cache_decay_bucket = "{percent}% {after}"
+cache_decay_after_0_10 = "за 10 мин"
+cache_decay_after_10_30 = "за полчаса"
+cache_decay_after_30_60 = "за час"
+cache_decay_after_60plus = "дальше"
+
+workspace = "**Воркспейс** {name} · ветка `{branch}`"
+workspace_mixed = "**Воркспейс** {name}"
+workspace_unreadable = "**Воркспейс** {name} — .feature.json нечитаем"
+repo = "- {repo} {bits}"
+repo_base = "→ {base}"
+repo_branch = "ветка `{branch}`"
+repo_pr = "[{label}]({url})"
+repo_no_pr = "PR нет"
+repo_preview = "[превью]({url})"
+pr_number = "PR {number}"
+
+processed_up_to = "обработано до сообщения {last_message_id}"
 
 
 # /sessions
 [sessions]
-title = "{prefix} Сессии этой задачи"
-retired = "  #{seq}  {id}"
-retired_detail = "       {turns} запросов · ≈ {cost} · закрыта {retired_at} ({reason})"
-current = "  #{seq}  {id}   ← текущая"
-current_detail = "       {turns} запросов · ≈ {cost}"
-footer = "Открыть любую локально:  claude --resume <id>"
+title = "# {prefix} Сессии задачи — {count} · всего ≈ {spent}"
+retired = "- #{seq} `{id}` · {turns} · ≈ {cost} · закрыта {retired_at} ({reason})"
+current = "- #{seq} `{id}` · {turns} · ≈ {cost} · **текущая**"
+footer = "Открыть любую локально: `claude --resume <id>`"
 
 
 # /new, /keep, /stop

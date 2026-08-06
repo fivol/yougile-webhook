@@ -554,6 +554,13 @@ raising. A missing key logs an ERROR and renders as the bare key — the
 turn still completes. A missing or malformed file is logged and the
 service still starts.
 
+Four marks are understood and become HTML for the chat plus a plain twin
+for notifications — `# heading`, `- item`, `**emphasis**`, `` `literal` ``
+and `[label](url)`. Write no HTML in the file: the chat panel is narrow and
+wraps, so messages are laid out as short lines joined by `·`, never as
+aligned columns. Nouns that follow a number (`61 ход` / `623 хода`) pick
+their form from the `[plural]` table.
+
 Deliberately **not** in there:
 
 - `prompts/*.txt` — text sent to the agent, which has its own files.
