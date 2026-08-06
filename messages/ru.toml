@@ -134,6 +134,7 @@ new_reason = " Причина: {reason}"
 keep_ok = "{prefix} Ок, следующий ход продолжит текущую сессию, даже если сработает порог."
 stop_ok = "{prefix} Текущий ход прерван."
 stop_idle = "{prefix} Сейчас по этой задаче ничего не выполняется."
+not_allowed = "{prefix} Команда /{command} доступна только тем, кому разрешено обращаться к агенту (COMMAND_ALLOWED_EMAILS или allowed_sender_emails в rules.toml)."
 
 
 # A turn that died without the agent answering. `reason` is claude's own error

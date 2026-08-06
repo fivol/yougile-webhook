@@ -338,6 +338,13 @@ next turn start a new session?" — handled by the receiver itself, so it costs
 nothing and never wakes the agent. Also `/sessions`, `/new`, `/keep`, `/stop`,
 `/help`. See **[docs/chat-commands.md](docs/chat-commands.md)**.
 
+Who may run them: `COMMAND_ALLOWED_EMAILS`, or — when that is empty — whoever
+the rules already let talk to the agent. The sender is resolved with the same
+`SENDER_KEYS` lookup the rules use, because YouGile puts `fromUserId` at the
+top level of a chat-message payload rather than inside `payload`. A command
+from anyone else is refused **out loud**: a command that silently vanishes is
+indistinguishable from a receiver that is down.
+
 ### Interrupting a running turn
 
 A new `@Agent` message that lands while the agent is still working on the

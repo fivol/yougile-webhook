@@ -80,7 +80,14 @@ carried the `session:` line. Disable with `ACK_STATS=false`.
 
 `COMMAND_ALLOWED_EMAILS` if set; otherwise the union of every rule's
 `allowed_sender_emails`, so commands inherit the same allowlist as `@Agent`
-itself. A command from anyone else is logged and ignored.
+itself. A command from anyone else is logged and refused in the chat — never
+silently dropped.
+
+The sender id is read with `_deep_get(payload, SENDER_KEYS)`, exactly like the
+rules read it. This matters: a `chat_message-created` payload carries
+`fromUserId` at the **top level**, as a sibling of `payload`, not inside it.
+Reading one fixed path instead made every command look like it came from an
+unknown user, and the owner's own `/status` was dropped without a word.
 
 ## Keeping them out of the agent's context
 

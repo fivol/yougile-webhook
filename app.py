@@ -2671,10 +2671,27 @@ def command_sender_allowed(payload: Any) -> bool:
             allowed |= {e.lower() for e in (r.allowed_sender_emails or [])}
     if not allowed:
         return True  # no allowlist configured anywhere — same as the rules
-    msg = payload.get("payload") if isinstance(payload, dict) else {}
-    uid = (msg or {}).get("fromUserId")
+    # Same lookup the rules use. YouGile puts fromUserId at the TOP level of a
+    # chat_message-created payload, not inside `payload` — reading one fixed
+    # path found nothing and silently rejected the owner's own commands.
+    uid = _deep_get(payload, SENDER_KEYS)
     user = USERS_BY_ID.get(uid) or {}
     return (user.get("email") or "").lower() in allowed
+
+
+def _post_command_refusal(chat_id: Optional[str], cmd: str) -> None:
+    """Tell the sender their command was recognised but not theirs to run."""
+    if not chat_id:
+        return
+    text = msg("command.not_allowed", prefix=COMMAND_REPLY_PREFIX, command=cmd)
+
+    def _send() -> None:
+        try:
+            send_chat_message(chat_id, text, f"<p>{_html_escape(text)}</p>")
+        except Exception:
+            log.exception("command refusal send failed chat=%s", chat_id)
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def handle_command(cmd: str, arg: str, payload: Any) -> Dict[str, Any]:
@@ -3623,7 +3640,15 @@ async def yougile_webhook(req: Request):
         cmd = parse_command(payload)
         if cmd:
             if not command_sender_allowed(payload):
-                log.info("command /%s from a non-allowlisted sender — ignored", cmd[0])
+                # Say so rather than dropping it. A command that vanishes is
+                # indistinguishable from a receiver that is down, and this is
+                # exactly how a bad sender lookup stayed invisible for weeks.
+                sender = _deep_get(payload, SENDER_KEYS)
+                log.info(
+                    "command /%s from a non-allowlisted sender %s — refused",
+                    cmd[0], sender,
+                )
+                _post_command_refusal(extract_chat_id(payload), cmd[0])
                 return {"ok": True, "command": cmd[0], "handled": False,
                         "reason": "sender-not-allowed"}
             result = await asyncio.to_thread(handle_command, cmd[0], cmd[1], payload)
