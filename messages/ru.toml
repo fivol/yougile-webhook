@@ -1,0 +1,167 @@
+# Everything this receiver says in a YouGile chat, in one file.
+#
+# The code is English, the chats it serves are not — so no user-facing wording
+# lives in app.py. Translating the service means copying this file to
+# messages/<lang>.toml and setting MESSAGES_LANG=<lang> in .env.
+#
+# Rules for editing:
+#   * Keys are addressed as "table.key" from the code — renaming a key breaks
+#     the message (it degrades to the bare key in the chat and an ERROR in the
+#     log; nothing crashes).
+#   * `{placeholder}` slots are filled by the code with already-formatted
+#     values (`$12.34`, `1 234`, `2 ч 05 мин`). Drop a slot you don't need,
+#     reorder them freely, but don't invent new ones — an unknown name renders
+#     the template unfilled.
+#   * A literal brace must be doubled: {{ }}.
+#   * The /status, /sessions and /help replies are sent as <pre>, so their
+#     column alignment is what the user sees. Keep the padding.
+#
+# What is NOT here: prompts (prompts/*.txt), CONCURRENCY_BUSY_MESSAGE (.env,
+# for backwards compatibility), and text sent to the agent rather than to the
+# user (interrupt notices, prompt scaffolding) — that one is English on purpose.
+
+
+# Ages, as used in "последний 2 ч 05 мин назад" and "пауза 3 д 4 ч".
+[age]
+unknown = "?"
+minutes = "{minutes} мин"
+hours = "{hours} ч {minutes:02d} мин"
+hours_flat = "{hours} ч"
+days = "{days} д {hours} ч"
+days_flat = "{days} д"
+
+
+# The block the agent appends to its own ack ("Продолжаю …"), when ACK_STATS=true.
+[stats]
+chain_position = "  ({position}-я в цепочке)"
+context = "контекст {tokens}"
+turn_cost = "этот ход ≈ {cost}"
+session_cost = "за сессию ≈ {cost}"
+
+
+# Posted once per session when a turn crosses the cost threshold in `manual`
+# rotation mode — the receiver advises, the human decides.
+[advisory]
+text = """
+{prefix} Контекст этой сессии — {tokens} токенов, и следующий ход обойдётся примерно в {cost} (порог {threshold}).
+Имеет смысл начать новую сессию — команда /new. Подробности: /status"""
+
+
+# Posted when a chat's session is actually retired and work continues in a new one.
+[rotation]
+title = "{prefix} Новая сессия"
+reason_cost = "пауза {age}, кеш почти наверняка мёртв"
+reason_hard_ctx = "контекст подошёл к пределу окна"
+reason_command = "запрошено командой /new"
+old = "Прошлая — {id}"
+old_context = "  контекст     {tokens} токенов · {turns} запросов к API"
+old_spent = "  потрачено    ≈ {total}   (запись {write} · чтение {read} · вывод {output})"
+old_cold = "  мимо кеша    {cold} запросов из {turns}"
+why = "Причина: {why} → следующий ход на этом контексте стоил бы ≈ {expected} (порог {threshold})."
+new = "Новая — {id}. Перенесены история задачи, ветки, PR и дифф."
+handoff = "Handoff: {path}"
+old_kept = "Старая сессия никуда не делась:"
+resume_hint = "claude --resume {id}"
+
+
+# /help
+[help]
+text = """
+{prefix} Команды — их обрабатывает обвязка, агент не запускается и токены не тратятся
+
+/status     контекст, кеш, траты, воркспейс, и начнётся ли следующий ход
+            в новой сессии
+/sessions   цепочка сессий этой задачи: id, причины смены, траты
+            (любую можно открыть локально: claude --resume <id>)
+/new [что]  следующий ход — принудительно в новой сессии
+/keep       разово отменить запланированную авто-ротацию
+/stop       прервать текущий ход агента
+/help       это сообщение
+
+{mention} <текст>        обычное обращение к агенту
+{mention} /new <текст>   ротация + сразу задача
+
+Суммы — оценка по прайсу API (${price_in}/${price_out} за Mtok,
+запись в кеш ×{cache_write}, чтение ×{cache_read})."""
+
+
+# /status
+[status]
+never_ran = "{prefix} По этому чату ещё не было ни одного хода агента."
+title = "{prefix} Статус"
+
+session_header = "Сессия"
+session_id = "  id            {id}   ({position}-я из {total} в цепочке)"
+session_context = "  контекст      {tokens} токенов · {turns} запросов · последний {age} назад"
+session_context_unknown = "  контекст      нет данных (транскрипт не найден)"
+last_turn = "  прошлый ход   {mark} (read {read}, write {write}) — факт {cost}"
+last_turn_cold = "❌ мимо кеша"
+last_turn_warm = "✅ попал в кеш"
+session_cost = "  за сессию     ≈ {total}   (запись {write} · чтение {read} · вывод {output})"
+task_cost = "  за задачу     ≈ {cost} по цепочке из {sessions} сессий"
+
+rotation_header = "Ротация"
+rotation_policy = "  режим         {mode} · порог {threshold} за ход · потолок {ctx_cap} токенов"
+rotation_unknown = "  сейчас        нет данных для оценки"
+rotation_now = "  сейчас        следующий ход ≈ {cost} → {verdict}"
+verdict_rotate = "начнётся НОВАЯ сессия"
+verdict_keep = "продолжу текущую сессию"
+verdict_advisory_only = " (режим {mode} — только предупрежу)"
+rotation_if_idle = "  если пауза    > часа → ≈ {cost}, и тогда новая сессия"
+cache_miss = "  промах кеша   {buckets}"
+cache_miss_bucket = "{bucket} мин {percent}%"
+
+workspace_header = "Воркспейс  {path}"
+workspace_repo = "  {repo} {branch} → {base}   {pr}   {url}"
+workspace_no_pr = "PR нет"
+workspace_unreadable = "  (.feature.json нечитаем)"
+
+chat_header = "Чат"
+chat_processed = "  обработано до {last_message_id}"
+chat_agent = "  агент: {state}"
+agent_busy = "работает"
+agent_idle = "свободен"
+
+
+# /sessions
+[sessions]
+title = "{prefix} Сессии этой задачи"
+retired = "  #{seq}  {id}"
+retired_detail = "       {turns} запросов · ≈ {cost} · закрыта {retired_at} ({reason})"
+current = "  #{seq}  {id}   ← текущая"
+current_detail = "       {turns} запросов · ≈ {cost}"
+footer = "Открыть любую локально:  claude --resume <id>"
+
+
+# /new, /keep, /stop
+[command]
+new_ok = "{prefix} Принято — следующий ход начнётся в новой сессии."
+new_reason = " Причина: {reason}"
+keep_ok = "{prefix} Ок, следующий ход продолжит текущую сессию, даже если сработает порог."
+stop_ok = "{prefix} Текущий ход прерван."
+stop_idle = "{prefix} Сейчас по этой задаче ничего не выполняется."
+
+
+# A turn that died without the agent answering. `reason` is claude's own error
+# line, quoted as-is — it is not translated.
+[turn_failure]
+# claude exited non-zero and the cause was a session it couldn't open.
+session_lost = "Не смог продолжить сессию этого чата — claude вышел с кодом {rc}:"
+session_lost_footer = """
+Транскрипт сессии не найден, контекст прошлых ходов утерян. Перезапускаю этот же ход в новой сессии — задачу перечитаю из чата, ветку и PR подхвачу из воркспейса."""
+# ... and the same thing happened again in the fresh session.
+session_lost_again = "Ход не запустился даже в новой сессии (код {rc}):"
+session_lost_again_footer = """
+Дальше не пробую, чтобы не крутиться в цикле. Позови {mention} ещё раз или посмотри logs/claude.log."""
+# Any other non-zero exit.
+generic = "Ход завершился с ошибкой (код {rc}). Последнее, что написал claude:"
+generic_footer = """
+Если ответа в чате нет — упомяни {mention} ещё раз, чтобы повторить. Полный лог: logs/claude.log."""
+# The turn never launched at all.
+not_started = "Не смог запустить агента — ход не стартовал ({why})."
+not_started_footer = "Смотри logs/uvicorn.err. Упомяни {mention} ещё раз, чтобы повторить."
+# The replay in the fresh session couldn't be launched.
+replay_failed = "Не смог перезапустить ход в новой сессии ({why})."
+replay_failed_footer = "Упомяни {mention} ещё раз — сессия уже новая, запуск должен пройти."
+# Used as the reason when claude died without printing anything at all.
+no_output = "процесс завершился с кодом {rc}, не написав ни строчки"

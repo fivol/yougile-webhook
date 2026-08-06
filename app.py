@@ -61,6 +61,64 @@ log = logging.getLogger("yougile-webhook")
 log.info("yougile-webhook %s starting from %s", APP_VERSION, ROOT)
 
 
+# --- User-facing text --------------------------------------------------------
+# Everything this receiver posts into a chat lives in messages/<lang>.toml, not
+# in the code: the code is English, the chats it serves are not, and a file of
+# strings is something you can hand to someone who doesn't read Python. Loaded
+# once at import — the strings are needed by module-level constants, and a
+# reload of the service is how every other config change lands anyway.
+MESSAGES_LANG = os.environ.get("MESSAGES_LANG", "ru").strip() or "ru"
+MESSAGES_FILE = os.environ.get("MESSAGES_FILE", "").strip()
+MESSAGES_DIR = ROOT / "messages"
+
+
+def _flatten_messages(table: Dict[str, Any], prefix: str = "") -> Dict[str, str]:
+    """TOML tables to "table.key" paths, which is how the code addresses them."""
+    flat: Dict[str, str] = {}
+    for key, value in table.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(_flatten_messages(value, f"{path}."))
+        else:
+            flat[path] = str(value)
+    return flat
+
+
+def load_messages() -> Dict[str, str]:
+    path = Path(MESSAGES_FILE) if MESSAGES_FILE else MESSAGES_DIR / f"{MESSAGES_LANG}.toml"
+    try:
+        with path.open("rb") as f:
+            flat = _flatten_messages(tomllib.load(f))
+    except (OSError, tomllib.TOMLDecodeError):
+        # Never fatal. A chat that answers with bare keys is bad; a receiver
+        # that refuses to start — and so drops every mention — is worse.
+        log.exception("messages file %s unusable — falling back to bare keys", path)
+        return {}
+    log.info("messages: %d strings from %s", len(flat), path)
+    return flat
+
+
+MESSAGES = load_messages()
+
+
+def msg(key: str, **kwargs: Any) -> str:
+    """Render a user-facing string by "table.key".
+
+    Degrades instead of raising: a missing key or a template someone broke while
+    translating must never take down the turn that was trying to report
+    something — least of all a failure report.
+    """
+    template = MESSAGES.get(key)
+    if template is None:
+        log.error("message %r missing from the %s messages file", key, MESSAGES_LANG)
+        return key
+    try:
+        return template.format(**kwargs)
+    except (KeyError, IndexError, ValueError):
+        log.exception("message %r failed to render", key)
+        return template
+
+
 YOUGILE_API_KEY = os.environ.get("YOUGILE_API_KEY", "")
 YOUGILE_API_BASE = os.environ.get("YOUGILE_API_BASE", "https://yougile.com/api-v2").rstrip("/")
 # Host used to resolve schemeless `/user-data/...` file URLs that YouGile
@@ -1698,14 +1756,16 @@ def _fmt_usd(x: Optional[float]) -> str:
 
 def _fmt_age(minutes: Optional[float]) -> str:
     if minutes is None:
-        return "?"
+        return msg("age.unknown")
     if minutes < 60:
-        return f"{int(minutes)} мин"
+        return msg("age.minutes", minutes=int(minutes))
     if minutes < 60 * 24:
         h, m = divmod(int(minutes), 60)
-        return f"{h} ч {m:02d} мин" if m else f"{h} ч"
+        return (msg("age.hours", hours=h, minutes=m) if m
+                else msg("age.hours_flat", hours=h))
     d, h = divmod(int(minutes) // 60, 24)
-    return f"{d} д {h} ч" if h else f"{d} д"
+    return (msg("age.days", days=d, hours=h) if h
+            else msg("age.days_flat", days=d))
 
 
 def usage_cost(u: Dict[str, Any]) -> float:
@@ -2041,13 +2101,12 @@ def _post_rotation_advisory(chat_id: str, facts: Dict[str, Any]) -> None:
     if state.get("advisory_at_seq") == facts["session"]["seq"]:
         return  # already told them about this session
     update_chat_state(chat_id, advisory_at_seq=facts["session"]["seq"])
-    text = (
-        f"{COMMAND_REPLY_PREFIX} Контекст этой сессии — "
-        f"{_fmt_int(facts.get('ctx_tokens'))} токенов, и следующий ход обойдётся "
-        f"примерно в {_fmt_usd(facts.get('expected_cost'))} "
-        f"(порог {_fmt_usd(ROTATE_TURN_COST_USD)}).\n"
-        f"Имеет смысл начать новую сессию — команда /new. "
-        f"Подробности: /status"
+    text = msg(
+        "advisory.text",
+        prefix=COMMAND_REPLY_PREFIX,
+        tokens=_fmt_int(facts.get("ctx_tokens")),
+        cost=_fmt_usd(facts.get("expected_cost")),
+        threshold=_fmt_usd(ROTATE_TURN_COST_USD),
     )
     threading.Thread(
         target=send_chat_message,
@@ -2399,14 +2458,14 @@ def render_session_stats(facts: Dict[str, Any], state: Dict[str, Any]) -> str:
     spent = (state.get("session_totals") or {}).get("cost_usd")
     line = f"session: {sv['id']}"
     if chain > 1:
-        line += f"  ({sv['seq'] + 1}-я в цепочке)"
+        line += msg("stats.chain_position", position=sv["seq"] + 1)
     bits = []
     if ctx:
-        bits.append(f"контекст {_fmt_int(ctx)}")
+        bits.append(msg("stats.context", tokens=_fmt_int(ctx)))
     if cost is not None:
-        bits.append(f"этот ход ≈ {_fmt_usd(cost)}")
+        bits.append(msg("stats.turn_cost", cost=_fmt_usd(cost)))
     if spent:
-        bits.append(f"за сессию ≈ {_fmt_usd(spent)}")
+        bits.append(msg("stats.session_cost", cost=_fmt_usd(spent)))
     return line + ("\n" + " · ".join(bits) if bits else "")
 
 
@@ -2415,39 +2474,40 @@ def render_rotation_notice(
     facts: Dict[str, Any], totals: Dict[str, Any], handoff: Optional[Path],
 ) -> Tuple[str, str]:
     why = {
-        "cost": f"пауза {_fmt_age(facts.get('idle_min'))}, кеш почти наверняка мёртв",
-        "hard-ctx": "контекст подошёл к пределу окна",
-        "command": "запрошено командой /new",
+        "cost": msg("rotation.reason_cost", age=_fmt_age(facts.get("idle_min"))),
+        "hard-ctx": msg("rotation.reason_hard_ctx"),
+        "command": msg("rotation.reason_command"),
     }.get(reason, reason)
     cold = totals.get("cold_turns") or 0
     turns = totals.get("turns") or 0
     lines = [
-        f"{COMMAND_REPLY_PREFIX} Новая сессия",
+        msg("rotation.title", prefix=COMMAND_REPLY_PREFIX),
         "",
-        f"Прошлая — {old_id}",
-        f"  контекст     {_fmt_int(facts.get('ctx_tokens'))} токенов"
-        f" · {turns} запросов к API",
-        f"  потрачено    ≈ {_fmt_usd(totals.get('cost_usd'))}"
-        f"   (запись {_fmt_usd(totals.get('write_usd'))}"
-        f" · чтение {_fmt_usd(totals.get('read_usd'))}"
-        f" · вывод {_fmt_usd(totals.get('output_usd'))})",
+        msg("rotation.old", id=old_id),
+        msg("rotation.old_context",
+            tokens=_fmt_int(facts.get("ctx_tokens")), turns=turns),
+        msg("rotation.old_spent",
+            total=_fmt_usd(totals.get("cost_usd")),
+            write=_fmt_usd(totals.get("write_usd")),
+            read=_fmt_usd(totals.get("read_usd")),
+            output=_fmt_usd(totals.get("output_usd"))),
     ]
     if turns:
-        lines.append(f"  мимо кеша    {cold} запросов из {turns}")
+        lines.append(msg("rotation.old_cold", cold=cold, turns=turns))
     exp = facts.get("expected_cost")
     lines += [
         "",
-        f"Причина: {why} → следующий ход на этом контексте стоил бы "
-        f"≈ {_fmt_usd(exp)} (порог {_fmt_usd(ROTATE_TURN_COST_USD)}).",
+        msg("rotation.why", why=why, expected=_fmt_usd(exp),
+            threshold=_fmt_usd(ROTATE_TURN_COST_USD)),
         "",
-        f"Новая — {new_id}. Перенесены история задачи, ветки, PR и дифф.",
+        msg("rotation.new", id=new_id),
     ]
     if handoff:
-        lines.append(f"Handoff: {handoff}")
+        lines.append(msg("rotation.handoff", path=handoff))
     lines += [
         "",
-        "Старая сессия никуда не делась:",
-        f"claude --resume {old_id}",
+        msg("rotation.old_kept"),
+        msg("rotation.resume_hint", id=old_id),
     ]
     text = "\n".join(lines)
     html = "<p>" + "</p><p>".join(
@@ -2460,30 +2520,25 @@ def _html_escape(s: str) -> str:
 
 
 def render_help() -> Tuple[str, str]:
-    text = f"""{COMMAND_REPLY_PREFIX} Команды — их обрабатывает обвязка, агент не запускается и токены не тратятся
-
-/status     контекст, кеш, траты, воркспейс, и начнётся ли следующий ход
-            в новой сессии
-/sessions   цепочка сессий этой задачи: id, причины смены, траты
-            (любую можно открыть локально: claude --resume <id>)
-/new [что]  следующий ход — принудительно в новой сессии
-/keep       разово отменить запланированную авто-ротацию
-/stop       прервать текущий ход агента
-/help       это сообщение
-
-@Agent <текст>        обычное обращение к агенту
-@Agent /new <текст>   ротация + сразу задача
-
-Суммы — оценка по прайсу API (${PRICE_IN_PER_MTOK:.0f}/${PRICE_OUT_PER_MTOK:.0f} за Mtok,
-запись в кеш ×{CACHE_WRITE_MULT:g}, чтение ×{CACHE_READ_MULT:g})."""
+    # Numbers arrive pre-formatted: a format spec inside a translatable string
+    # is a landmine for whoever edits the file next.
+    text = msg(
+        "help.text",
+        prefix=COMMAND_REPLY_PREFIX,
+        mention=AGENT_MENTION,
+        price_in=f"{PRICE_IN_PER_MTOK:.0f}",
+        price_out=f"{PRICE_OUT_PER_MTOK:.0f}",
+        cache_write=f"{CACHE_WRITE_MULT:g}",
+        cache_read=f"{CACHE_READ_MULT:g}",
+    )
     return text, f"<pre>{_html_escape(text)}</pre>"
 
 
 def render_status(chat_id: str, rule: "Rule") -> Tuple[str, str]:
     state = get_chat_state(chat_id)
     if not state:
-        t = f"{COMMAND_REPLY_PREFIX} По этому чату ещё не было ни одного хода агента."
-        return t, f"<p>{_html_escape(t)}</p>"
+        never = msg("status.never_ran", prefix=COMMAND_REPLY_PREFIX)
+        return never, f"<p>{_html_escape(never)}</p>"
     facts = session_facts(chat_id, state, rule)
     sv = facts["session"]
     tp = _transcript_path(rule.workdir, sv["id"])
@@ -2492,61 +2547,74 @@ def render_status(chat_id: str, rule: "Rule") -> Tuple[str, str]:
     chain_cost = sum((s.get("cost_usd") or 0) for s in chain) + (totals.get("cost_usd") or 0)
     last = facts.get("last_turn") or {}
 
-    L = [f"{COMMAND_REPLY_PREFIX} Статус", "", "Сессия",
-         f"  id            {sv['id']}   ({sv['seq'] + 1}-я из {len(chain) + 1} в цепочке)"]
+    L = [msg("status.title", prefix=COMMAND_REPLY_PREFIX),
+         "",
+         msg("status.session_header"),
+         msg("status.session_id", id=sv["id"], position=sv["seq"] + 1,
+             total=len(chain) + 1)]
     if facts.get("ctx_tokens"):
-        L.append(f"  контекст      {_fmt_int(facts['ctx_tokens'])} токенов"
-                 f" · {totals.get('turns', 0)} запросов"
-                 f" · последний {_fmt_age(facts.get('idle_min'))} назад")
+        L.append(msg("status.session_context",
+                     tokens=_fmt_int(facts["ctx_tokens"]),
+                     turns=totals.get("turns", 0),
+                     age=_fmt_age(facts.get("idle_min"))))
     else:
-        L.append("  контекст      нет данных (транскрипт не найден)")
+        L.append(msg("status.session_context_unknown"))
     if last:
-        mark = "❌ мимо кеша" if last.get("cold") else "✅ попал в кеш"
-        L.append(f"  прошлый ход   {mark}"
-                 f" (read {_fmt_int(last.get('cache_read'))},"
-                 f" write {_fmt_int(last.get('cache_creation'))})"
-                 f" — факт {_fmt_usd(last.get('cost_usd'))}")
-    L.append(f"  за сессию     ≈ {_fmt_usd(totals.get('cost_usd'))}"
-             f"   (запись {_fmt_usd(totals.get('write_usd'))}"
-             f" · чтение {_fmt_usd(totals.get('read_usd'))}"
-             f" · вывод {_fmt_usd(totals.get('output_usd'))})")
+        mark = msg("status.last_turn_cold" if last.get("cold")
+                   else "status.last_turn_warm")
+        L.append(msg("status.last_turn", mark=mark,
+                     read=_fmt_int(last.get("cache_read")),
+                     write=_fmt_int(last.get("cache_creation")),
+                     cost=_fmt_usd(last.get("cost_usd"))))
+    L.append(msg("status.session_cost",
+                 total=_fmt_usd(totals.get("cost_usd")),
+                 write=_fmt_usd(totals.get("write_usd")),
+                 read=_fmt_usd(totals.get("read_usd")),
+                 output=_fmt_usd(totals.get("output_usd"))))
     if chain:
-        L.append(f"  за задачу     ≈ {_fmt_usd(chain_cost)} по цепочке из {len(chain) + 1} сессий")
+        L.append(msg("status.task_cost", cost=_fmt_usd(chain_cost),
+                     sessions=len(chain) + 1))
 
-    L += ["", "Ротация",
-          f"  режим         {SESSION_ROTATE_MODE} · порог {_fmt_usd(ROTATE_TURN_COST_USD)} за ход"
-          f" · потолок {_fmt_int(ROTATE_HARD_CTX)} токенов"]
+    L += ["", msg("status.rotation_header"),
+          msg("status.rotation_policy", mode=SESSION_ROTATE_MODE,
+              threshold=_fmt_usd(ROTATE_TURN_COST_USD),
+              ctx_cap=_fmt_int(ROTATE_HARD_CTX))]
     exp = facts.get("expected_cost")
     if exp is None:
-        L.append("  сейчас        нет данных для оценки")
+        L.append(msg("status.rotation_unknown"))
     else:
         rotate_now = (facts.get("ctx_tokens") or 0) >= ROTATE_HARD_CTX or exp > ROTATE_TURN_COST_USD
-        verdict = "начнётся НОВАЯ сессия" if rotate_now else "продолжу текущую сессию"
+        verdict = msg("status.verdict_rotate" if rotate_now else "status.verdict_keep")
         if SESSION_ROTATE_MODE != "auto" and rotate_now:
-            verdict += f" (режим {SESSION_ROTATE_MODE} — только предупрежу)"
-        L.append(f"  сейчас        следующий ход ≈ {_fmt_usd(exp)} → {verdict}")
+            verdict += msg("status.verdict_advisory_only", mode=SESSION_ROTATE_MODE)
+        L.append(msg("status.rotation_now", cost=_fmt_usd(exp), verdict=verdict))
         cold_cost = expected_turn_cost(facts.get("ctx_tokens"), 999)
         if cold_cost and not rotate_now:
-            L.append(f"  если пауза    > часа → ≈ {_fmt_usd(cold_cost)}, и тогда новая сессия")
+            L.append(msg("status.rotation_if_idle", cost=_fmt_usd(cold_cost)))
     stats = _load_cache_stats()
-    L.append("  промах кеша   " + " · ".join(
-        f"{k} мин {100 * miss_probability(k):.0f}%" for k in ("0-10", "10-30", "30-60", "60+")))
+    L.append(msg("status.cache_miss", buckets=" · ".join(
+        msg("status.cache_miss_bucket", bucket=k,
+            percent=f"{100 * miss_probability(k):.0f}")
+        for k in ("0-10", "10-30", "30-60", "60+"))))
 
     ws = find_workspace(rule.workdir, [s.get("id") for s in chain] + [sv["id"]], chat_id)
     if ws:
-        L += ["", f"Воркспейс  {ws}"]
+        L += ["", msg("status.workspace_header", path=ws)]
         try:
             data = json.loads((ws / ".feature.json").read_text(encoding="utf-8"))
             for name, r in (data.get("repos") or {}).items():
-                L.append(f"  {name:<10} {r.get('branch')} → {r.get('base')}"
-                         f"   {r.get('pr') or 'PR нет'}   {r.get('url') or ''}")
+                L.append(msg("status.workspace_repo", repo=f"{name:<10}",
+                             branch=r.get("branch"), base=r.get("base"),
+                             pr=r.get("pr") or msg("status.workspace_no_pr"),
+                             url=r.get("url") or ""))
         except (OSError, json.JSONDecodeError):
-            L.append("  (.feature.json нечитаем)")
+            L.append(msg("status.workspace_unreadable"))
 
     busy = chat_turn_in_flight(chat_id)
-    L += ["", "Чат",
-          f"  обработано до {state.get('last_message_id')}",
-          f"  агент: {'работает' if busy else 'свободен'}"]
+    L += ["", msg("status.chat_header"),
+          msg("status.chat_processed", last_message_id=state.get("last_message_id")),
+          msg("status.chat_agent", state=msg(
+              "status.agent_busy" if busy else "status.agent_idle"))]
     text = "\n".join(L)
     return text, f"<pre>{_html_escape(text)}</pre>"
 
@@ -2555,15 +2623,18 @@ def render_sessions(chat_id: str, rule: "Rule") -> Tuple[str, str]:
     state = get_chat_state(chat_id)
     sv = session_view(chat_id, state)
     chain = list(state.get("sessions") or [])
-    L = [f"{COMMAND_REPLY_PREFIX} Сессии этой задачи", ""]
+    L = [msg("sessions.title", prefix=COMMAND_REPLY_PREFIX), ""]
     for s in chain:
-        L.append(f"  #{s.get('seq')}  {s.get('id')}")
-        L.append(f"       {s.get('turns')} запросов · ≈ {_fmt_usd(s.get('cost_usd'))}"
-                 f" · закрыта {s.get('retired_at', '?')[:16]} ({s.get('reason')})")
+        L.append(msg("sessions.retired", seq=s.get("seq"), id=s.get("id")))
+        L.append(msg("sessions.retired_detail", turns=s.get("turns"),
+                     cost=_fmt_usd(s.get("cost_usd")),
+                     retired_at=s.get("retired_at", "?")[:16],
+                     reason=s.get("reason")))
     totals = _usage_totals(_transcript_path(rule.workdir, sv["id"]))
-    L.append(f"  #{sv['seq']}  {sv['id']}   ← текущая")
-    L.append(f"       {totals.get('turns')} запросов · ≈ {_fmt_usd(totals.get('cost_usd'))}")
-    L += ["", "Открыть любую локально:  claude --resume <id>"]
+    L.append(msg("sessions.current", seq=sv["seq"], id=sv["id"]))
+    L.append(msg("sessions.current_detail", turns=totals.get("turns"),
+                 cost=_fmt_usd(totals.get("cost_usd"))))
+    L += ["", msg("sessions.footer")]
     text = "\n".join(L)
     return text, f"<pre>{_html_escape(text)}</pre>"
 
@@ -2637,20 +2708,17 @@ def handle_command(cmd: str, arg: str, payload: Any) -> Dict[str, Any]:
         text, html = render_sessions(chat_id, rule)
     elif cmd == "new":
         update_chat_state(chat_id, pending_rotation=True, skip_rotation_once=False)
-        extra = f" Причина: {arg}" if arg else ""
-        text = (f"{COMMAND_REPLY_PREFIX} Принято — следующий ход начнётся "
-                f"в новой сессии.{extra}")
+        extra = msg("command.new_reason", reason=arg) if arg else ""
+        text = msg("command.new_ok", prefix=COMMAND_REPLY_PREFIX) + extra
         html = f"<p>{_html_escape(text)}</p>"
     elif cmd == "keep":
         update_chat_state(chat_id, skip_rotation_once=True, pending_rotation=False)
-        text = (f"{COMMAND_REPLY_PREFIX} Ок, следующий ход продолжит текущую "
-                f"сессию, даже если сработает порог.")
+        text = msg("command.keep_ok", prefix=COMMAND_REPLY_PREFIX)
         html = f"<p>{_html_escape(text)}</p>"
     elif cmd == "stop":
         stopped = _interrupt_chat(chat_id)
-        text = (f"{COMMAND_REPLY_PREFIX} Текущий ход прерван."
-                if stopped else
-                f"{COMMAND_REPLY_PREFIX} Сейчас по этой задаче ничего не выполняется.")
+        text = msg("command.stop_ok" if stopped else "command.stop_idle",
+                   prefix=COMMAND_REPLY_PREFIX)
         html = f"<p>{_html_escape(text)}</p>"
     else:
         return {"handled": False}
@@ -2850,19 +2918,16 @@ def _report_dead_turn(
     if session_lost and recovering:
         _post_turn_failure(
             chat_id,
-            f"Не смог продолжить сессию этого чата — claude вышел с кодом {rc}:",
+            msg("turn_failure.session_lost", rc=rc),
             reason,
-            "Транскрипт сессии не найден, контекст прошлых ходов утерян. "
-            "Перезапускаю этот же ход в новой сессии — задачу перечитаю из "
-            "чата, ветку и PR подхвачу из воркспейса.",
+            msg("turn_failure.session_lost_footer"),
         )
     elif session_lost:
         _post_turn_failure(
             chat_id,
-            f"Ход не запустился даже в новой сессии (код {rc}):",
+            msg("turn_failure.session_lost_again", rc=rc),
             reason,
-            "Дальше не пробую, чтобы не крутиться в цикле. Позови @Agent "
-            "ещё раз или посмотри logs/claude.log.",
+            msg("turn_failure.session_lost_again_footer", mention=AGENT_MENTION),
         )
     else:
         # The tail is claude's last word, whatever it was — an error, or (if it
@@ -2870,10 +2935,9 @@ def _report_dead_turn(
         # either way; guessing which one it is would be worse than saying both.
         _post_turn_failure(
             chat_id,
-            f"Ход завершился с ошибкой (код {rc}). Последнее, что написал claude:",
+            msg("turn_failure.generic", rc=rc),
             reason,
-            "Если ответа в чате нет — упомяни @Agent ещё раз, чтобы повторить. "
-            "Полный лог: logs/claude.log.",
+            msg("turn_failure.generic_footer", mention=AGENT_MENTION),
         )
 
 
@@ -2919,9 +2983,9 @@ def _recover_lost_session(chat_id: str, rule: "Rule", payload: Any) -> None:
             if not ok:
                 _post_turn_failure(
                     chat_id,
-                    f"Не смог перезапустить ход в новой сессии ({why}).",
-                    footer="Упомяни @Agent ещё раз — сессия уже новая, "
-                           "запуск должен пройти.",
+                    msg("turn_failure.replay_failed", why=why),
+                    footer=msg("turn_failure.replay_failed_footer",
+                               mention=AGENT_MENTION),
                 )
         except Exception:
             log.exception("chat %s: session-loss recovery failed", chat_id)
@@ -3208,7 +3272,7 @@ def _failure_reason(rc: int, output: str) -> str:
             if pattern.search(line):
                 return line[:TURN_FAILURE_QUOTE_CHARS]
     if not lines:
-        return f"процесс завершился с кодом {rc}, не написав ни строчки"
+        return msg("turn_failure.no_output", rc=rc)
     tail = "\n".join(lines[-6:])
     return tail[-TURN_FAILURE_QUOTE_CHARS:]
 
@@ -3614,9 +3678,9 @@ async def yougile_webhook(req: Request):
             # rather than leaving the chat waiting for an agent that never ran.
             _post_turn_failure(
                 extract_chat_id(payload),
-                f"Не смог запустить агента — ход не стартовал ({why}).",
-                footer="Смотри logs/uvicorn.err. Упомяни @Agent ещё раз, "
-                       "чтобы повторить.",
+                msg("turn_failure.not_started", why=why),
+                footer=msg("turn_failure.not_started_footer",
+                           mention=AGENT_MENTION),
             )
 
     event = isinstance(payload, dict) and payload.get("event")

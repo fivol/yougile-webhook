@@ -251,6 +251,8 @@ path / PR URL across turns.
 | `SESSION_RECOVERY_DELAY_SECONDS` | After a session turns out to be lost, wait this long before replaying the turn in a fresh session — enough for anything queued behind the dead turn to claim the chat first (it would supersede the replay). Default `2`. |
 | `CLAUDE_PUMP_DRAIN_SECONDS` | How long to keep draining claude's output after it exits, before giving up on a grandchild (a lingering MCP server) that inherited the pipe and never closed it. Default `10`. |
 | `RULES_FILE` | Default `rules.toml`. |
+| `MESSAGES_LANG` | Which `messages/<lang>.toml` the receiver speaks. Default `ru`. See [Wording](#wording--messageslangtoml). |
+| `MESSAGES_FILE` | Absolute path to a messages file, overriding `MESSAGES_LANG`. |
 | `WEBHOOK_ENSURE_INTERVAL_SECONDS` | How often the service sweeps its own YouGile subscription and revives it if YouGile auto-disabled it after a streak of failed deliveries (e.g. while we were down). Default `900` (15 min). The same check runs once at startup. Set to a large value to disable the timer; the startup check still fires. |
 | `WEBHOOK_ENSURE_RETRY_SECONDS` | After a *failed* ensure cycle (couldn't reach YouGile / couldn't revive the subscription), retry this soon instead of waiting the full interval — so recovery from an outage takes minutes. Default `60`. |
 | `YOUGILE_API_TIMEOUT` | Per-attempt timeout (seconds) for every call to the YouGile API. Default `30`. |
@@ -514,6 +516,39 @@ on next restart — no per-prompt copy-paste. The shipped file enforces:
 If a particular HTML tag renders as literal text in your deployment,
 drop it from `prompts/_formatting.txt`.
 
+## Wording — `messages/<lang>.toml`
+
+Everything the **receiver itself** says in a chat — `/help`, `/status`,
+`/sessions`, rotation notices, command acks, failure reports — lives in
+`messages/ru.toml`, not in `app.py`. The code is English, the chats it
+serves are not, and a file of strings is something you can hand to
+someone who doesn't read Python.
+
+To translate the service: copy the file, translate the values, point
+`MESSAGES_LANG` at it.
+
+```bash
+cp messages/ru.toml messages/en.toml   # then translate the values
+echo 'MESSAGES_LANG=en' >> .env        # or MESSAGES_FILE=/abs/path.toml
+```
+
+Keys are `table.key` paths into the TOML; the code fills `{placeholder}`
+slots with already-formatted values (`$12.34`, `1 234`, `2 ч 05 мин`), so a
+translator never has to deal with format specs. Reorder or drop slots
+freely; an unknown slot name leaves the template unfilled rather than
+raising. A missing key logs an ERROR and renders as the bare key — the
+turn still completes. A missing or malformed file is logged and the
+service still starts.
+
+Deliberately **not** in there:
+
+- `prompts/*.txt` — text sent to the agent, which has its own files.
+- `CONCURRENCY_BUSY_MESSAGE` — stays in `.env` where it has always been.
+- Interrupt notices and prompt scaffolding — addressed to the model, not
+  the user, and English on purpose.
+- The quoted `reason` in a failure report — that is claude's own error
+  output, passed through verbatim.
+
 ## Reference: real YouGile payloads
 
 `chat_message-created`:
@@ -577,6 +612,7 @@ previous column.
 | `register_webhook.py` | CLI to manage YouGile subscriptions. |
 | `rules.example.toml` | Rule template (commit). |
 | `prompts/*.example.txt` | Prompt templates (commit). |
+| `messages/<lang>.toml` | Everything the receiver says in a chat (commit). |
 | `rules.toml`, `prompts/*.txt` | Your real rules and prompts (**gitignored**). |
 | `.env.example` / `.env` | Runtime config (`.env` gitignored). |
 | `state/chats/<chatId>.json` | Per-chat session state (gitignored). |
