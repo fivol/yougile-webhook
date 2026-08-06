@@ -285,10 +285,15 @@ launchctl load -w ~/Library/LaunchAgents/org.local.yougile-webhook.plist
 
 For rules with `session_per_chat = true` (default):
 
-- `session_id = chatId` (the YouGile task UUID).
-- State lives at `state/chats/<chatId>.json` — one tiny file per chat,
-  containing `last_message_id` and timestamps.
-- Existence of that file decides `--resume` vs `--session-id`.
+- A chat owns a **chain** of claude sessions. Link 0 is the chat id itself
+  (the YouGile task UUID); later links are `uuid5`-derived from it, so they
+  are deterministic and need no lookup table.
+- State lives at `state/chats/<chatId>.json` — one small file per chat with
+  `last_message_id`, the current session pointer, what the last turn cost,
+  and the retired links of the chain.
+- `session_bootstrapped` decides `--resume` vs `--session-id`; the existence
+  of the file still means only "we have run for this chat before", which is
+  what `skip_if_chat_known` keys off.
 - The prompt receives chat history via the `{chat_history}` placeholder
   (full on first run, only new messages on subsequent runs).
 - While claude is running for a chat, a new `@Agent` message for the SAME
@@ -296,6 +301,28 @@ For rules with `session_per_chat = true` (default):
 
 To reset a single chat: `rm state/chats/<chatId>.json`. The next trigger
 will start a fresh session and re-inject full history.
+
+### Rotation — why a task spans several sessions
+
+A session that has been running for days costs real money to resume: every
+turn re-sends the whole conversation, and whether that is served from cache
+(0.1× input price) or re-written (2×) depends almost entirely on how long the
+chat has been idle. Because both inputs — context size and idle time — are
+known for free *before* a turn starts, the receiver can price the next turn in
+advance and retire the session when it gets too expensive, handing the new one
+a **handoff file** (task chat, workspace, branches, PR diffs) instead of the
+raw transcript.
+
+Off by default (`SESSION_ROTATE_MODE=manual` only advises). See
+**[docs/session-rotation.md](docs/session-rotation.md)** for the measured
+numbers, the cost model, and how to tune it.
+
+### Asking without spending — chat commands
+
+`/status` answers "how big has this chat got, what has it cost, and will the
+next turn start a new session?" — handled by the receiver itself, so it costs
+nothing and never wakes the agent. Also `/sessions`, `/new`, `/keep`, `/stop`,
+`/help`. See **[docs/chat-commands.md](docs/chat-commands.md)**.
 
 ### Interrupting a running turn
 

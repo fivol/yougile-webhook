@@ -17,6 +17,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ from fastapi import FastAPI, Request
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -249,6 +250,105 @@ AGENT_STICKER_WORKING = os.environ.get("AGENT_STICKER_WORKING", "working").strip
 AGENT_STICKER_ANSWERED = os.environ.get("AGENT_STICKER_ANSWERED", "answered").strip()
 AGENT_STICKER_WORKING_COLOR = os.environ.get("AGENT_STICKER_WORKING_COLOR", "#8CC2FF").strip()
 AGENT_STICKER_ANSWERED_COLOR = os.environ.get("AGENT_STICKER_ANSWERED_COLOR", "#79CE69").strip()
+
+# --- Session rotation --------------------------------------------------------
+# A chat's claude session grows without bound: every turn re-sends the whole
+# conversation. Two costs follow from that, and both scale linearly with the
+# context size:
+#
+#   cache HIT  -> the prefix is served from cache at 0.1x the input price
+#   cache MISS -> the whole prefix is re-written at 2x (1h TTL) — a 20x jump
+#
+# Whether the next turn hits is almost entirely a function of how long the chat
+# has been idle (measured over 88 real turns on this machine):
+#
+#   <10 min  7% miss     30-60 min  75% miss
+#   10-30    24% miss    >60 min   100% miss
+#
+# So the expected cost of the next turn is fully knowable BEFORE spending a
+# token: `ctx_tokens` comes from the previous turn's usage block and the idle
+# time from the clock. When that expected cost crosses ROTATE_TURN_COST_USD we
+# retire the session and start a fresh one, carrying the essence over in a
+# handoff file (task history + workspace + PR diffs) instead of the raw
+# transcript. The effect is that a live back-and-forth keeps its context (it is
+# cheap while warm) and a chat resumed after a long pause resets (its context
+# would be re-billed at the write rate).
+SESSION_ROTATE_MODE = os.environ.get("SESSION_ROTATE_MODE", "manual").strip().lower()
+# The one knob that matters: rotate once the next turn's expected input cost
+# exceeds this. In dollars, so it means something without a token calculator.
+ROTATE_TURN_COST_USD = float(os.environ.get("ROTATE_TURN_COST_USD", "1.50"))
+# Rotate regardless of cost past this context size — the 1M window is a wall we
+# must not hit mid-task (observed sessions reached 950k).
+ROTATE_HARD_CTX = int(os.environ.get("ROTATE_HARD_CTX", "600000"))
+# Never rotate a small session, whatever the arithmetic says.
+ROTATE_MIN_CTX = int(os.environ.get("ROTATE_MIN_CTX", "40000"))
+
+# --- Handoff -----------------------------------------------------------------
+# What the new session gets instead of the old transcript. Everything here is
+# assembled mechanically (L0) at zero model cost; only the optional digest (L1)
+# spends anything, and it runs in a fresh cheap session over the L0 file rather
+# than resuming the expensive one we are escaping.
+HANDOFF_DIR = STATE_DIR / "handoff"
+HANDOFF_HISTORY_LIMIT = int(os.environ.get("HANDOFF_HISTORY_LIMIT", "0"))  # 0 = all
+HANDOFF_INLINE_MESSAGES = int(os.environ.get("HANDOFF_INLINE_MESSAGES", "30"))
+HANDOFF_DIGEST = os.environ.get("HANDOFF_DIGEST", "auto").strip().lower()
+# A mechanical handoff runs ~25 KB (≈7k tokens) for a typical task, which is
+# cheap to hand over as-is. Only a genuinely long chat is worth paying a model
+# to compress.
+HANDOFF_DIGEST_THRESHOLD_KB = int(os.environ.get("HANDOFF_DIGEST_THRESHOLD_KB", "64"))
+HANDOFF_DIGEST_MODEL = os.environ.get("HANDOFF_DIGEST_MODEL", "sonnet").strip()
+HANDOFF_DIGEST_TIMEOUT = int(os.environ.get("HANDOFF_DIGEST_TIMEOUT", "180"))
+HANDOFF_SKELETON_MAX_CHARS = int(os.environ.get("HANDOFF_SKELETON_MAX_CHARS", "200000"))
+# Prepended to the first prompt of a rotated session. Kept short on purpose: the
+# detail lives in the file, and making the agent open it is what puts the diff
+# and the chat history into the NEW session's cache rather than this prompt.
+HANDOFF_BLOCK = """\
+SESSION HANDOFF — the previous claude session for this task was retired because
+its context grew too expensive to carry. You are continuing the SAME task in a
+fresh session, so you start with no memory of it.
+
+Before doing anything else, in this order:
+
+1. Read {path} — the full task chat, what the previous session
+   did, and where its workspace is.
+2. For every repo listed there:
+   `git -C <worktree>/<repo> diff origin/<base>...HEAD --stat`, then the full
+   diff of the files that matter for the current request.
+3. If the task has open PRs, check the review comments:
+   `gh pr view <url> --comments`.
+4. Only then act on the latest message in the chat.
+
+Do NOT create a new branch, worktree or PR — the existing ones are named in the
+handoff and the `feature` skill will resume them. If you need a detail the
+handoff doesn't cover, grep the old transcript (its path is at the bottom of
+the file) rather than guessing.\
+"""
+
+# --- Pricing -----------------------------------------------------------------
+# Anthropic API list price. Every dollar figure the webhook reports is an
+# estimate at these rates — on a subscription the absolute numbers are notional
+# but the ratios (and therefore the rotation decision) still hold.
+PRICE_IN_PER_MTOK = float(os.environ.get("PRICE_IN_PER_MTOK", "5.0"))
+PRICE_OUT_PER_MTOK = float(os.environ.get("PRICE_OUT_PER_MTOK", "25.0"))
+CACHE_WRITE_MULT = float(os.environ.get("CACHE_WRITE_MULT", "2.0"))  # 1h TTL
+CACHE_READ_MULT = float(os.environ.get("CACHE_READ_MULT", "0.1"))
+CACHE_STATS_FILE = STATE_DIR / "cache_stats.json"
+
+# --- Chat commands -----------------------------------------------------------
+# Handled entirely by the receiver: no agent spawn, no tokens, no sticker
+# change. `/status` is the important one — it answers "how big has this got and
+# will the next turn start a new session?" without costing anything to ask.
+COMMANDS_ENABLED = os.environ.get("COMMANDS_ENABLED", "true").lower() not in ("0", "false", "no")
+COMMAND_ALLOWED_EMAILS = [
+    e.strip().lower()
+    for e in os.environ.get("COMMAND_ALLOWED_EMAILS", "").split(",")
+    if e.strip()
+]
+# Marks our own command replies so they can be stripped back out of the history
+# the next agent turn sees.
+COMMAND_REPLY_PREFIX = os.environ.get("COMMAND_REPLY_PREFIX", "⚙️").strip()
+# Append the cost/context block to the ack the agent posts ("Продолжаю …").
+ACK_STATS = os.environ.get("ACK_STATS", "true").lower() not in ("0", "false", "no")
 
 # --- Replying to the agent counts as mentioning it ---------------------------
 # Replying to (or forwarding) one of the agent's own messages is how a user says
@@ -1496,6 +1596,10 @@ def render_chat_history(
     all_paths: List[Path] = []
     seen_paths: Set[str] = set()
     for m in messages:
+        # Slash commands and our own replies to them are plumbing, not
+        # conversation — keep them out of the agent's context.
+        if _is_command_noise(m.get("text") or ""):
+            continue
         ts_ms = m.get("id") or 0
         try:
             ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
@@ -1518,6 +1622,991 @@ def render_chat_history(
         text = text.replace("\n", " ")
         lines.append(f"[{ts}] {sender}: {text}")
     return "\n".join(lines), all_paths
+
+
+# ------------------------------------------------- cost accounting / metrics
+#
+# Everything here reads claude's own on-disk transcript
+# (~/.claude/projects/<slugified cwd>/<session id>.jsonl) — the same file
+# `claude --resume` reads. Each assistant message carries a `usage` block, and
+# the last one tells us the size of the session's context and whether the turn
+# that produced it hit the prompt cache. Both are free to obtain and are the
+# only inputs the rotation decision needs.
+
+
+def _fmt_int(n: Optional[int]) -> str:
+    return "?" if n is None else f"{n:,}".replace(",", " ")
+
+
+def _fmt_usd(x: Optional[float]) -> str:
+    if x is None:
+        return "?"
+    return f"${x:,.2f}".replace(",", " ") if x >= 10 else f"${x:.2f}"
+
+
+def _fmt_age(minutes: Optional[float]) -> str:
+    if minutes is None:
+        return "?"
+    if minutes < 60:
+        return f"{int(minutes)} мин"
+    if minutes < 60 * 24:
+        h, m = divmod(int(minutes), 60)
+        return f"{h} ч {m:02d} мин" if m else f"{h} ч"
+    d, h = divmod(int(minutes) // 60, 24)
+    return f"{d} д {h} ч" if h else f"{d} д"
+
+
+def usage_cost(u: Dict[str, Any]) -> float:
+    """Dollar cost of a single API call, from its `usage` block."""
+    read = u.get("cache_read_input_tokens", 0) or 0
+    write = u.get("cache_creation_input_tokens", 0) or 0
+    plain = u.get("input_tokens", 0) or 0
+    out = u.get("output_tokens", 0) or 0
+    return (
+        (plain + write * CACHE_WRITE_MULT + read * CACHE_READ_MULT)
+        * PRICE_IN_PER_MTOK
+        + out * PRICE_OUT_PER_MTOK
+    ) / 1_000_000
+
+
+def _transcript_path(workdir: str, session_id: str) -> Path:
+    """claude slugifies the absolute cwd by replacing "/" and "." with "-"."""
+    slug = str(Path(workdir).resolve()).replace("/", "-").replace(".", "-")
+    return Path.home() / ".claude" / "projects" / slug / f"{session_id}.jsonl"
+
+
+def _turn_from_usage(u: Dict[str, Any], ts: Optional[str]) -> Dict[str, Any]:
+    read = u.get("cache_read_input_tokens", 0) or 0
+    write = u.get("cache_creation_input_tokens", 0) or 0
+    plain = u.get("input_tokens", 0) or 0
+    ctx = read + write + plain
+    return {
+        "at": ts,
+        "ctx_tokens": ctx,
+        "cache_read": read,
+        "cache_creation": write,
+        "input_tokens": plain,
+        "output_tokens": u.get("output_tokens", 0) or 0,
+        # A miss re-writes the conversation while the shared tools/system prefix
+        # (a stable 15-25k) still reads from cache — hence the ratio test rather
+        # than "read == 0".
+        "cold": ctx > 50_000 and write > 0.5 * ctx,
+        "cost_usd": round(usage_cost(u), 4),
+    }
+
+
+def _usage_tail(path: Path, tail_bytes: int = 262_144) -> Optional[Dict[str, Any]]:
+    """Last turn's usage, read from the tail of the file.
+
+    Transcripts reach 10-14 MB; seeking to the end keeps this O(256 KB) so it
+    can run on every spawn without thinking about it.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    try:
+        with path.open("rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()  # drop the partial first line
+            chunk = f.read()
+    except OSError:
+        log.exception("failed to read transcript tail: %s", path)
+        return None
+    found: Optional[Dict[str, Any]] = None
+    for raw in chunk.splitlines():
+        if b'"usage"' not in raw:
+            continue
+        try:
+            d = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        u = (d.get("message") or {}).get("usage")
+        if isinstance(u, dict):
+            found = _turn_from_usage(u, d.get("timestamp"))
+    return found
+
+
+_totals_cache: "OrderedDict[Tuple[str, int, int], Dict[str, Any]]" = OrderedDict()
+
+
+def _usage_totals(path: Path) -> Dict[str, Any]:
+    """Whole-session totals. Full scan, memoised on (path, mtime, size).
+
+    ~1s on a 13 MB transcript thanks to the substring pre-filter — only called
+    when a turn ends, on rotation, and by /status.
+    """
+    empty = {
+        "turns": 0, "write_tokens": 0, "read_tokens": 0,
+        "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "cold_turns": 0,
+    }
+    try:
+        st = path.stat()
+    except OSError:
+        return empty
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    hit = _totals_cache.get(key)
+    if hit is not None:
+        _totals_cache.move_to_end(key)
+        return hit
+    tot = dict(empty)
+    try:
+        with path.open("rb") as f:
+            for raw in f:
+                if b'"usage"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                u = (d.get("message") or {}).get("usage")
+                if not isinstance(u, dict):
+                    continue
+                t = _turn_from_usage(u, None)
+                tot["turns"] += 1
+                tot["write_tokens"] += t["cache_creation"]
+                tot["read_tokens"] += t["cache_read"]
+                tot["input_tokens"] += t["input_tokens"]
+                tot["output_tokens"] += t["output_tokens"]
+                tot["cost_usd"] += t["cost_usd"]
+                tot["cold_turns"] += 1 if t["cold"] else 0
+    except OSError:
+        log.exception("failed to scan transcript: %s", path)
+        return empty
+    tot["cost_usd"] = round(tot["cost_usd"], 4)
+    tot["write_usd"] = round(
+        tot["write_tokens"] * CACHE_WRITE_MULT * PRICE_IN_PER_MTOK / 1e6, 4)
+    tot["read_usd"] = round(
+        tot["read_tokens"] * CACHE_READ_MULT * PRICE_IN_PER_MTOK / 1e6, 4)
+    tot["output_usd"] = round(tot["output_tokens"] * PRICE_OUT_PER_MTOK / 1e6, 4)
+    _totals_cache[key] = tot
+    while len(_totals_cache) > 32:
+        _totals_cache.popitem(last=False)
+    return tot
+
+
+def _extract_skeleton(path: Path, max_chars: int = HANDOFF_SKELETON_MAX_CHARS) -> str:
+    """What the previous session concluded, without the tool noise.
+
+    A multi-megabyte transcript is almost entirely tool_use/tool_result/thinking;
+    the few structural markers (assistant replies, todos, edited files, PR links)
+    compress to a few KB, mechanically and for free.
+
+    Deliberately skips `user` messages: in `-p` mode those are the prompts THIS
+    receiver generated, plus skill bodies injected into the turn — not anything
+    a human said. The human's actual words reach the handoff from YouGile, so
+    including them here would duplicate the chat and bury the signal.
+    """
+    assists: List[str] = []
+    todos: str = ""
+    edited: "OrderedDict[str, None]" = OrderedDict()
+    prs: "OrderedDict[str, None]" = OrderedDict()
+    compacts: List[str] = []
+    try:
+        with path.open("rb") as f:
+            for raw in f:
+                try:
+                    d = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                t = d.get("type")
+                if t == "pr-link":
+                    url = d.get("prUrl")
+                    if url:
+                        prs[f"{d.get('prRepository', '?')} — {url}"] = None
+                    continue
+                msg = d.get("message") or {}
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                if d.get("isCompactSummary"):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            compacts.append(b.get("text", ""))
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    bt = b.get("type")
+                    if bt == "text" and t == "assistant":
+                        assists.append(b.get("text", ""))
+                    elif bt == "tool_use":
+                        name = b.get("name") or ""
+                        inp = b.get("input") or {}
+                        if name in ("Edit", "Write", "NotebookEdit") and isinstance(inp, dict):
+                            fp = inp.get("file_path")
+                            if fp:
+                                edited[str(fp)] = None
+                        elif name == "TodoWrite" and isinstance(inp, dict):
+                            items = inp.get("todos") or []
+                            if isinstance(items, list):
+                                todos = "\n".join(
+                                    f"  [{i.get('status', '?')}] {i.get('content', '')}"
+                                    for i in items if isinstance(i, dict)
+                                )
+    except OSError:
+        log.exception("failed to read transcript for skeleton: %s", path)
+        return "(transcript unreadable)"
+
+    def _clip(items: List[str], limit: int, chars: int) -> List[str]:
+        out = []
+        for x in items:
+            x = (x or "").strip()
+            if not x:
+                continue
+            out.append(x if len(x) <= chars else x[:chars] + " …(truncated)")
+        return out[-limit:]
+
+    parts: List[str] = []
+    if compacts:
+        parts.append("### Auto-compaction summaries\n\n" + "\n\n".join(compacts[-2:]))
+    if assists:
+        parts.append(
+            "### What the previous session said, most recent last\n\n"
+            + "\n\n".join(f"- {x}" for x in _clip(assists, 40, 2000)))
+    if todos:
+        parts.append("### Final todo state\n\n```\n" + todos + "\n```")
+    if edited:
+        parts.append("### Files the previous session edited\n\n" + "\n".join(
+            f"- {p}" for p in list(edited)[:200]))
+    if prs:
+        parts.append("### Pull requests it opened\n\n" + "\n".join(
+            f"- {p}" for p in prs))
+    out = "\n\n".join(parts)
+    if len(out) > max_chars:
+        out = out[:max_chars] + "\n\n…(skeleton truncated)"
+    return out or "(no dialogue recovered from the transcript)"
+
+
+# --------------------------------------------------- cache-hit statistics
+#
+# p(cache miss | idle) measured on this machine, seeded with the values observed
+# across 88 turns so the estimator is calibrated from the very first rotation
+# and self-corrects as MCP-server reliability changes.
+
+_IDLE_BUCKETS = ((10.0, "0-10"), (30.0, "10-30"), (60.0, "30-60"), (float("inf"), "60+"))
+_CACHE_STATS_SEED = {
+    "0-10": {"turns": 45, "misses": 3},
+    "10-30": {"turns": 21, "misses": 5},
+    "30-60": {"turns": 4, "misses": 3},
+    "60+": {"turns": 18, "misses": 18},
+}
+_cache_stats_lock = threading.Lock()
+
+
+def _idle_bucket(idle_min: Optional[float]) -> str:
+    if idle_min is None:
+        return "60+"  # unknown age — assume the pessimistic case
+    for edge, name in _IDLE_BUCKETS:
+        if idle_min < edge:
+            return name
+    return "60+"
+
+
+def _load_cache_stats() -> Dict[str, Dict[str, int]]:
+    try:
+        data = json.loads(CACHE_STATS_FILE.read_text(encoding="utf-8"))
+        buckets = data.get("buckets") or {}
+    except (OSError, json.JSONDecodeError):
+        buckets = {}
+    merged = {k: dict(v) for k, v in _CACHE_STATS_SEED.items()}
+    for k, v in buckets.items():
+        if k in merged and isinstance(v, dict):
+            merged[k] = {"turns": int(v.get("turns", 0)), "misses": int(v.get("misses", 0))}
+    return merged
+
+
+def _save_cache_stats(buckets: Dict[str, Dict[str, int]]) -> None:
+    tmp = CACHE_STATS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(
+        {"buckets": buckets, "updated_at": datetime.now(timezone.utc).isoformat()},
+        ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(CACHE_STATS_FILE)
+
+
+def miss_probability(bucket: str) -> float:
+    b = _load_cache_stats().get(bucket) or {"turns": 0, "misses": 0}
+    # Laplace smoothing keeps a thin bucket from swinging to 0 or 1.
+    return (b["misses"] + 1) / (b["turns"] + 2)
+
+
+def record_turn_outcome(idle_min: Optional[float], cold: bool) -> None:
+    """One observation of "did the cache survive this pause?"."""
+    bucket = _idle_bucket(idle_min)
+    with _cache_stats_lock:
+        buckets = _load_cache_stats()
+        b = buckets.setdefault(bucket, {"turns": 0, "misses": 0})
+        b["turns"] += 1
+        b["misses"] += 1 if cold else 0
+        # Halve when a bucket gets fat so it tracks current behaviour rather
+        # than averaging over months of history.
+        if b["turns"] > 400:
+            b["turns"] //= 2
+            b["misses"] //= 2
+        try:
+            _save_cache_stats(buckets)
+        except OSError:
+            log.exception("failed to persist cache stats")
+
+
+def expected_turn_cost(ctx_tokens: Optional[int], idle_min: Optional[float]) -> Optional[float]:
+    """What the next turn's input will cost, before we spend anything on it."""
+    if not ctx_tokens:
+        return None
+    p = miss_probability(_idle_bucket(idle_min))
+    rate = p * CACHE_WRITE_MULT + (1 - p) * CACHE_READ_MULT
+    return ctx_tokens * rate * PRICE_IN_PER_MTOK / 1_000_000
+
+
+def _record_turn_metrics(
+    chat_id: str, session_id: str, rule: "Rule", idle_before: Optional[float]
+) -> None:
+    """After a turn: persist what it cost and whether its cache survived.
+
+    Runs in the reaper thread, so a slow full-transcript scan here delays
+    nothing the user is waiting on.
+    """
+    try:
+        path = _transcript_path(rule.workdir, session_id)
+        last = _usage_tail(path)
+        if last is None:
+            return
+        totals = _usage_totals(path)
+        update_chat_state(chat_id, last_turn=last, session_totals=totals)
+        record_turn_outcome(idle_before, bool(last.get("cold")))
+        log.info(
+            "chat %s: turn ctx=%s cold=%s cost=%.3f session=%.2f",
+            chat_id, last.get("ctx_tokens"), last.get("cold"),
+            last.get("cost_usd") or 0.0, totals.get("cost_usd") or 0.0,
+        )
+    except Exception:
+        log.exception("failed to record turn metrics for chat %s", chat_id)
+
+
+def _post_rotation_advisory(chat_id: str, facts: Dict[str, Any]) -> None:
+    """`manual` mode: flag the threshold, let the human decide."""
+    state = get_chat_state(chat_id)
+    if state.get("advisory_at_seq") == facts["session"]["seq"]:
+        return  # already told them about this session
+    update_chat_state(chat_id, advisory_at_seq=facts["session"]["seq"])
+    text = (
+        f"{COMMAND_REPLY_PREFIX} Контекст этой сессии — "
+        f"{_fmt_int(facts.get('ctx_tokens'))} токенов, и следующий ход обойдётся "
+        f"примерно в {_fmt_usd(facts.get('expected_cost'))} "
+        f"(порог {_fmt_usd(ROTATE_TURN_COST_USD)}).\n"
+        f"Имеет смысл начать новую сессию — команда /new. "
+        f"Подробности: /status"
+    )
+    threading.Thread(
+        target=send_chat_message,
+        args=(chat_id, text, f"<p>{_html_escape(text)}</p>"),
+        daemon=True,
+    ).start()
+
+
+# ------------------------------------------------------------- session chain
+#
+# The session id used to BE the chat id, which made rotation impossible. Now a
+# chat owns a chain of sessions: seq 0 keeps the chat id (so every existing chat
+# carries on untouched with no migration) and later links are derived with
+# uuid5, which is deterministic and — unlike a random uuid4 — needs no lookup
+# table. `claude --session-id` requires a valid UUID, which uuid5 satisfies.
+
+SESSION_NS = uuid.UUID("b1f0c3a2-5d47-4e9a-9c31-8f2e6d0a7b54")
+
+
+def session_for(chat_id: str, seq: int) -> str:
+    if seq <= 0:
+        return chat_id
+    return str(uuid.uuid5(SESSION_NS, f"yougile:{chat_id}:{seq}"))
+
+
+def session_view(chat_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalised session pointer, tolerating pre-rotation state files."""
+    seq = int(state.get("session_seq", 0) or 0)
+    return {
+        "seq": seq,
+        "id": state.get("session_id") or session_for(chat_id, seq),
+        # A state file that predates rotation describes a live seq-0 session.
+        "bootstrapped": bool(state.get("session_bootstrapped", bool(state))),
+    }
+
+
+def session_facts(chat_id: str, state: Dict[str, Any], rule: "Rule") -> Dict[str, Any]:
+    """Everything the rotation decision and /status need — all of it free."""
+    sv = session_view(chat_id, state)
+    tail = _usage_tail(_transcript_path(rule.workdir, sv["id"]))
+    last = tail or state.get("last_turn") or {}
+    ctx = last.get("ctx_tokens")
+    at = last.get("at") or state.get("updated_at")
+    idle_min: Optional[float] = None
+    if at:
+        try:
+            then = datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+            idle_min = (datetime.now(timezone.utc) - then).total_seconds() / 60
+        except ValueError:
+            idle_min = None
+    bucket = _idle_bucket(idle_min)
+    return {
+        "session": sv,
+        "ctx_tokens": ctx,
+        "idle_min": idle_min,
+        "bucket": bucket,
+        "p_miss": miss_probability(bucket),
+        "expected_cost": expected_turn_cost(ctx, idle_min),
+        "last_turn": last,
+    }
+
+
+def should_rotate(
+    chat_id: str, state: Dict[str, Any], rule: "Rule", interrupted: bool
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """(rotate?, reason, facts). Purely a-priori — costs nothing to ask."""
+    facts = session_facts(chat_id, state, rule)
+    if not facts["session"]["bootstrapped"]:
+        # Nothing to rotate away from. A /new issued in this window (right
+        # after a rotation, before the new session's first turn) is already
+        # satisfied — drop the flag so it can't fire again one turn later.
+        if state.get("pending_rotation") or state.get("skip_rotation_once"):
+            update_chat_state(chat_id, pending_rotation=False,
+                              skip_rotation_once=False)
+        return False, "", facts
+    # An explicit /new wins over everything, including an interrupt.
+    if state.get("pending_rotation"):
+        return True, "command", facts
+    if state.get("skip_rotation_once"):
+        return False, "kept", facts
+    if SESSION_ROTATE_MODE == "off":
+        return False, "", facts
+    # Mid-flight redirects must keep their continuity; the interrupted turn is
+    # resumed, not replaced.
+    if interrupted:
+        return False, "", facts
+    ctx = facts["ctx_tokens"]
+    if not ctx or ctx < ROTATE_MIN_CTX:
+        return False, "", facts
+    over = ctx >= ROTATE_HARD_CTX
+    cost = facts["expected_cost"]
+    reason = "hard-ctx" if over else (
+        "cost" if (cost is not None and cost > ROTATE_TURN_COST_USD) else "")
+    if not reason:
+        return False, "", facts
+    # `manual` notices the threshold but leaves the decision to the human.
+    if SESSION_ROTATE_MODE != "auto":
+        return False, "advisory:" + reason, facts
+    return True, reason, facts
+
+
+def rotate_session(
+    chat_id: str, state: Dict[str, Any], reason: str, facts: Dict[str, Any], rule: "Rule"
+) -> Dict[str, Any]:
+    """Retire the current session, point the chat at the next one."""
+    sv = facts["session"]
+    totals = _usage_totals(_transcript_path(rule.workdir, sv["id"]))
+    retired = {
+        "seq": sv["seq"],
+        "id": sv["id"],
+        "started_at": (state.get("sessions") or [{}])[-1].get("started_at")
+        if state.get("sessions") else state.get("first_seen_at"),
+        "retired_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "ctx_tokens": facts.get("ctx_tokens"),
+        "turns": totals.get("turns"),
+        "cost_usd": totals.get("cost_usd"),
+    }
+    chain = list(state.get("sessions") or [])
+    # Replace the open entry for this seq if we already recorded one.
+    chain = [s for s in chain if s.get("seq") != sv["seq"]] + [retired]
+    new_seq = sv["seq"] + 1
+    return update_chat_state(
+        chat_id,
+        session_seq=new_seq,
+        session_id=session_for(chat_id, new_seq),
+        session_bootstrapped=False,
+        sessions=chain,
+        # The new link starts empty. Leaving the retired session's figures here
+        # would make the fresh session report the old context and price its
+        # first turn off it.
+        session_totals={},
+        last_turn={},
+        pending_rotation=False,
+        skip_rotation_once=False,
+        rotated_at=datetime.now(timezone.utc).isoformat(),
+        rotated_from=sv["id"],
+        rotate_reason=reason,
+    )
+
+
+# ------------------------------------------------------------------ workspace
+#
+# The `feature` skill records its worktree/branch/PR state in
+# worktrees/<slug>/.feature.json, keyed by the claude session id. Rotation
+# changes that id, so we re-point the file (and add chat_id, which never
+# changes) — otherwise the next turn would fail to resume the same branch and
+# would open a second PR.
+
+
+def _git(args: List[str], cwd: Path, timeout: int = 15) -> str:
+    try:
+        p = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True,
+            text=True, timeout=timeout,
+        )
+        return (p.stdout or "").strip() if p.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def find_workspace(workdir: str, session_ids: List[str], chat_id: str) -> Optional[Path]:
+    root = Path(workdir) / "worktrees"
+    if not root.is_dir():
+        return None
+    wanted = {s for s in session_ids if s} | {chat_id}
+    for fj in sorted(root.glob("*/.feature.json")):
+        try:
+            data = json.loads(fj.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("session_id") in wanted or data.get("chat_id") in wanted:
+            return fj.parent
+    return None
+
+
+def patch_feature_json(ws: Path, session_id: str, chat_id: str) -> None:
+    fj = ws / ".feature.json"
+    try:
+        data = json.loads(fj.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    data["session_id"] = session_id
+    data["chat_id"] = chat_id
+    tmp = fj.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(fj)
+    except OSError:
+        log.exception("failed to patch %s", fj)
+
+
+def workspace_facts(ws: Optional[Path]) -> Tuple[str, Dict[str, Any]]:
+    """Markdown block + parsed .feature.json for the handoff and /status."""
+    if ws is None:
+        return "(no `feature` workspace found for this chat)", {}
+    try:
+        data = json.loads((ws / ".feature.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return f"(workspace at {ws}, .feature.json unreadable)", {}
+    lines = [f"Workspace: `{ws}`", f"Slug: `{data.get('task', ws.name)}`", ""]
+    for name, r in (data.get("repos") or {}).items():
+        repo = ws / name
+        branch, base = r.get("branch"), r.get("base")
+        lines.append(f"**{name}** — branch `{branch}` off `{base}`")
+        if r.get("pr"):
+            lines.append(f"  PR: {r['pr']}")
+        if r.get("url"):
+            lines.append(f"  dev server: {r['url']}")
+        if repo.is_dir() and branch and base:
+            logs = _git(["log", "--oneline", f"origin/{base}..HEAD"], repo)
+            stat = _git(["diff", "--stat", f"origin/{base}...HEAD"], repo)
+            if logs:
+                lines.append("  commits:\n" + "\n".join(f"    {l}" for l in logs.splitlines()))
+            if stat:
+                lines.append("  diff --stat:\n" + "\n".join(f"    {l}" for l in stat.splitlines()))
+        lines.append("")
+    return "\n".join(lines), data
+
+
+# -------------------------------------------------------------------- handoff
+
+
+def build_handoff(
+    chat_id: str, old_session_id: str, new_seq: int, rule: "Rule",
+    facts: Dict[str, Any], reason: str,
+) -> Optional[Path]:
+    """Assemble everything the new session needs. Zero model tokens (L0)."""
+    try:
+        out_dir = HANDOFF_DIR / chat_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{new_seq}.md"
+
+        task = _api_get(f"/tasks/{chat_id}", retries=2) or {}
+        history = fetch_chat_messages(
+            chat_id, since=None,
+            limit=HANDOFF_HISTORY_LIMIT or 100_000,
+        )
+        history_text, _paths = render_chat_history(history, chat_id)
+        transcript = _transcript_path(rule.workdir, old_session_id)
+        skeleton = _extract_skeleton(transcript)
+        ws = find_workspace(rule.workdir, [old_session_id, chat_id], chat_id)
+        ws_text, _ws_data = workspace_facts(ws)
+
+        ctx_str = _fmt_int(facts.get("ctx_tokens"))
+        body = f"""# Handoff — YouGile task {chat_id}
+
+The previous claude session for this chat was retired ({reason}); its context
+had grown to {ctx_str} tokens. You are its replacement and you start with no
+memory of the task. Everything below was assembled mechanically from YouGile,
+git and the old transcript — it is the whole state, so read it before acting.
+
+## Task card
+
+- Title: {task.get('title') or '(unknown)'}
+- Deadline: {(task.get('deadline') or {}).get('deadline') if isinstance(task.get('deadline'), dict) else task.get('deadline')}
+- Description:
+
+{(task.get('description') or '(empty)')}
+
+## Workspace, branches and pull requests
+
+{ws_text}
+
+## Full task chat ({len(history)} messages, oldest first)
+
+```
+{history_text}
+```
+
+## What the previous session did
+
+{skeleton}
+
+## Escape hatch
+
+The old transcript is still on disk. If you need a detail that is not captured
+above, grep it rather than guessing:
+
+    rg -n "<what you need>" {transcript}
+
+Old session id: `{old_session_id}` (openable locally with `claude --resume {old_session_id}`)
+"""
+        path.write_text(body, encoding="utf-8")
+        log.info("handoff written: %s (%d bytes)", path, len(body))
+        return path
+    except Exception:
+        log.exception("failed to build handoff for chat %s", chat_id)
+        return None
+
+
+def maybe_digest(path: Optional[Path], rule: "Rule") -> None:
+    """L1: compress a fat handoff with a cheap model in a FRESH session.
+
+    Deliberately not `--resume` on the outgoing session: that would re-read the
+    very context we are rotating away from, at the write rate, which is the
+    cost we are trying to avoid.
+    """
+    if path is None or HANDOFF_DIGEST == "off":
+        return
+    try:
+        size_kb = path.stat().st_size / 1024
+    except OSError:
+        return
+    if size_kb < HANDOFF_DIGEST_THRESHOLD_KB:
+        return
+    raw = path.with_suffix(".raw.md")
+    prompt = (
+        "Read the handoff file below and rewrite it as a tight 1-2 page briefing "
+        "for an engineer taking over this task cold. Keep every branch name, PR "
+        "URL, file path, decision and open question; drop repetition and chatter. "
+        "Output ONLY the rewritten briefing in Markdown, no preamble.\n\n"
+        f"File: {path}\n\n{path.read_text(encoding='utf-8')}"
+    )
+    try:
+        path.replace(raw)
+        p = subprocess.run(
+            [CLAUDE_BIN, "--model", HANDOFF_DIGEST_MODEL,
+             "--session-id", str(uuid.uuid4()), "-p", prompt],
+            cwd=rule.workdir, capture_output=True, text=True,
+            timeout=HANDOFF_DIGEST_TIMEOUT,
+        )
+        out = (p.stdout or "").strip()
+        if p.returncode == 0 and len(out) > 500:
+            path.write_text(
+                out + f"\n\n---\nUncompressed original: `{raw}`\n", encoding="utf-8")
+            log.info("handoff digested: %.1f KB -> %.1f KB", size_kb, len(out) / 1024)
+            return
+        log.warning("handoff digest returned nothing usable (rc=%s) — keeping L0", p.returncode)
+    except Exception:
+        log.exception("handoff digest failed — keeping L0")
+    # Any failure: put the mechanical version back.
+    try:
+        if not path.exists() and raw.exists():
+            raw.replace(path)
+    except OSError:
+        log.exception("failed to restore raw handoff")
+
+
+# ------------------------------------------------------------------ rendering
+
+
+def render_session_stats(facts: Dict[str, Any], state: Dict[str, Any]) -> str:
+    """The block the agent appends verbatim to its ack."""
+    sv = facts["session"]
+    chain = len(state.get("sessions") or []) + 1
+    ctx = facts.get("ctx_tokens")
+    cost = facts.get("expected_cost")
+    spent = (state.get("session_totals") or {}).get("cost_usd")
+    line = f"session: {sv['id']}"
+    if chain > 1:
+        line += f"  ({sv['seq'] + 1}-я в цепочке)"
+    bits = []
+    if ctx:
+        bits.append(f"контекст {_fmt_int(ctx)}")
+    if cost is not None:
+        bits.append(f"этот ход ≈ {_fmt_usd(cost)}")
+    if spent:
+        bits.append(f"за сессию ≈ {_fmt_usd(spent)}")
+    return line + ("\n" + " · ".join(bits) if bits else "")
+
+
+def render_rotation_notice(
+    chat_id: str, old_id: str, new_id: str, reason: str,
+    facts: Dict[str, Any], totals: Dict[str, Any], handoff: Optional[Path],
+) -> Tuple[str, str]:
+    why = {
+        "cost": f"пауза {_fmt_age(facts.get('idle_min'))}, кеш почти наверняка мёртв",
+        "hard-ctx": "контекст подошёл к пределу окна",
+        "command": "запрошено командой /new",
+    }.get(reason, reason)
+    cold = totals.get("cold_turns") or 0
+    turns = totals.get("turns") or 0
+    lines = [
+        f"{COMMAND_REPLY_PREFIX} Новая сессия",
+        "",
+        f"Прошлая — {old_id}",
+        f"  контекст     {_fmt_int(facts.get('ctx_tokens'))} токенов"
+        f" · {turns} запросов к API",
+        f"  потрачено    ≈ {_fmt_usd(totals.get('cost_usd'))}"
+        f"   (запись {_fmt_usd(totals.get('write_usd'))}"
+        f" · чтение {_fmt_usd(totals.get('read_usd'))}"
+        f" · вывод {_fmt_usd(totals.get('output_usd'))})",
+    ]
+    if turns:
+        lines.append(f"  мимо кеша    {cold} запросов из {turns}")
+    exp = facts.get("expected_cost")
+    lines += [
+        "",
+        f"Причина: {why} → следующий ход на этом контексте стоил бы "
+        f"≈ {_fmt_usd(exp)} (порог {_fmt_usd(ROTATE_TURN_COST_USD)}).",
+        "",
+        f"Новая — {new_id}. Перенесены история задачи, ветки, PR и дифф.",
+    ]
+    if handoff:
+        lines.append(f"Handoff: {handoff}")
+    lines += [
+        "",
+        "Старая сессия никуда не делась:",
+        f"claude --resume {old_id}",
+    ]
+    text = "\n".join(lines)
+    html = "<p>" + "</p><p>".join(
+        _html_escape(b).replace("\n", "<br>") for b in text.split("\n\n")) + "</p>"
+    return text, html
+
+
+def _html_escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def render_help() -> Tuple[str, str]:
+    text = f"""{COMMAND_REPLY_PREFIX} Команды — их обрабатывает обвязка, агент не запускается и токены не тратятся
+
+/status     контекст, кеш, траты, воркспейс, и начнётся ли следующий ход
+            в новой сессии
+/sessions   цепочка сессий этой задачи: id, причины смены, траты
+            (любую можно открыть локально: claude --resume <id>)
+/new [что]  следующий ход — принудительно в новой сессии
+/keep       разово отменить запланированную авто-ротацию
+/stop       прервать текущий ход агента
+/help       это сообщение
+
+@Agent <текст>        обычное обращение к агенту
+@Agent /new <текст>   ротация + сразу задача
+
+Суммы — оценка по прайсу API (${PRICE_IN_PER_MTOK:.0f}/${PRICE_OUT_PER_MTOK:.0f} за Mtok,
+запись в кеш ×{CACHE_WRITE_MULT:g}, чтение ×{CACHE_READ_MULT:g})."""
+    return text, f"<pre>{_html_escape(text)}</pre>"
+
+
+def render_status(chat_id: str, rule: "Rule") -> Tuple[str, str]:
+    state = get_chat_state(chat_id)
+    if not state:
+        t = f"{COMMAND_REPLY_PREFIX} По этому чату ещё не было ни одного хода агента."
+        return t, f"<p>{_html_escape(t)}</p>"
+    facts = session_facts(chat_id, state, rule)
+    sv = facts["session"]
+    tp = _transcript_path(rule.workdir, sv["id"])
+    totals = _usage_totals(tp)
+    chain = list(state.get("sessions") or [])
+    chain_cost = sum((s.get("cost_usd") or 0) for s in chain) + (totals.get("cost_usd") or 0)
+    last = facts.get("last_turn") or {}
+
+    L = [f"{COMMAND_REPLY_PREFIX} Статус", "", "Сессия",
+         f"  id            {sv['id']}   ({sv['seq'] + 1}-я из {len(chain) + 1} в цепочке)"]
+    if facts.get("ctx_tokens"):
+        L.append(f"  контекст      {_fmt_int(facts['ctx_tokens'])} токенов"
+                 f" · {totals.get('turns', 0)} запросов"
+                 f" · последний {_fmt_age(facts.get('idle_min'))} назад")
+    else:
+        L.append("  контекст      нет данных (транскрипт не найден)")
+    if last:
+        mark = "❌ мимо кеша" if last.get("cold") else "✅ попал в кеш"
+        L.append(f"  прошлый ход   {mark}"
+                 f" (read {_fmt_int(last.get('cache_read'))},"
+                 f" write {_fmt_int(last.get('cache_creation'))})"
+                 f" — факт {_fmt_usd(last.get('cost_usd'))}")
+    L.append(f"  за сессию     ≈ {_fmt_usd(totals.get('cost_usd'))}"
+             f"   (запись {_fmt_usd(totals.get('write_usd'))}"
+             f" · чтение {_fmt_usd(totals.get('read_usd'))}"
+             f" · вывод {_fmt_usd(totals.get('output_usd'))})")
+    if chain:
+        L.append(f"  за задачу     ≈ {_fmt_usd(chain_cost)} по цепочке из {len(chain) + 1} сессий")
+
+    L += ["", "Ротация",
+          f"  режим         {SESSION_ROTATE_MODE} · порог {_fmt_usd(ROTATE_TURN_COST_USD)} за ход"
+          f" · потолок {_fmt_int(ROTATE_HARD_CTX)} токенов"]
+    exp = facts.get("expected_cost")
+    if exp is None:
+        L.append("  сейчас        нет данных для оценки")
+    else:
+        rotate_now = (facts.get("ctx_tokens") or 0) >= ROTATE_HARD_CTX or exp > ROTATE_TURN_COST_USD
+        verdict = "начнётся НОВАЯ сессия" if rotate_now else "продолжу текущую сессию"
+        if SESSION_ROTATE_MODE != "auto" and rotate_now:
+            verdict += f" (режим {SESSION_ROTATE_MODE} — только предупрежу)"
+        L.append(f"  сейчас        следующий ход ≈ {_fmt_usd(exp)} → {verdict}")
+        cold_cost = expected_turn_cost(facts.get("ctx_tokens"), 999)
+        if cold_cost and not rotate_now:
+            L.append(f"  если пауза    > часа → ≈ {_fmt_usd(cold_cost)}, и тогда новая сессия")
+    stats = _load_cache_stats()
+    L.append("  промах кеша   " + " · ".join(
+        f"{k} мин {100 * miss_probability(k):.0f}%" for k in ("0-10", "10-30", "30-60", "60+")))
+
+    ws = find_workspace(rule.workdir, [s.get("id") for s in chain] + [sv["id"]], chat_id)
+    if ws:
+        L += ["", f"Воркспейс  {ws}"]
+        try:
+            data = json.loads((ws / ".feature.json").read_text(encoding="utf-8"))
+            for name, r in (data.get("repos") or {}).items():
+                L.append(f"  {name:<10} {r.get('branch')} → {r.get('base')}"
+                         f"   {r.get('pr') or 'PR нет'}   {r.get('url') or ''}")
+        except (OSError, json.JSONDecodeError):
+            L.append("  (.feature.json нечитаем)")
+
+    busy = chat_turn_in_flight(chat_id)
+    L += ["", "Чат",
+          f"  обработано до {state.get('last_message_id')}",
+          f"  агент: {'работает' if busy else 'свободен'}"]
+    text = "\n".join(L)
+    return text, f"<pre>{_html_escape(text)}</pre>"
+
+
+def render_sessions(chat_id: str, rule: "Rule") -> Tuple[str, str]:
+    state = get_chat_state(chat_id)
+    sv = session_view(chat_id, state)
+    chain = list(state.get("sessions") or [])
+    L = [f"{COMMAND_REPLY_PREFIX} Сессии этой задачи", ""]
+    for s in chain:
+        L.append(f"  #{s.get('seq')}  {s.get('id')}")
+        L.append(f"       {s.get('turns')} запросов · ≈ {_fmt_usd(s.get('cost_usd'))}"
+                 f" · закрыта {s.get('retired_at', '?')[:16]} ({s.get('reason')})")
+    totals = _usage_totals(_transcript_path(rule.workdir, sv["id"]))
+    L.append(f"  #{sv['seq']}  {sv['id']}   ← текущая")
+    L.append(f"       {totals.get('turns')} запросов · ≈ {_fmt_usd(totals.get('cost_usd'))}")
+    L += ["", "Открыть любую локально:  claude --resume <id>"]
+    text = "\n".join(L)
+    return text, f"<pre>{_html_escape(text)}</pre>"
+
+
+# ------------------------------------------------------------------- commands
+
+COMMAND_RE = re.compile(
+    r"^\s*(?:@\S+\s+)?/(help|status|sessions|new|keep|stop)\b\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain_text(payload: Any) -> str:
+    msg = payload.get("payload") if isinstance(payload, dict) else None
+    text = (msg or {}).get("text") if isinstance(msg, dict) else None
+    return _TAG_RE.sub(" ", text or "").strip()
+
+
+def _is_command_noise(text: str) -> bool:
+    """True for a slash command or for one of our own replies to one."""
+    if not COMMANDS_ENABLED:
+        return False
+    plain = _TAG_RE.sub(" ", text or "").strip()
+    if COMMAND_REPLY_PREFIX and plain.startswith(COMMAND_REPLY_PREFIX):
+        return True
+    return bool(COMMAND_RE.match(plain))
+
+
+def parse_command(payload: Any) -> Optional[Tuple[str, str]]:
+    if not COMMANDS_ENABLED:
+        return None
+    event = payload.get("event") if isinstance(payload, dict) else None
+    if event != "chat_message-created":
+        return None
+    m = COMMAND_RE.match(_plain_text(payload))
+    if not m:
+        return None
+    return m.group(1).lower(), (m.group(2) or "").strip()
+
+
+def command_sender_allowed(payload: Any) -> bool:
+    allowed = set(COMMAND_ALLOWED_EMAILS)
+    if not allowed:
+        for r in RULES:
+            allowed |= {e.lower() for e in (r.allowed_sender_emails or [])}
+    if not allowed:
+        return True  # no allowlist configured anywhere — same as the rules
+    msg = payload.get("payload") if isinstance(payload, dict) else {}
+    uid = (msg or {}).get("fromUserId")
+    user = USERS_BY_ID.get(uid) or {}
+    return (user.get("email") or "").lower() in allowed
+
+
+def handle_command(cmd: str, arg: str, payload: Any) -> Dict[str, Any]:
+    """Answer in-process. Never spawns an agent, never touches the sticker."""
+    chat_id = extract_chat_id(payload)
+    if not chat_id:
+        return {"handled": False}
+    rule = next((r for r in RULES if r.enabled and r.session_per_chat), None)
+    if rule is None:
+        rule = RULES[0] if RULES else None
+    if rule is None:
+        return {"handled": False}
+
+    if cmd == "help":
+        text, html = render_help()
+    elif cmd == "status":
+        text, html = render_status(chat_id, rule)
+    elif cmd == "sessions":
+        text, html = render_sessions(chat_id, rule)
+    elif cmd == "new":
+        update_chat_state(chat_id, pending_rotation=True, skip_rotation_once=False)
+        extra = f" Причина: {arg}" if arg else ""
+        text = (f"{COMMAND_REPLY_PREFIX} Принято — следующий ход начнётся "
+                f"в новой сессии.{extra}")
+        html = f"<p>{_html_escape(text)}</p>"
+    elif cmd == "keep":
+        update_chat_state(chat_id, skip_rotation_once=True, pending_rotation=False)
+        text = (f"{COMMAND_REPLY_PREFIX} Ок, следующий ход продолжит текущую "
+                f"сессию, даже если сработает порог.")
+        html = f"<p>{_html_escape(text)}</p>"
+    elif cmd == "stop":
+        stopped = _interrupt_chat(chat_id)
+        text = (f"{COMMAND_REPLY_PREFIX} Текущий ход прерван."
+                if stopped else
+                f"{COMMAND_REPLY_PREFIX} Сейчас по этой задаче ничего не выполняется.")
+        html = f"<p>{_html_escape(text)}</p>"
+    else:
+        return {"handled": False}
+
+    threading.Thread(
+        target=send_chat_message, args=(chat_id, text, html), daemon=True
+    ).start()
+    return {"handled": True, "command": cmd}
 
 
 # ---------------------------------------------------------------- spawning
@@ -1707,6 +2796,8 @@ def _build_prompt(
     attachment_paths: List[Path],
     session_id: Optional[str] = None,
     interrupted: bool = False,
+    handoff_path: Optional[Path] = None,
+    session_stats: str = "",
 ) -> str:
     event_json = json.dumps(payload, ensure_ascii=False, indent=2)
     rendered = rule.prompt_template
@@ -1716,6 +2807,19 @@ def _build_prompt(
     rendered = rendered.replace("{formatting}", FORMATTING_BLOCK)
     rendered = rendered.replace("{language}", rule.language or "")
     rendered = rendered.replace("{session_id}", session_id or "")
+    rendered = rendered.replace("{session_stats}", session_stats)
+    rendered = rendered.replace("{handoff}", HANDOFF_BLOCK.format(path=handoff_path)
+                                if handoff_path else "")
+    # A handoff must never be silently dropped just because the template
+    # predates it — append the pointer if the placeholder isn't there.
+    if handoff_path and "{handoff}" not in rule.prompt_template:
+        rendered = f"{HANDOFF_BLOCK.format(path=handoff_path)}\n\n---\n{rendered}"
+    if session_stats and "{session_stats}" not in rule.prompt_template:
+        rendered = (
+            f"{rendered}\n\n---\nWhen you post your ack message into the chat, "
+            f"end it with this block, copied VERBATIM (do not recompute or "
+            f"reword the numbers):\n\n{session_stats}\n"
+        )
     # If the template doesn't reference {formatting} explicitly, append it so
     # every spawned agent still sees the rules — guarantees consistent output.
     if "{formatting}" not in rule.prompt_template and FORMATTING_BLOCK:
@@ -1918,26 +3022,78 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
 
     try:
         if chat_id:
-            # The claude session id IS the YouGile chat/task UUID — deterministic,
-            # so we never need to map it. "Have we already started a session for
-            # this chat?" is answered solely by whether state/chats/<chatId>.json
-            # exists. No peeking into claude's internal storage.
-            session_id = chat_id
-            known = chat_known(chat_id)
+            # A chat owns a CHAIN of claude sessions. Link 0 keeps the chat id
+            # (so every pre-rotation chat carries on with no migration); later
+            # links are uuid5-derived, deterministic and needing no lookup
+            # table. Whether we resume or start fresh is answered by
+            # `session_bootstrapped` in the chat state — the existence of the
+            # state file still means only "we have run for this chat before",
+            # which is what skip_if_chat_known relies on.
             chat_state = get_chat_state(chat_id)
             last_msg_id = chat_state.get("last_message_id")
 
-            if not known:
+            rotate, rotate_reason, facts = should_rotate(
+                chat_id, chat_state, rule, interrupted)
+            handoff_path: Optional[Path] = None
+            if rotate:
+                old_id = facts["session"]["id"]
+                old_totals = _usage_totals(_transcript_path(rule.workdir, old_id))
+                chat_state = rotate_session(
+                    chat_id, chat_state, rotate_reason, facts, rule)
+                new_id = chat_state["session_id"]
+                log.info(
+                    "chat %s: rotating session %s -> %s (%s, ctx=%s, est=%.2f)",
+                    chat_id, old_id, new_id, rotate_reason,
+                    facts.get("ctx_tokens"), facts.get("expected_cost") or 0.0,
+                )
+                handoff_path = build_handoff(
+                    chat_id, old_id, chat_state["session_seq"], rule,
+                    facts, rotate_reason,
+                )
+                maybe_digest(handoff_path, rule)
+                ws = find_workspace(rule.workdir, [old_id, chat_id], chat_id)
+                if ws:
+                    patch_feature_json(ws, new_id, chat_id)
+                    update_chat_state(chat_id, workspace_path=str(ws))
+                notice, notice_html = render_rotation_notice(
+                    chat_id, old_id, new_id, rotate_reason, facts,
+                    old_totals, handoff_path,
+                )
+                threading.Thread(
+                    target=send_chat_message,
+                    args=(chat_id, notice, notice_html), daemon=True,
+                ).start()
+                facts = session_facts(chat_id, chat_state, rule)
+            elif rotate_reason.startswith("advisory:"):
+                _post_rotation_advisory(chat_id, facts)
+            elif rotate_reason == "kept":
+                update_chat_state(chat_id, skip_rotation_once=False)
+
+            sv = session_view(chat_id, chat_state)
+            session_id = sv["id"]
+            # A state file can claim a session that never made it to disk (spawn
+            # died mid-launch). Resuming that fails hard, so fall back to
+            # creating it — the transcript is the ground truth.
+            bootstrapped = sv["bootstrapped"] and _transcript_path(
+                rule.workdir, session_id).exists()
+
+            if not bootstrapped:
                 is_first_turn = True
                 history = fetch_chat_messages(
-                    chat_id, since=None, limit=CHAT_HISTORY_FIRST_TIME_LIMIT
+                    chat_id, since=None,
+                    limit=(HANDOFF_INLINE_MESSAGES if handoff_path
+                           else CHAT_HISTORY_FIRST_TIME_LIMIT),
                 )
                 session_flag = ["--session-id", session_id]
-                # Mark the chat as known BEFORE spawn so a crash mid-launch
+                # Mark the session as live BEFORE spawn so a crash mid-launch
                 # doesn't make us double-fire --session-id on retry.
                 update_chat_state(
                     chat_id,
-                    first_seen_at=datetime.now(timezone.utc).isoformat(),
+                    first_seen_at=chat_state.get("first_seen_at")
+                    or datetime.now(timezone.utc).isoformat(),
+                    session_seq=sv["seq"],
+                    session_id=session_id,
+                    session_bootstrapped=True,
                 )
             else:
                 is_first_turn = False
@@ -1948,6 +3104,8 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
                 )
                 session_flag = ["--resume", session_id]
 
+            session_stats = (
+                render_session_stats(facts, chat_state) if ACK_STATS else "")
             history_text, attachment_paths = render_chat_history(history, chat_id)
             newest_msg_id = max(
                 [int(m["id"]) for m in history if m.get("id")] + [last_msg_id or 0]
@@ -1958,6 +3116,8 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
             is_first_turn = True
             newest_msg_id = None
             session_flag = []
+            handoff_path = None
+            session_stats = ""
             attachment_paths = []
 
         # Webhook can race ahead of /chats/<id>/messages — if the trigger
@@ -1975,6 +3135,7 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
         prompt = _build_prompt(
             rule, payload, history_text, is_first_turn, attachment_paths,
             session_id=session_id, interrupted=interrupted,
+            handoff_path=handoff_path, session_stats=session_stats,
         )
         cmd = [CLAUDE_BIN, *rule.extra_args, *session_flag, "-p", prompt]
 
@@ -1986,10 +3147,16 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
             f"--- prompt ---\n{prompt}\n--- output ---\n"
         )
 
+        # How long the chat had been idle when this turn started — the input to
+        # the cache-survival statistic, recorded once the turn's usage lands.
+        idle_before = facts.get("idle_min") if chat_id else None
+
         def on_exit(rc: int) -> None:
             try:
                 if chat_id and newest_msg_id:
                     update_chat_state(chat_id, last_message_id=newest_msg_id)
+                if chat_id and session_id:
+                    _record_turn_metrics(chat_id, session_id, rule, idle_before)
                 _mark_turn_finished(chat_id, task_id)
             finally:
                 _release_chat(chat_id, chat_lock)
@@ -2118,6 +3285,20 @@ async def yougile_webhook(req: Request):
         # the literal text — mark it before the rules look at the payload.
         learn_agent_user_id(payload)
         replied_to_agent = await asyncio.to_thread(annotate_agent_reply, payload)
+
+    # Slash commands are answered by the receiver itself — no agent spawn, no
+    # tokens, no sticker change. Checked before rule matching so a bare
+    # "/status" can never fall through to an @Agent rule.
+    if not duplicate:
+        cmd = parse_command(payload)
+        if cmd:
+            if not command_sender_allowed(payload):
+                log.info("command /%s from a non-allowlisted sender — ignored", cmd[0])
+                return {"ok": True, "command": cmd[0], "handled": False,
+                        "reason": "sender-not-allowed"}
+            result = await asyncio.to_thread(handle_command, cmd[0], cmd[1], payload)
+            log.info("command /%s handled=%s", cmd[0], result.get("handled"))
+            return {"ok": True, **result}
 
     rule, reasons = find_matching_rule(payload)
     fired_rule: Optional[str] = None
