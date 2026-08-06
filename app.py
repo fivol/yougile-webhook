@@ -4202,6 +4202,7 @@ def spawn_claude(
             history_text = ""
             is_first_turn = True
             newest_msg_id = None
+            last_msg_id = None
             dropped = 0
             session_flag = []
             handoff_path = None
@@ -4241,15 +4242,26 @@ def spawn_claude(
             f"{(chat_id or rule.name)}-{ts.replace(':', '').replace('-', '')[:15]}.log"
         )
 
+        # What the record will say. Kept here too because a turn can die faster
+        # than the record gets written (`--resume` on a dead session exits in
+        # about two seconds, but a bad binary exits in milliseconds), and
+        # finish_turn still needs the watermark to roll back.
+        base_rec: Dict[str, Any] = {
+            "chat_id": chat_id, "task_id": task_id, "session_id": session_id,
+            "rule": rule.name, "idle_before": idle_before,
+            "prev_watermark": last_msg_id if chat_id else None,
+            "watermark": newest_msg_id, "log_path": str(turn_log),
+            "allow_session_recovery": allow_session_recovery, "payload": payload,
+        }
+
         def on_exit(rc: int, failure: Optional[str] = None) -> None:
             # `failure` is claude's own last word, or None when the turn ended
             # normally / we killed it ourselves to run a newer instruction.
-            # Everything else lives in the turn record, so a restart can finish
-            # this same turn without any of the state captured here.
-            rec = (read_turn(chat_id) if chat_id else {}) or {
-                "chat_id": chat_id, "task_id": task_id, "session_id": session_id,
-                "rule": rule.name, "idle_before": idle_before,
-            }
+            # Everything else comes from the record, so a restart can finish
+            # this same turn without any of the state captured here; the
+            # closure only fills in what the record didn't get to say.
+            rec = dict(base_rec)
+            rec.update(read_turn(chat_id) if chat_id else {})
             finish_turn(rec, rc, failure)
 
         _reap_turn_logs()
