@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import yaml
 from fastapi import FastAPI, Request
 
 # Hand-maintained; bump on every change worth restarting the service for. The
@@ -59,6 +60,107 @@ load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("yougile-webhook")
 log.info("yougile-webhook %s starting from %s", APP_VERSION, ROOT)
+
+
+# --- Settings ----------------------------------------------------------------
+# Seventy flat environment variables is a lot of surface for something whose
+# knobs group naturally (rotation, handoff, history, turns). config.yaml gives
+# them that shape; config.local.yaml overrides it per machine and is not
+# committed. Environment variables still win over both, so a one-off override
+# needs no file edit and every existing .env keeps working unchanged.
+#
+# Secrets stay in .env deliberately: config.yaml is meant to be committable.
+
+CONFIG_FILE = ROOT / os.environ.get("CONFIG_FILE", "config.yaml")
+CONFIG_LOCAL_FILE = ROOT / os.environ.get("CONFIG_LOCAL_FILE", "config.local.yaml")
+
+
+class _StrictBoolLoader(yaml.SafeLoader):
+    """YAML 1.1 reads `no`, `off` and `yes` as booleans.
+
+    That is a live hazard here: `language: no` is Norwegian, not False, and the
+    same goes for locale lists and two-letter codes generally. Only `true` and
+    `false` stay boolean; everything else that looks like a word stays a string.
+    """
+
+
+_StrictBoolLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+    list("tTfF"),
+)
+for _ch in list("yYnNoO"):
+    _StrictBoolLoader.yaml_implicit_resolvers.setdefault(_ch, [])
+    _StrictBoolLoader.yaml_implicit_resolvers[_ch] = [
+        (tag, rx) for tag, rx in _StrictBoolLoader.yaml_implicit_resolvers[_ch]
+        if tag != "tag:yaml.org,2002:bool"
+    ]
+
+
+def _deep_merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, value in (over or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _load_config() -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for path in (CONFIG_FILE, CONFIG_LOCAL_FILE):
+        if not path.exists():
+            continue
+        try:
+            with path.open("rb") as f:
+                data = yaml.load(f, Loader=_StrictBoolLoader) or {}
+        except (OSError, yaml.YAMLError):
+            log.exception("config %s is unreadable — ignoring it", path)
+            continue
+        if not isinstance(data, dict):
+            log.warning("config %s is not a mapping — ignoring it", path)
+            continue
+        merged = _deep_merge(merged, data)
+        log.info("config: loaded %s", path.name)
+    return merged
+
+
+CONFIG: Dict[str, Any] = _load_config()
+
+
+def conf(path: str, env: str, default: Any, cast: Any = str) -> Any:
+    """One setting, resolved: environment > config.local.yaml > config.yaml > default.
+
+    `path` is dotted ("rotation.turn_cost_usd"); `env` is the variable that has
+    always set it. Keeping both means no existing deployment has to change and
+    nothing has to be looked up in two places to know what is in effect.
+    """
+    raw = os.environ.get(env)
+    if raw is None:
+        node: Any = CONFIG
+        for part in path.split("."):
+            if not isinstance(node, dict) or part not in node:
+                node = None
+                break
+            node = node[part]
+        raw = node
+    if raw is None:
+        return default
+    try:
+        if cast is bool:
+            if isinstance(raw, bool):
+                return raw
+            return str(raw).strip().lower() not in ("0", "false", "no", "off", "")
+        if cast is list:
+            if isinstance(raw, list):
+                return [str(x).strip() for x in raw if str(x).strip()]
+            return [x.strip() for x in str(raw).split(",") if x.strip()]
+        return cast(raw)
+    except (TypeError, ValueError):
+        log.warning("config %s: %r is not a valid %s — using %r",
+                    path, raw, getattr(cast, "__name__", cast), default)
+        return default
 
 
 # --- User-facing text --------------------------------------------------------
@@ -193,7 +295,8 @@ CLAUDE_DEFAULT_WORKDIR = os.environ.get("CLAUDE_WORKDIR") or str(ROOT)
 CLAUDE_DEFAULT_EXTRA_ARGS = shlex.split(
     os.environ.get("CLAUDE_EXTRA_ARGS", "--dangerously-skip-permissions")
 )
-CLAUDE_MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "10"))
+CLAUDE_MAX_CONCURRENT = conf(
+    "claude.max_concurrent", "CLAUDE_MAX_CONCURRENT", 10, int)
 
 # When a new @Agent message lands in a chat whose turn is STILL running, we
 # interrupt the in-flight turn (kill its process group) and immediately start a
@@ -233,7 +336,7 @@ INTERRUPT_NOTICE = (
 # Retry policy for transient API errors. The Anthropic API surfaces overload /
 # rate-limit failures as 5xx; the claude CLI prints them to stdout and exits
 # with a non-zero code. We re-spawn the same command after a backoff.
-CLAUDE_API_RETRIES = int(os.environ.get("CLAUDE_API_RETRIES", "3"))
+CLAUDE_API_RETRIES = conf("claude.api_retries", "CLAUDE_API_RETRIES", 3, int)
 CLAUDE_RETRY_DELAYS = [
     int(x) for x in os.environ.get("CLAUDE_RETRY_DELAYS", "30,120,300").split(",")
     if x.strip()
@@ -249,19 +352,41 @@ CLAUDE_RETRY_PATTERN = re.compile(
 # trigger message has been 👍'd by then, so the chat shows "received" and then
 # nothing forever — from the outside, a dead turn is indistinguishable from a
 # slow one. Every failed turn now posts what actually went wrong.
-TURN_FAILURE_REPORT = os.environ.get(
-    "TURN_FAILURE_REPORT", "true").lower() not in ("0", "false", "no")
+TURN_FAILURE_REPORT = conf("turn.report_failure", "TURN_FAILURE_REPORT", True, bool)
 TURN_FAILURE_PREFIX = os.environ.get("TURN_FAILURE_PREFIX", "⚠️").strip()
 # How much of claude's own output to quote back into the chat.
 TURN_FAILURE_QUOTE_CHARS = int(os.environ.get("TURN_FAILURE_QUOTE_CHARS", "600"))
-# Bound on the per-turn output buffer kept in memory. Startup errors are the
-# first thing printed and the answer is the last, so keeping the head and the
-# tail of the stream covers every case the report cares about.
+# Bound on how much of a turn's output the failure report reads back. Startup
+# errors are the first thing printed and the answer is the last, so keeping the
+# head and the tail of the stream covers every case the report cares about.
 CLAUDE_CAPTURE_HEAD_CHARS = 8 * 1024
 CLAUDE_CAPTURE_TAIL_CHARS = 56 * 1024
-# How long to keep draining claude's output after it exits, before giving up on
-# a grandchild that inherited the pipe and never closed it.
-CLAUDE_PUMP_DRAIN_SECONDS = float(os.environ.get("CLAUDE_PUMP_DRAIN_SECONDS", "10"))
+
+# --- A turn outlives the process that started it ------------------------------
+# claude runs in its own process session (start_new_session=True) so a webhook
+# restart cannot kill a running turn. Everything the receiver needs to finish
+# that turn therefore has to be on disk too, or a restart orphans it: the
+# watermark never advances, the card keeps saying "working", the queued turn
+# never starts, and the chat is told nothing. One file per chat, written the
+# moment the process is live, removed when the turn is finalised.
+TURNS_STATE_DIR = STATE_DIR / "turns"
+TURNS_STATE_DIR.mkdir(parents=True, exist_ok=True)
+# claude's stdout goes to a file rather than a pipe. A pipe has a reader that
+# dies with the receiver — after which claude either blocks on a full buffer or
+# is killed writing to a closed one, mid-turn, having answered nothing. A file
+# has no reader to lose, so an orphaned turn runs to completion and still posts
+# its own reply.
+TURN_LOG_DIR = LOG_DIR / "turns"
+TURN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+# Keep the last N turn logs; older ones are reaped as new turns start.
+TURN_LOG_KEEP = conf("turn.log_keep", "TURN_LOG_KEEP", 200, int)
+# A turn that exits cleanly but posts nothing looks identical to a working one
+# from the chat: the 👍 is there and no reply ever comes. Say so instead.
+TURN_REPORT_SILENT = conf("turn.report_silent", "TURN_REPORT_SILENT", True, bool)
+# How often the re-attached supervisor polls an adopted (no longer child)
+# process to notice it has exited.
+TURN_ADOPT_POLL_SECONDS = conf(
+    "turn.adopt_poll_seconds", "TURN_ADOPT_POLL_SECONDS", 5.0, float)
 
 # `claude --resume <id>` on a session that is no longer on disk exits 1 within
 # seconds having printed just this one line. That id is then unusable in BOTH
@@ -315,8 +440,10 @@ CHAT_ID_KEYS = [
     if k.strip()
 ]
 
-CHAT_HISTORY_FIRST_TIME_LIMIT = int(os.environ.get("CHAT_HISTORY_FIRST_TIME_LIMIT", "20"))
-CHAT_HISTORY_DELTA_LIMIT = int(os.environ.get("CHAT_HISTORY_DELTA_LIMIT", "50"))
+CHAT_HISTORY_FIRST_TIME_LIMIT = conf(
+    "history.first_time_limit", "CHAT_HISTORY_FIRST_TIME_LIMIT", 20, int)
+CHAT_HISTORY_DELTA_LIMIT = conf(
+    "history.delta_limit", "CHAT_HISTORY_DELTA_LIMIT", 50, int)
 
 ATTACHMENTS_ENABLED = os.environ.get("ATTACHMENTS_ENABLED", "true").lower() not in ("0", "false", "no")
 ATTACHMENT_MAX_BYTES = int(os.environ.get("ATTACHMENT_MAX_BYTES", str(25 * 1024 * 1024)))
@@ -383,15 +510,17 @@ AGENT_STICKER_ANSWERED_COLOR = os.environ.get("AGENT_STICKER_ANSWERED_COLOR", "#
 # transcript. The effect is that a live back-and-forth keeps its context (it is
 # cheap while warm) and a chat resumed after a long pause resets (its context
 # would be re-billed at the write rate).
-SESSION_ROTATE_MODE = os.environ.get("SESSION_ROTATE_MODE", "manual").strip().lower()
+SESSION_ROTATE_MODE = conf(
+    "rotation.mode", "SESSION_ROTATE_MODE", "manual", str).strip().lower()
 # The one knob that matters: rotate once the next turn's expected input cost
 # exceeds this. In dollars, so it means something without a token calculator.
-ROTATE_TURN_COST_USD = float(os.environ.get("ROTATE_TURN_COST_USD", "1.50"))
+ROTATE_TURN_COST_USD = conf(
+    "rotation.turn_cost_usd", "ROTATE_TURN_COST_USD", 1.50, float)
 # Rotate regardless of cost past this context size — the 1M window is a wall we
 # must not hit mid-task (observed sessions reached 950k).
-ROTATE_HARD_CTX = int(os.environ.get("ROTATE_HARD_CTX", "600000"))
+ROTATE_HARD_CTX = conf("rotation.hard_ctx", "ROTATE_HARD_CTX", 600000, int)
 # Never rotate a small session, whatever the arithmetic says.
-ROTATE_MIN_CTX = int(os.environ.get("ROTATE_MIN_CTX", "40000"))
+ROTATE_MIN_CTX = conf("rotation.min_ctx", "ROTATE_MIN_CTX", 40000, int)
 
 # --- Handoff -----------------------------------------------------------------
 # What the new session gets instead of the old transcript. Everything here is
@@ -399,39 +528,53 @@ ROTATE_MIN_CTX = int(os.environ.get("ROTATE_MIN_CTX", "40000"))
 # spends anything, and it runs in a fresh cheap session over the L0 file rather
 # than resuming the expensive one we are escaping.
 HANDOFF_DIR = STATE_DIR / "handoff"
-HANDOFF_HISTORY_LIMIT = int(os.environ.get("HANDOFF_HISTORY_LIMIT", "0"))  # 0 = all
-HANDOFF_INLINE_MESSAGES = int(os.environ.get("HANDOFF_INLINE_MESSAGES", "30"))
-HANDOFF_DIGEST = os.environ.get("HANDOFF_DIGEST", "auto").strip().lower()
+HANDOFF_HISTORY_LIMIT = conf(
+    "handoff.history_limit", "HANDOFF_HISTORY_LIMIT", 0, int)  # 0 = all
+HANDOFF_INLINE_MESSAGES = conf(
+    "handoff.inline_messages", "HANDOFF_INLINE_MESSAGES", 30, int)
+HANDOFF_DIGEST = conf(
+    "handoff.digest.mode", "HANDOFF_DIGEST", "auto", str).strip().lower()
 # A mechanical handoff runs ~25 KB (≈7k tokens) for a typical task, which is
 # cheap to hand over as-is. Only a genuinely long chat is worth paying a model
 # to compress.
-HANDOFF_DIGEST_THRESHOLD_KB = int(os.environ.get("HANDOFF_DIGEST_THRESHOLD_KB", "64"))
-HANDOFF_DIGEST_MODEL = os.environ.get("HANDOFF_DIGEST_MODEL", "sonnet").strip()
+HANDOFF_DIGEST_THRESHOLD_KB = conf(
+    "handoff.digest.threshold_kb", "HANDOFF_DIGEST_THRESHOLD_KB", 64, int)
+HANDOFF_DIGEST_MODEL = conf(
+    "handoff.digest.model", "HANDOFF_DIGEST_MODEL", "sonnet", str).strip()
 HANDOFF_DIGEST_TIMEOUT = int(os.environ.get("HANDOFF_DIGEST_TIMEOUT", "180"))
 HANDOFF_SKELETON_MAX_CHARS = int(os.environ.get("HANDOFF_SKELETON_MAX_CHARS", "200000"))
-# Prepended to the first prompt of a rotated session. Kept short on purpose: the
-# detail lives in the file, and making the agent open it is what puts the diff
-# and the chat history into the NEW session's cache rather than this prompt.
+# How many of the retired session's own remarks to carry over. They are the
+# priciest part of the handoff and the least load-bearing — running commentary
+# between tool calls, whose conclusions are already in the chat. A few keep the
+# "where was it cut off" signal; 0 drops the section entirely.
+HANDOFF_NARRATION = conf("handoff.narration", "HANDOFF_NARRATION", 6, int)
+# Wrapped around the handoff at the top of a rotated session's first prompt.
+# The content is inlined rather than pointed at: a Read tool-result lands in the
+# same context and is cached the same way, so the file bought nothing but an
+# extra round-trip — and, because the prompt also carried {chat_history}, the
+# whole chat was being delivered twice.
 HANDOFF_BLOCK = """\
 SESSION HANDOFF — the previous claude session for this task was retired because
 its context grew too expensive to carry. You are continuing the SAME task in a
-fresh session, so you start with no memory of it.
+fresh session, so you start with no memory of it. Everything known about the
+task is below; it was assembled mechanically, so read it before acting.
 
-Before doing anything else, in this order:
+After reading it, and before answering:
 
-1. Read {path} — the full task chat, what the previous session
-   did, and where its workspace is.
-2. For every repo listed there:
+1. For every repo listed below:
    `git -C <worktree>/<repo> diff origin/<base>...HEAD --stat`, then the full
    diff of the files that matter for the current request.
-3. If the task has open PRs, check the review comments:
+2. If the task has open PRs, check the review comments:
    `gh pr view <url> --comments`.
-4. Only then act on the latest message in the chat.
+3. Only then act on the latest message in the chat.
 
-Do NOT create a new branch, worktree or PR — the existing ones are named in the
-handoff and the `feature` skill will resume them. If you need a detail the
-handoff doesn't cover, grep the old transcript (its path is at the bottom of
-the file) rather than guessing.\
+Do NOT create a new branch, worktree or PR — the existing ones are named below
+and the `feature` skill will resume them. If you need a detail this doesn't
+cover, grep the old transcript (its path is at the bottom) rather than guessing.
+
+════════════════════════ HANDOFF ════════════════════════
+{body}
+═════════════════════ END OF HANDOFF ════════════════════\
 """
 
 # --- Pricing -----------------------------------------------------------------
@@ -458,7 +601,7 @@ COMMAND_ALLOWED_EMAILS = [
 # the next agent turn sees.
 COMMAND_REPLY_PREFIX = os.environ.get("COMMAND_REPLY_PREFIX", "⚙️").strip()
 # Append the cost/context block to the ack the agent posts ("Продолжаю …").
-ACK_STATS = os.environ.get("ACK_STATS", "true").lower() not in ("0", "false", "no")
+ACK_STATS = conf("chat.ack_stats", "ACK_STATS", True, bool)
 
 # --- Replying to the agent counts as mentioning it ---------------------------
 # Replying to (or forwarding) one of the agent's own messages is how a user says
@@ -519,6 +662,9 @@ class Rule:
     allowed_sender_emails: List[str]
     column_names: List[str]
     prompt_template: str
+    # Used from the second turn of a session onward, when the standing
+    # instructions are already in the agent's context. Empty = always full.
+    prompt_template_followup: str
     workdir: str
     extra_args: List[str]
     column_transition_only: bool = True
@@ -554,6 +700,23 @@ def load_rules(path: Path) -> List[Rule]:
         if not prompt_path.exists():
             log.warning("rule %s: prompt file %s missing — skipping", name, prompt_path)
             continue
+        # Optional. Without it every turn re-sends the full template, which a
+        # resumed session already has — see _build_prompt. Defaults to
+        # "<prompt>.followup.txt" beside the main one, so dropping the file in
+        # is enough; no rules.toml change needed.
+        followup = ""
+        followup_file = raw.get("prompt_file_followup")
+        followup_path = (
+            ROOT / followup_file if followup_file
+            else prompt_path.with_suffix(".followup.txt")
+        )
+        if followup_path.exists():
+            followup = followup_path.read_text(encoding="utf-8")
+        elif followup_file:
+            log.warning(
+                "rule %s: follow-up prompt %s missing — every turn will "
+                "re-send the full template", name, followup_path,
+            )
         rules.append(
             Rule(
                 name=name,
@@ -563,6 +726,7 @@ def load_rules(path: Path) -> List[Rule]:
                 allowed_sender_emails=list(raw.get("allowed_sender_emails", [])),
                 column_names=list(raw.get("column_names", [])),
                 prompt_template=prompt_path.read_text(encoding="utf-8"),
+                prompt_template_followup=followup,
                 workdir=raw.get("workdir") or CLAUDE_DEFAULT_WORKDIR,
                 extra_args=(
                     shlex.split(raw["extra_args"])
@@ -1051,10 +1215,12 @@ def resolve_rules(rules: List[Rule]) -> None:
             else:
                 log.warning("rule %s: column '%s' not found", r.name, cname)
         log.info(
-            "rule %s: enabled=%s events=%s pattern=%s senders=%d columns=%d workdir=%s session_per_chat=%s",
+            "rule %s: enabled=%s events=%s pattern=%s senders=%d columns=%d "
+            "workdir=%s session_per_chat=%s followup_prompt=%s",
             r.name, r.enabled, sorted(r.events),
             r.pattern.pattern if r.pattern else None,
-            len(r.allowed_sender_ids), len(r.column_ids), r.workdir, r.session_per_chat,
+            len(r.allowed_sender_ids), len(r.column_ids), r.workdir,
+            r.session_per_chat, bool(r.prompt_template_followup),
         )
 
 
@@ -1401,6 +1567,152 @@ def list_known_chats() -> List[str]:
     return sorted(p.stem for p in CHATS_STATE_DIR.glob("*.json"))
 
 
+# ------------------------------------------------------------- turn records
+#
+# One file per chat, alive only while that chat has a turn running. It holds
+# everything finish_turn() needs, so finishing does not depend on the process
+# that started the turn still being around: the pid to watch, where its output
+# went, the watermark to roll back if the session turns out to be gone, and the
+# instruction queued behind an interrupt. Written after the process is live —
+# a launch that never happened must not leave a record claiming a running turn.
+
+
+def _turn_path(chat_id: str) -> Path:
+    return TURNS_STATE_DIR / f"{chat_id}.json"
+
+
+def read_turn(chat_id: str) -> Dict[str, Any]:
+    p = _turn_path(chat_id)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log.exception("turn record corrupted: %s", p)
+        return {}
+
+
+def write_turn(chat_id: str, **fields: Any) -> Dict[str, Any]:
+    p = _turn_path(chat_id)
+    existing = read_turn(chat_id)
+    existing.update(fields)
+    # Always present, so a record read back on its own knows whose it is.
+    existing["chat_id"] = chat_id
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+    return dict(existing)
+
+
+def clear_turn(chat_id: str) -> None:
+    try:
+        _turn_path(chat_id).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.exception("could not remove turn record for chat %s", chat_id)
+
+
+def list_open_turns() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for p in sorted(TURNS_STATE_DIR.glob("*.json")):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            log.warning("turn record unreadable, removing: %s", p)
+            try:
+                p.unlink()
+            except OSError:
+                pass
+            continue
+        rec.setdefault("chat_id", p.stem)
+        out.append(rec)
+    return out
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    """Is this pid still around? Signal 0 asks without delivering anything.
+
+    A pid the receiver no longer owns cannot be wait()ed on, so this is the only
+    way to supervise a turn adopted after a restart.
+    """
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # alive, just not ours to signal
+    except OSError:
+        return False
+    return True
+
+
+def _read_turn_output(log_path: Optional[str]) -> str:
+    """Head + tail of a turn's output file, for the failure report.
+
+    Startup errors are printed first and the answer last; the middle is tool
+    traffic no report needs. Reading it back at the end costs one open, and
+    unlike an in-memory buffer it survives the receiver restarting.
+    """
+    if not log_path:
+        return ""
+    p = Path(log_path)
+    try:
+        size = p.stat().st_size
+        with p.open("r", encoding="utf-8", errors="replace") as f:
+            head = f.read(CLAUDE_CAPTURE_HEAD_CHARS)
+            if size <= CLAUDE_CAPTURE_HEAD_CHARS + CLAUDE_CAPTURE_TAIL_CHARS:
+                return head + f.read()
+            dropped = size - CLAUDE_CAPTURE_HEAD_CHARS - CLAUDE_CAPTURE_TAIL_CHARS
+            f.seek(max(0, size - CLAUDE_CAPTURE_TAIL_CHARS))
+            tail = f.read()
+        return f"{head}\n…[{dropped} chars omitted]…\n{tail}"
+    except OSError:
+        return ""
+
+
+def _reap_turn_logs() -> None:
+    """Keep the turn-log directory from growing without bound."""
+    try:
+        logs = sorted(TURN_LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    for stale in logs[:-TURN_LOG_KEEP] if len(logs) > TURN_LOG_KEEP else []:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def agent_replied_since(chat_id: str, since_id: Optional[int]) -> Optional[bool]:
+    """Did the agent post anything into the chat after `since_id`?
+
+    The receiver never writes the agent's answers — the agent posts them itself
+    over MCP — so this is the only way to tell "the turn ended" from "the user
+    got an answer". Returns None when the question can't be answered (no agent
+    account resolved, or the API is unreachable), so callers can stay quiet
+    rather than accuse a turn that did reply.
+    """
+    me = agent_user_id()
+    if not me:
+        return None
+    params = {"limit": "50", "offset": "0", "includeSystem": "false"}
+    if since_id is not None:
+        params["since"] = str(int(since_id) + 1)
+    qs = urllib.parse.urlencode(params)
+    # Straight to the API rather than fetch_chat_messages(): that one folds an
+    # unreachable API into an empty list, and "we couldn't ask" must not be
+    # reported to the user as "the agent said nothing".
+    data = _api_get(f"/chats/{chat_id}/messages?{qs}")
+    if data is None:
+        return None
+    return any(
+        m.get("fromUserId") == me for m in (data.get("content") or [])
+    )
+
+
 def _migrate_legacy_state() -> None:
     """One-time migration from the old monolithic state/sessions.json layout."""
     legacy = STATE_DIR / "sessions.json"
@@ -1649,9 +1961,14 @@ def fetch_chat_messages(
     """Fetch up to `limit` messages, paginating if needed. Returns the LATEST
     `limit` messages (oldest first). `since` is exclusive — only messages with
     id strictly greater than `since` are returned.
+
+    `limit <= 0` means "everything after `since`, uncapped" — the caller then
+    decides what to do with an oversized batch. That matters for the delta
+    fetch: silently keeping the newest N and advancing the watermark past the
+    rest would drop messages the agent never saw.
     """
     PAGE = 1000  # YouGile API max
-    page_limit = min(PAGE, max(1, limit))
+    page_limit = PAGE if limit <= 0 else min(PAGE, limit)
     collected: List[dict] = []
     offset = 0
     while True:
@@ -1677,9 +1994,36 @@ def fetch_chat_messages(
         if offset > 100_000:  # hard safety cap
             break
     collected.sort(key=lambda m: m.get("id") or 0)
-    if limit and len(collected) > limit:
+    if limit > 0 and len(collected) > limit:
         collected = collected[-limit:]
     return collected
+
+
+def merge_trigger_message(
+    messages: List[dict], payload: Any, since: Optional[int]
+) -> List[dict]:
+    """Make sure the message that fired this turn is in the batch.
+
+    The webhook routinely beats /chats/<id>/messages to the punch, so the very
+    message we are reacting to can be missing from the fetch. If it is, its id
+    never enters the watermark and the next turn serves it again — which is
+    exactly how a chat ends up re-reading messages it has already answered.
+    """
+    inner = payload.get("payload") if isinstance(payload, dict) else None
+    if not isinstance(inner, dict):
+        return messages
+    mid = inner.get("id")
+    if not mid:
+        return messages
+    if since is not None and int(mid) <= int(since):
+        return messages  # already delivered by an earlier turn
+    if any(m.get("id") == mid for m in messages):
+        return messages
+    trigger = dict(inner)
+    trigger.setdefault("fromUserId", payload.get("fromUserId"))
+    merged = messages + [trigger]
+    merged.sort(key=lambda m: m.get("id") or 0)
+    return merged
 
 
 def _format_sender(user_id: Optional[str]) -> str:
@@ -1692,16 +2036,25 @@ def _format_sender(user_id: Optional[str]) -> str:
 
 
 def render_chat_history(
-    messages: List[dict], chat_id: Optional[str] = None
+    messages: List[dict], chat_id: Optional[str] = None,
+    exclude_agent: bool = False,
 ) -> Tuple[str, List[Path]]:
     """Render messages as text. Downloads any `/root/#file:<url>` attachments
     to state/attachments/<chatId>/ and rewrites them inline as
     `[image: <abs-path>]` / `[file: <abs-path>]`. Returns (rendered_text,
     sorted list of unique local attachment paths referenced anywhere in the
     rendered history).
+
+    `exclude_agent` drops the agent's own posts. Set it when the session being
+    resumed already holds them: it wrote those replies itself a few minutes ago
+    and they are still in its context, so feeding them back re-reads its own
+    words at full price — in practice 90%+ of a follow-up's history block. The
+    first turn of a session is the opposite case: there the agent has no memory
+    and its past replies are the only record of what it already answered.
     """
     if not messages:
         return "(no prior messages)", []
+    me = agent_user_id() if exclude_agent else None
     lines: List[str] = []
     all_paths: List[Path] = []
     seen_paths: Set[str] = set()
@@ -1709,6 +2062,8 @@ def render_chat_history(
         # Slash commands and our own replies to them are plumbing, not
         # conversation — keep them out of the agent's context.
         if _is_command_noise(m.get("text") or ""):
+            continue
+        if me and m.get("fromUserId") == me:
             continue
         ts_ms = m.get("id") or 0
         try:
@@ -1731,6 +2086,10 @@ def render_chat_history(
                 all_paths.append(p)
         text = text.replace("\n", " ")
         lines.append(f"[{ts}] {sender}: {text}")
+    if not lines:
+        # Everything in the batch was ours or was plumbing. Say so rather than
+        # handing the agent an empty block it has to interpret.
+        return "(no new messages)", all_paths
     return "\n".join(lines), all_paths
 
 
@@ -2005,10 +2364,15 @@ def _extract_skeleton(path: Path, max_chars: int = HANDOFF_SKELETON_MAX_CHARS) -
     parts: List[str] = []
     if compacts:
         parts.append("### Auto-compaction summaries\n\n" + "\n\n".join(compacts[-2:]))
-    if assists:
+    # The running commentary between tool calls ("let me check X", "false
+    # positive — …") is process, not state: it is the most expensive section of
+    # the handoff and the least useful, because the conclusions it reaches are
+    # already in the chat in cleaned-up form. Off by default; the last few lines
+    # are worth keeping only to show where the session was cut off.
+    if assists and HANDOFF_NARRATION > 0:
         parts.append(
             "### What the previous session said, most recent last\n\n"
-            + "\n\n".join(f"- {x}" for x in _clip(assists, 40, 2000)))
+            + "\n\n".join(f"- {x}" for x in _clip(assists, HANDOFF_NARRATION, 2000)))
     if todos:
         parts.append("### Final todo state\n\n```\n" + todos + "\n```")
     if edited:
@@ -2428,6 +2792,27 @@ Old session id: `{old_session_id}` (openable locally with `claude --resume {old_
     except Exception:
         log.exception("failed to build handoff for chat %s", chat_id)
         return None
+
+
+def handoff_text(path: Optional[Path]) -> str:
+    """The handoff, wrapped in its instructions, ready to go into the prompt.
+
+    The file stays on disk as the artefact to inspect after the fact; what the
+    agent gets is its contents, because a file it has to open is the same tokens
+    plus a round-trip.
+    """
+    if not path:
+        return ""
+    try:
+        body = path.read_text(encoding="utf-8")
+    except OSError:
+        log.exception("handoff unreadable: %s", path)
+        return (
+            "SESSION HANDOFF — the previous session for this task was retired, "
+            "but its handoff file could not be read. Reconstruct the state from "
+            "the task chat and the workspace before acting."
+        )
+    return HANDOFF_BLOCK.format(body=body)
 
 
 def maybe_digest(path: Optional[Path], rule: "Rule") -> None:
@@ -2930,6 +3315,9 @@ async def _start_background_tasks() -> None:
             "watchdog: armed (timeout=%ds, check=%ds)",
             LOOP_WATCHDOG_TIMEOUT_SECONDS, LOOP_WATCHDOG_CHECK_SECONDS,
         )
+    # Turns outlive this process, so a fresh one starts by finding out what the
+    # last one left behind. Off the event loop: it talks to the YouGile API.
+    threading.Thread(target=reconcile_open_turns, daemon=True).start()
 
 
 _active_lock = threading.Lock()
@@ -3000,9 +3388,17 @@ def _interrupt_chat(chat_id: str) -> bool:
     transient-error retry path for an intentional kill."""
     with _active_lock:
         proc = _chat_procs.get(chat_id)
-        if proc is None:
+        pid = proc.pid if proc is not None else None
+        if pid is None:
+            # A turn adopted after a restart is not our child and has no Popen
+            # here — its pid is in the record, and killpg works on it all the
+            # same. Without this an inherited turn could never be redirected.
+            rec = read_turn(chat_id)
+            candidate = rec.get("pid")
+            if _pid_alive(candidate):
+                pid = candidate
+        if pid is None:
             return False
-        pid = proc.pid
         _interrupted_pids.add(pid)
     threading.Thread(target=_terminate_proc_group, args=(pid,), daemon=True).start()
     return True
@@ -3150,6 +3546,8 @@ def _mark_turn_finished(chat_id: Optional[str], task_id: Optional[str]) -> None:
     Skipped while another turn is already queued for this chat (an interrupt, or
     a follow-up that landed mid-turn): the agent isn't actually done, so the card
     keeps saying "working" instead of blinking "read me" and back a second later.
+    Whoever skips it owes the flip to the turn that follows — see _release_chat,
+    which flips it when the queued turn fails to start.
     """
     if chat_id:
         with _active_lock:
@@ -3158,7 +3556,11 @@ def _mark_turn_finished(chat_id: Optional[str], task_id: Optional[str]) -> None:
     set_task_marker(task_id, MARKER_ANSWERED)
 
 
-def _release_chat(chat_id: Optional[str], chat_lock: Optional[threading.Lock]) -> None:
+def _release_chat(
+    chat_id: Optional[str],
+    chat_lock: Optional[threading.Lock],
+    task_id: Optional[str] = None,
+) -> None:
     """Release a chat's turn lock, then run any turn queued while it was busy.
 
     Single exit point for every turn (normal completion, spawn failure, or
@@ -3167,7 +3569,10 @@ def _release_chat(chat_id: Optional[str], chat_lock: Optional[threading.Lock]) -
     which is why interrupting never blocks the webhook handler.
     """
     if chat_lock is not None:
-        chat_lock.release()
+        try:
+            chat_lock.release()
+        except RuntimeError:
+            pass  # already released — finishing twice must not raise
     if not chat_id:
         return
     with _active_lock:
@@ -3176,8 +3581,99 @@ def _release_chat(chat_id: Optional[str], chat_lock: Optional[threading.Lock]) -
         return
     p_rule, p_payload = pending
     ok, why = spawn_claude(p_rule, p_payload, interrupted=True)
-    if not ok and why == "global-max-concurrent":
+    if ok:
+        return
+    # The queued turn is the reason _mark_turn_finished left the card on
+    # "working". It never started, so nothing else will ever clear it.
+    set_task_marker(task_id, MARKER_ANSWERED)
+    if why == "global-max-concurrent":
         _post_capacity_message(chat_id)
+
+
+def finish_turn(
+    rec: Dict[str, Any],
+    rc: int,
+    failure: Optional[str],
+    *,
+    adopted_dead: bool = False,
+) -> None:
+    """Everything the receiver owes a turn once its process is gone.
+
+    Takes the turn's on-disk record rather than a closure, so it works both for
+    a turn this process started and for one it inherited from a process that no
+    longer exists. Nothing here depends on in-memory state that a restart would
+    take with it: the usage figures come from claude's transcript, the watermark
+    and the queued instruction from the record, the rest from the API.
+    """
+    chat_id = rec.get("chat_id")
+    task_id = rec.get("task_id")
+    session_id = rec.get("session_id")
+    rule = next((r for r in RULES if r.name == rec.get("rule")), None)
+    session_lost = bool(failure and SESSION_LOST_PATTERN.search(failure))
+    recovering = (
+        session_lost and bool(chat_id) and bool(rule)
+        and rec.get("allow_session_recovery", True)
+    )
+    try:
+        if chat_id and session_lost:
+            # The prompt never reached a session, so those messages were not
+            # delivered after all — put the watermark back or they are lost.
+            prev = rec.get("prev_watermark")
+            update_chat_state(chat_id, last_message_id=prev)
+            log.warning(
+                "chat %s: session was gone — watermark rolled back to %s",
+                chat_id, prev,
+            )
+        if chat_id and session_id and rule:
+            _record_turn_metrics(chat_id, session_id, rule, rec.get("idle_before"))
+        # A queued instruction survives a restart only if it was written down.
+        pending = rec.get("pending")
+        if chat_id and pending and rule is not None:
+            p_rule = next(
+                (r for r in RULES if r.name == pending.get("rule")), None)
+            if p_rule is not None:
+                with _active_lock:
+                    _pending_turns.setdefault(
+                        chat_id, (p_rule, pending.get("payload")))
+        _mark_turn_finished(chat_id, task_id)
+        if failure:
+            _report_dead_turn(chat_id, rc, failure, session_lost, recovering)
+        elif chat_id and TURN_REPORT_SILENT and not rec.get("killed"):
+            with _active_lock:
+                queued = chat_id in _pending_turns
+            if not queued:
+                _report_silent_turn(chat_id, rec, adopted_dead)
+    except Exception:
+        log.exception("chat %s: finishing turn failed", chat_id)
+    finally:
+        if chat_id:
+            clear_turn(chat_id)
+        lock = _get_chat_lock(chat_id) if chat_id else None
+        _release_chat(chat_id, lock, task_id)
+    if recovering and chat_id and rule is not None:
+        _recover_lost_session(chat_id, rule, rec.get("payload"))
+
+
+def _report_silent_turn(
+    chat_id: str, rec: Dict[str, Any], adopted_dead: bool
+) -> None:
+    """Say something when a turn ended cleanly but the agent never spoke.
+
+    The receiver does not write the agent's answers — the agent posts them over
+    MCP — so "the process exited" and "the user got a reply" are different
+    facts. When they disagree the chat otherwise shows a 👍 and then silence
+    forever, which is indistinguishable from a turn still running.
+    """
+    replied = agent_replied_since(chat_id, rec.get("prev_watermark"))
+    if replied is not False:
+        return  # it answered, or we couldn't ask — either way, stay quiet
+    log.warning("chat %s: turn ended without the agent posting anything", chat_id)
+    _post_turn_failure(
+        chat_id,
+        msg("turn_failure.silent_restart" if adopted_dead
+            else "turn_failure.silent"),
+        footer=msg("turn_failure.silent_footer", mention=AGENT_MENTION),
+    )
 
 
 def _build_prompt(
@@ -3190,23 +3686,51 @@ def _build_prompt(
     interrupted: bool = False,
     handoff_path: Optional[Path] = None,
     session_stats: str = "",
+    dropped: int = 0,
 ) -> str:
-    event_json = json.dumps(payload, ensure_ascii=False, indent=2)
-    rendered = rule.prompt_template
-    rendered = rendered.replace("{event_json}", event_json)
+    """Render the prompt for one turn.
+
+    A resumed session is already holding the standing instructions from its
+    first turn, so re-sending them costs a full re-read of text the agent has
+    not forgotten — and, being appended at the end, they compete for attention
+    with the actual request. When the rule ships a follow-up template we use it;
+    it carries the new messages, the stats block and a short reminder, and
+    nothing else.
+    """
+    using_followup = bool(not is_first_turn and rule.prompt_template_followup)
+    template = rule.prompt_template_followup if using_followup else rule.prompt_template
+    rendered = template
     rendered = rendered.replace("{chat_history}", chat_history_text)
     rendered = rendered.replace("{first_turn}", "true" if is_first_turn else "false")
     rendered = rendered.replace("{formatting}", FORMATTING_BLOCK)
     rendered = rendered.replace("{language}", rule.language or "")
     rendered = rendered.replace("{session_id}", session_id or "")
     rendered = rendered.replace("{session_stats}", session_stats)
-    rendered = rendered.replace("{handoff}", HANDOFF_BLOCK.format(path=handoff_path)
-                                if handoff_path else "")
+    chat_id = extract_chat_id(payload) or ""
+    rendered = rendered.replace("{chat_id}", chat_id)
+    # {event_json} used to interpolate the raw webhook event: ~340 tokens of
+    # which half was `prevData`, a byte-for-byte copy of `payload`, wrapped
+    # around a message that is already the last line of {chat_history}. Kept as
+    # a placeholder so templates written against it keep working, but it now
+    # renders the two facts that were ever read out of it.
+    if "{event_json}" in rendered:
+        inner = payload.get("payload") if isinstance(payload, dict) else None
+        text = (inner or {}).get("text") or ""
+        sender = _format_sender(
+            payload.get("fromUserId") if isinstance(payload, dict) else None)
+        rendered = rendered.replace(
+            "{event_json}",
+            f"  chat/task id : {chat_id}\n"
+            f"  from         : {sender}\n"
+            f"  text         : {text}",
+        )
+    rendered = rendered.replace(
+        "{handoff}", handoff_text(handoff_path) if handoff_path else "")
     # A handoff must never be silently dropped just because the template
-    # predates it — append the pointer if the placeholder isn't there.
-    if handoff_path and "{handoff}" not in rule.prompt_template:
-        rendered = f"{HANDOFF_BLOCK.format(path=handoff_path)}\n\n---\n{rendered}"
-    if session_stats and "{session_stats}" not in rule.prompt_template:
+    # predates it — append it if the placeholder isn't there.
+    if handoff_path and "{handoff}" not in template:
+        rendered = f"{handoff_text(handoff_path)}\n\n---\n{rendered}"
+    if session_stats and "{session_stats}" not in template:
         rendered = (
             f"{rendered}\n\n---\nWhen you post your ack message into the chat, "
             f"end it with this block, copied VERBATIM (do not recompute or "
@@ -3214,15 +3738,27 @@ def _build_prompt(
         )
     # If the template doesn't reference {formatting} explicitly, append it so
     # every spawned agent still sees the rules — guarantees consistent output.
-    if "{formatting}" not in rule.prompt_template and FORMATTING_BLOCK:
+    # Not for a follow-up: the session was given the rules on its first turn and
+    # its template says what to repeat, so appending the full block here would
+    # undo the whole point of having a shorter one.
+    if not using_followup and "{formatting}" not in template and FORMATTING_BLOCK:
         rendered = f"{rendered}\n\n---\n{FORMATTING_BLOCK}\n"
     # If template uses no placeholder for history, append it so the agent still sees it.
-    if "{chat_history}" not in rule.prompt_template and chat_history_text:
+    if "{chat_history}" not in template and chat_history_text:
         rendered = (
             f"{rendered}\n\n"
             f"---\nRecent messages in this task chat "
             f"({'first turn — full history' if is_first_turn else 'new since your last reply'}):\n"
             f"{chat_history_text}\n"
+        )
+    # Never let a trimmed batch look like the whole story: the watermark has
+    # already stepped over these, so nothing will bring them back.
+    if dropped:
+        rendered = (
+            f"{rendered}\n\n"
+            f"---\nNOTE: {dropped} older message(s) from this chat are not shown "
+            f"above (the batch was larger than this turn carries). If you need "
+            f"them, read the chat with `mcp__yougile-mcp__get_task_messages`.\n"
         )
     if attachment_paths:
         listed = "\n".join(f"- {_render_attachment_marker(p)}" for p in attachment_paths)
@@ -3236,74 +3772,63 @@ def _build_prompt(
     return rendered
 
 
-class _OutputCapture:
-    """Bounded head+tail window over a stream, for one turn's claude output.
-
-    Startup errors ("No conversation found …") arrive first and the answer
-    arrives last, so both ends are worth keeping; the middle — tool calls,
-    thinking, file dumps — is what would blow the buffer up, and is the part no
-    report needs. Written by the pump thread, read by the reaper after it joins.
-    """
-
-    def __init__(self) -> None:
-        self._head: List[str] = []
-        self._head_len = 0
-        self._tail: List[str] = []
-        self._tail_len = 0
-        self._dropped = 0
-
-    def add(self, chunk: str) -> None:
-        if self._head_len < CLAUDE_CAPTURE_HEAD_CHARS:
-            room = CLAUDE_CAPTURE_HEAD_CHARS - self._head_len
-            self._head.append(chunk[:room])
-            self._head_len += min(room, len(chunk))
-            chunk = chunk[room:]
-            if not chunk:
-                return
-        self._tail.append(chunk)
-        self._tail_len += len(chunk)
-        while self._tail_len - len(self._tail[0]) >= CLAUDE_CAPTURE_TAIL_CHARS:
-            gone = self._tail.pop(0)
-            self._tail_len -= len(gone)
-            self._dropped += len(gone)
-
-    def text(self) -> str:
-        head = "".join(self._head)
-        tail = "".join(self._tail)
-        if self._dropped:
-            return f"{head}\n…[{self._dropped} chars omitted]…\n{tail}"
-        return head + tail
-
-
 def _spawn_subprocess(
     rule: Rule,
     cmd: List[str],
     header: str,
     on_exit,
     chat_id: Optional[str] = None,
+    turn_log: Optional[Path] = None,
     attempt: int = 1,
 ) -> Optional[subprocess.Popen]:
-    log_fp = CLAUDE_LOG.open("a", encoding="utf-8")
-    if attempt == 1:
-        log_fp.write(header)
-    else:
-        log_fp.write(
-            f"\n--- retry attempt {attempt}/{CLAUDE_API_RETRIES} "
-            f"ts={datetime.now(timezone.utc).isoformat()} ---\n"
-        )
-    log_fp.flush()
+    """Start a turn and arrange for `on_exit(rc, failure)` when it ends.
+
+    claude's output goes to `turn_log`, not to a pipe. A pipe couples the turn
+    to this process: when the receiver goes away the reader goes with it, and
+    claude then either blocks on a full buffer or dies writing to a closed one —
+    mid-turn, with nothing posted to the chat. A file has no reader to lose, so
+    an orphaned turn finishes its work and posts its own reply; all this process
+    loses is the bookkeeping, which the turn record lets a restart pick up.
+    """
+    turn_log = turn_log or (TURN_LOG_DIR / f"{chat_id or rule.name}.log")
+    try:
+        out_fp = turn_log.open("a", encoding="utf-8")
+    except OSError:
+        log.exception("rule %s: cannot open turn log %s", rule.name, turn_log)
+        return None
+    # The prompt stays in the shared log — that is the file worth grepping when
+    # asking "what exactly did we send it?" — while the output goes to the
+    # turn's own file, so one chat's answer can never be quoted into another's.
+    try:
+        with CLAUDE_LOG.open("a", encoding="utf-8") as shared:
+            if attempt == 1:
+                shared.write(header)
+            else:
+                shared.write(
+                    f"\n--- retry attempt {attempt}/{CLAUDE_API_RETRIES} "
+                    f"ts={datetime.now(timezone.utc).isoformat()} ---\n"
+                )
+            shared.write(f"--- output -> {turn_log} ---\n")
+    except OSError:
+        log.exception("rule %s: cannot write %s", rule.name, CLAUDE_LOG)
+
+    out_fp.write(
+        f"\n=== {datetime.now(timezone.utc).isoformat()} | rule={rule.name} "
+        f"| chat={chat_id} | attempt={attempt} | start ===\n"
+    )
+    out_fp.flush()
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=rule.workdir,
-            stdout=subprocess.PIPE,
+            stdout=out_fp,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
     except Exception as exc:
         log.exception("rule %s: failed to spawn claude (attempt %d)", rule.name, attempt)
-        log_fp.close()
+        out_fp.close()
         # On first-attempt spawn failure the caller cleans up (chat_lock etc.).
         # On retry there is no caller waiting — make sure on_exit still fires.
         if attempt > 1:
@@ -3314,6 +3839,8 @@ def _spawn_subprocess(
         return None
 
     pid = proc.pid
+    # The child holds its own duplicate of the fd; ours has done its job.
+    out_fp.close()
     with _active_lock:
         _active_procs.add(pid)
         if chat_id:
@@ -3323,61 +3850,23 @@ def _spawn_subprocess(
         rule.name, pid, attempt, cmd[:3] + ["..."],
     )
 
-    # claude's output is teed: streamed into the shared claude.log for live
-    # tailing, and kept in a bounded per-turn buffer. The buffer — not a slice of
-    # the log — is what the retry decision and the failure report read: several
-    # turns append to claude.log at once, so a byte range in it can hold another
-    # chat's answer, and quoting that back would leak it into the wrong chat.
-    captured = _OutputCapture()
-
-    def _pump() -> None:
-        complained = False
-        while True:
-            try:
-                raw = proc.stdout.read1(4096)  # type: ignore[union-attr]
-            except (ValueError, OSError):
-                break  # pipe gone — nothing left to drain
-            if not raw:
-                break
-            chunk = raw.decode("utf-8", errors="replace")
-            # Draining is the one thing this loop MUST keep doing: claude blocks
-            # on a full pipe, so a hiccup in the bookkeeping (a closed log file
-            # after _reap, anything else) can never be allowed to end it.
-            try:
-                captured.add(chunk)
-                log_fp.write(chunk)
-                log_fp.flush()
-            except Exception:
-                if not complained:
-                    complained = True
-                    log.exception("rule %s: output pump degraded (pid=%s)", rule.name, pid)
-        try:
-            proc.stdout.close()  # type: ignore[union-attr]
-        except Exception:
-            pass
-
-    pump = threading.Thread(target=_pump, daemon=True)
-    pump.start()
-
     def _reap():
         rc = proc.wait()
-        # Drain what claude wrote before it exited. Bounded: a grandchild that
-        # inherited stdout (a lingering MCP server) can hold the pipe open long
-        # after claude is gone, and the turn must not hang on it.
-        pump.join(timeout=CLAUDE_PUMP_DRAIN_SECONDS)
         with _active_lock:
             _active_procs.discard(pid)
             was_interrupted = pid in _interrupted_pids
             _interrupted_pids.discard(pid)
             if chat_id and _chat_procs.get(chat_id) is proc:
                 del _chat_procs[chat_id]
-        log_fp.write(
-            f"\n--- exit rc={rc} attempt={attempt} "
-            f"ts={datetime.now(timezone.utc).isoformat()} ---\n"
-        )
-        log_fp.flush()
-        log_fp.close()
-        output = captured.text()
+        try:
+            with turn_log.open("a", encoding="utf-8") as fp:
+                fp.write(
+                    f"\n--- exit rc={rc} attempt={attempt} "
+                    f"ts={datetime.now(timezone.utc).isoformat()} ---\n"
+                )
+        except OSError:
+            pass
+        output = _read_turn_output(str(turn_log))
         log.info("rule %s: claude pid=%s attempt=%d rc=%s", rule.name, pid, attempt, rc)
 
         if (not was_interrupted and rc != 0 and attempt < CLAUDE_API_RETRIES
@@ -3390,13 +3879,20 @@ def _spawn_subprocess(
 
             def _delayed_retry():
                 time.sleep(delay)
-                _spawn_subprocess(rule, cmd, header, on_exit, chat_id=chat_id, attempt=attempt + 1)
+                p = _spawn_subprocess(rule, cmd, header, on_exit, chat_id=chat_id,
+                                      turn_log=turn_log, attempt=attempt + 1)
+                if p is not None and chat_id:
+                    write_turn(chat_id, pid=p.pid, attempt=attempt + 1)
 
             threading.Thread(target=_delayed_retry, daemon=True).start()
             return
 
         # An interrupt is our own doing and a fresh turn is already chained
-        # behind it — that is not a failure worth telling the chat about.
+        # behind it — that is not a failure worth telling the chat about, and
+        # the replacement turn is the one that will answer. Recorded rather
+        # than passed, so a restart mid-interrupt reads the same fact.
+        if was_interrupted and chat_id:
+            write_turn(chat_id, killed=True)
         failure = None if (rc == 0 or was_interrupted) else _failure_reason(rc, output)
         try:
             on_exit(rc, failure)
@@ -3405,6 +3901,82 @@ def _spawn_subprocess(
 
     threading.Thread(target=_reap, daemon=True).start()
     return proc
+
+
+def _supervise_adopted(rec: Dict[str, Any]) -> None:
+    """Watch a turn this process did not start, then finish it.
+
+    After a restart the running claude is no longer our child, so there is
+    nothing to wait() on — poll the pid instead. Cheap: one signal-0 every few
+    seconds for as long as the turn runs.
+    """
+    chat_id = rec.get("chat_id")
+    pid = rec.get("pid")
+
+    def _watch() -> None:
+        while _pid_alive(pid):
+            time.sleep(TURN_ADOPT_POLL_SECONDS)
+        log.info("chat %s: adopted turn pid=%s has exited", chat_id, pid)
+        with _active_lock:
+            was_interrupted = pid in _interrupted_pids
+            _interrupted_pids.discard(pid)
+        if was_interrupted and chat_id:
+            write_turn(chat_id, killed=True)
+        current = read_turn(chat_id) or rec
+        if was_interrupted:
+            finish_turn(current, 0, None)
+            return
+        output = _read_turn_output(current.get("log_path"))
+        # rc is unknowable for a process we never owned. Treat a turn that left
+        # a recognisable error in its log as failed and everything else as a
+        # clean finish — finish_turn's silent-turn check catches the rest.
+        failure = None
+        for pattern in (SESSION_LOST_PATTERN, CLAUDE_FATAL_PATTERN):
+            if pattern.search(output):
+                failure = _failure_reason(-1, output)
+                break
+        finish_turn(current, -1 if failure else 0, failure)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
+def reconcile_open_turns() -> None:
+    """Pick up turns left running or unfinished by a previous process.
+
+    Runs once at startup. A turn whose process is still alive is re-supervised
+    and its chat marked busy again — without this the receiver believes the chat
+    is idle and will happily --resume a session another process is holding. A
+    turn whose process is gone is finished right here: watermark, metrics, card,
+    queued instruction, and a word to the chat if the agent never got one out.
+    """
+    records = list_open_turns()
+    if not records:
+        return
+    live = dead = 0
+    for rec in records:
+        chat_id = rec.get("chat_id")
+        if not chat_id:
+            continue
+        if _pid_alive(rec.get("pid")):
+            live += 1
+            _get_chat_lock(chat_id).acquire(blocking=False)  # re-arm "busy"
+            log.info(
+                "chat %s: adopting turn pid=%s started %s",
+                chat_id, rec.get("pid"), rec.get("started_at"),
+            )
+            set_task_marker(rec.get("task_id"), MARKER_WORKING)
+            _supervise_adopted(rec)
+        else:
+            dead += 1
+            log.warning(
+                "chat %s: turn pid=%s died unsupervised — finishing it now",
+                chat_id, rec.get("pid"),
+            )
+            output = _read_turn_output(rec.get("log_path"))
+            failure = _failure_reason(-1, output) if output else None
+            finish_turn(rec, -1, failure, adopted_dead=True)
+    log.info("reconcile: %d turn(s) adopted, %d finished after the fact", live, dead)
+
 
 
 def _failure_reason(rc: int, output: str) -> str:
@@ -3461,6 +4033,10 @@ def spawn_claude(
         # same session so the agent sees the new instruction and can redirect.
         with _active_lock:
             _pending_turns[chat_id] = (rule, payload)
+        # Also on disk: a receiver restart between the kill and the replacement
+        # would otherwise drop the instruction the user is waiting on.
+        if read_turn(chat_id):
+            write_turn(chat_id, pending={"rule": rule.name, "payload": payload})
         if _interrupt_chat(chat_id):
             log.info("rule %s: chat %s busy — interrupting current turn for new instruction",
                      rule.name, chat_id)
@@ -3564,6 +4140,7 @@ def spawn_claude(
                     limit=(HANDOFF_INLINE_MESSAGES if handoff_path
                            else CHAT_HISTORY_FIRST_TIME_LIMIT),
                 )
+                dropped = 0
                 session_flag = ["--session-id", session_id]
                 # Mark the session as live BEFORE spawn so a crash mid-launch
                 # doesn't make us double-fire --session-id on retry.
@@ -3577,12 +4154,23 @@ def spawn_claude(
                 )
             else:
                 is_first_turn = False
-                history = fetch_chat_messages(
-                    chat_id,
-                    since=last_msg_id,
-                    limit=CHAT_HISTORY_DELTA_LIMIT,
-                )
+                # Uncapped, so an oversized batch can be reported rather than
+                # silently trimmed: the watermark moves past everything fetched,
+                # so anything dropped here is dropped for good.
+                history = fetch_chat_messages(chat_id, since=last_msg_id, limit=0)
+                dropped = max(0, len(history) - CHAT_HISTORY_DELTA_LIMIT)
+                if dropped:
+                    history = history[-CHAT_HISTORY_DELTA_LIMIT:]
+                    log.warning(
+                        "chat %s: %d message(s) older than the last %d are being "
+                        "skipped in this turn's prompt", chat_id, dropped,
+                        CHAT_HISTORY_DELTA_LIMIT,
+                    )
                 session_flag = ["--resume", session_id]
+
+            # The webhook can outrun the messages API, so the very message that
+            # fired this turn may be missing from the fetch above.
+            history = merge_trigger_message(history, payload, last_msg_id)
 
             # Stats are opt-out; a session change is not. If ACK_STATS is off,
             # the note still has to reach the chat — the user needs to know the
@@ -3590,7 +4178,22 @@ def spawn_claude(
             session_stats = (
                 render_session_stats(facts, chat_state, note=session_note)
                 if ACK_STATS else session_note)
-            history_text, attachment_paths = render_chat_history(history, chat_id)
+            # A resumed session wrote its own replies minutes ago and still has
+            # them; only the first turn of a session needs them read back.
+            history_text, attachment_paths = render_chat_history(
+                history, chat_id, exclude_agent=not is_first_turn)
+            if handoff_path:
+                # The handoff already carries the whole chat verbatim. Sending
+                # it again here is how the same 16 KB used to arrive twice in
+                # one prompt.
+                history_text = (
+                    "(the full chat is in the handoff above — only the newest "
+                    "message is repeated here)\n"
+                    + history_text.rsplit("\n", 1)[-1]
+                )
+            # Over EVERYTHING fetched, not just what was rendered: our own posts
+            # and slash commands are filtered out of the prompt but must still
+            # be stepped over, or every later turn re-fetches them forever.
             newest_msg_id = max(
                 [int(m["id"]) for m in history if m.get("id")] + [last_msg_id or 0]
             )
@@ -3599,15 +4202,14 @@ def spawn_claude(
             history_text = ""
             is_first_turn = True
             newest_msg_id = None
+            dropped = 0
             session_flag = []
             handoff_path = None
             session_stats = ""
             attachment_paths = []
 
-        # Webhook can race ahead of /chats/<id>/messages — if the trigger
-        # message itself carries attachments we haven't seen in history yet,
-        # pull them in so the agent doesn't miss the very file that prompted
-        # this run.
+        # Attachments on the trigger message itself, in case it arrived too
+        # early to be in the history fetch above.
         trigger_message = payload.get("payload") if isinstance(payload, dict) else None
         trigger_urls = download_message_attachments(trigger_message, chat_id)
         seen_paths = {str(p) for p in attachment_paths}
@@ -3620,6 +4222,7 @@ def spawn_claude(
             rule, payload, history_text, is_first_turn, attachment_paths,
             session_id=session_id, interrupted=interrupted,
             handoff_path=handoff_path, session_stats=session_stats,
+            dropped=dropped,
         )
         cmd = [CLAUDE_BIN, *rule.extra_args, *session_flag, "-p", prompt]
 
@@ -3628,41 +4231,68 @@ def spawn_claude(
             f"\n\n=== {ts} | rule={rule.name} | chat={chat_id} | session={session_id} "
             f"| first_turn={is_first_turn} | spawn ===\n"
             f"cwd: {rule.workdir}\nbin: {CLAUDE_BIN}\nargs: {rule.extra_args + session_flag}\n"
-            f"--- prompt ---\n{prompt}\n--- output ---\n"
+            f"--- prompt ---\n{prompt}\n"
         )
 
         # How long the chat had been idle when this turn started — the input to
         # the cache-survival statistic, recorded once the turn's usage lands.
         idle_before = facts.get("idle_min") if chat_id else None
+        turn_log = TURN_LOG_DIR / (
+            f"{(chat_id or rule.name)}-{ts.replace(':', '').replace('-', '')[:15]}.log"
+        )
 
         def on_exit(rc: int, failure: Optional[str] = None) -> None:
             # `failure` is claude's own last word, or None when the turn ended
             # normally / we killed it ourselves to run a newer instruction.
-            session_lost = bool(failure and SESSION_LOST_PATTERN.search(failure))
-            recovering = session_lost and bool(chat_id) and allow_session_recovery
-            try:
-                if chat_id and newest_msg_id:
-                    update_chat_state(chat_id, last_message_id=newest_msg_id)
-                if chat_id and session_id:
-                    _record_turn_metrics(chat_id, session_id, rule, idle_before)
-                _mark_turn_finished(chat_id, task_id)
-                if failure:
-                    _report_dead_turn(chat_id, rc, failure, session_lost, recovering)
-            finally:
-                _release_chat(chat_id, chat_lock)
-            if recovering and chat_id:
-                _recover_lost_session(chat_id, rule, payload)
+            # Everything else lives in the turn record, so a restart can finish
+            # this same turn without any of the state captured here.
+            rec = (read_turn(chat_id) if chat_id else {}) or {
+                "chat_id": chat_id, "task_id": task_id, "session_id": session_id,
+                "rule": rule.name, "idle_before": idle_before,
+            }
+            finish_turn(rec, rc, failure)
 
-        proc = _spawn_subprocess(rule, cmd, header, on_exit, chat_id=chat_id)
+        _reap_turn_logs()
+        proc = _spawn_subprocess(
+            rule, cmd, header, on_exit, chat_id=chat_id, turn_log=turn_log)
         if proc is None:
-            _release_chat(chat_id, chat_lock)
+            _release_chat(chat_id, chat_lock, task_id)
             return False, "spawn-failed"
 
+        if chat_id:
+            # The process is live, so `claude -p` has the prompt and has written
+            # those messages into the session transcript — they are delivered
+            # even if the turn dies next second, because --resume will find them
+            # there. That is what makes it safe to advance the watermark now
+            # instead of at exit: waiting until exit is how a turn that never
+            # gets to exit (a restart, a kill) makes the next one re-serve
+            # messages the agent has already answered.
+            write_turn(
+                chat_id,
+                task_id=task_id,
+                session_id=session_id,
+                rule=rule.name,
+                pid=proc.pid,
+                attempt=1,
+                started_at=ts,
+                log_path=str(turn_log),
+                prev_watermark=last_msg_id,
+                watermark=newest_msg_id,
+                idle_before=idle_before,
+                interrupted=interrupted,
+                allow_session_recovery=allow_session_recovery,
+                payload=payload,
+                pending=None,
+            )
+            if newest_msg_id:
+                update_chat_state(chat_id, last_message_id=newest_msg_id)
+
         # The turn is live — mark the card "working" so the board shows the
-        # agent is on it and the user knows to wait. on_exit flips it to
+        # agent is on it and the user knows to wait. finish_turn flips it to
         # "answered". Deliberately after the spawn: a launch that never happened
         # must not leave the card claiming a running agent.
         set_task_marker(task_id, MARKER_WORKING)
+
 
         # Fast ack — let the user see "I'm on it" without waiting for claude
         # to finish. Only fire AFTER claude was actually spawned, so a failed

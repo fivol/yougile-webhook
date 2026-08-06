@@ -183,3 +183,9 @@ replay_failed = "Не смог перезапустить ход в новой �
 replay_failed_footer = "Упомяни {mention} ещё раз — сессия уже новая, запуск должен пройти."
 # Used as the reason when claude died without printing anything at all.
 no_output = "процесс завершился с кодом {rc}, не написав ни строчки"
+# The turn ended without an error, but the agent never posted into the chat.
+silent = "Ход завершился, но агент так ничего и не написал в чат."
+# ... and we only noticed because the receiver was restarted under it.
+silent_restart = "Ход оборвался на перезапуске обвязки и не успел ничего написать в чат."
+silent_footer = """
+Работа могла быть сделана — проверь ветку и PR. Упомяни {mention} ещё раз, чтобы он отчитался."""

@@ -209,6 +209,36 @@ Claude's session memory (`--session-id <chatId>` first time, `--resume
 <chatId>` after) is what lets the agent remember the slug / worktree
 path / PR URL across turns.
 
+### Two prompts per session
+
+Because the session is resumed, everything the first prompt said is still in
+the agent's context. Re-sending it costs a full re-read of text it has not
+forgotten, and — being appended at the end — it competes for attention with the
+actual request. So a rule has two templates:
+
+| | `prompt_file` | `prompt_file_followup` |
+|---|---|---|
+| Used on | first turn of a session (incl. after a rotation) | every turn after that |
+| Carries | the standing instructions: how to classify, how to use the `feature` skill, the full formatting rules, the whole chat so far | the new messages, the stats block, and a short reminder of what is cheap to get wrong |
+
+What a follow-up turn no longer carries:
+
+- **The raw webhook event.** It was ~340 tokens of JSON, half of it `prevData`
+  — a byte-for-byte copy of `payload` — wrapped around a message that is
+  already the last line of `{chat_history}`. The trigger message is now simply
+  the newest entry there, with its time, sender, text and attachments.
+  `{event_json}` still works in older templates, rendering those facts as three
+  lines instead of a JSON blob.
+- **The agent's own posts.** It wrote them minutes ago and still has them; in
+  practice they were 90%+ of a follow-up's history block.
+- **Slash commands** and the receiver's replies to them, as before.
+
+Both are dropped from the *prompt* only — the watermark still steps over them,
+or they would be re-fetched forever.
+
+If `prompt_file_followup` is missing, nothing changes: every turn gets the full
+template, exactly as before.
+
 | Field | Meaning |
 |---|---|
 | `name` | Identifier shown in logs and `/healthz`. |
@@ -220,14 +250,37 @@ path / PR URL across turns.
 | `column_transition_only` | Default `true`. When `column_names` is set, only fire on actual transitions (`prevData.columnId != payload.columnId`). |
 | `skip_if_chat_known` | Default `false`. Skip this rule if the task's chat already has a claude session — either finished (`state/chats/<chatId>.json` exists) or **being launched / running right now** (the chat's turn lock is held). Use it on auto-kickoff rules like `task_in_progress` so they don't pile a second LLM run on top of an already-active `@Agent` conversation. Such a rule is never queued behind a live turn: if the chat is busy the event is dropped, not postponed, so moving a task to "In progress" while the agent is mid-reply can't fire a stale kickoff once that reply finishes. |
 | `session_per_chat` | Default `true`. Runs claude with `--session-id <chatId>` first time, `--resume <chatId>` after. |
-| `prompt_file` | Path to a text file used as the prompt. `{event_json}`, `{chat_history}`, `{first_turn}`, `{formatting}`, `{language}`, and `{session_id}` are substituted. |
+| `prompt_file` | Path to a text file used as the prompt for the FIRST turn of a session. `{chat_history}`, `{chat_id}`, `{first_turn}`, `{formatting}`, `{language}`, `{session_id}`, `{session_stats}` and `{handoff}` are substituted. |
+| `prompt_file_followup` | Prompt used from the SECOND turn of a session onward — see [Two prompts per session](#two-prompts-per-session). Defaults to `<prompt_file>` with `.followup.txt` in place of `.txt`, so dropping the file in beside the main one is enough. Omit the file entirely to keep re-sending the full template. |
 | `workdir` | Override `CLAUDE_WORKDIR` for this rule. |
 | `extra_args` | Override `CLAUDE_EXTRA_ARGS` for this rule. |
 | `ack_message` | Optional short plain-text reply posted into the task chat the moment claude is successfully spawned (e.g. `"Взял в работу..."`). The session id (== chat/task UUID) is auto-appended on its own line so you can copy it from the task and continue the same session locally with `claude --resume <id>`. Fires only after the subprocess actually started, so a failed launch never leaves an orphan ack. Opt-in — omitted = no ack. |
 | `ack_message_html` | Optional HTML companion to `ack_message`. Usually unneeded — the session id line is appended automatically with `<code>` wrapping for clean copy. |
 | `language` | Output language hint, substituted into prompts as `{language}` (e.g. `"ru"`). Lets you declare the reply language once in the rules file instead of repeating it in every prompt. |
 
-## Configure runtime — `.env`
+## Configure runtime — `config.yaml` and `.env`
+
+Behaviour settings live in **`config.yaml`**, grouped (`claude`, `history`,
+`turn`, `rotation`, `handoff`, `chat`) instead of spread across seventy flat
+variables. Override them per machine in **`config.local.yaml`** (gitignored),
+which is deep-merged on top.
+
+Environment variables still win over both, so every existing `.env` keeps
+working unchanged and a one-off override needs no file edit. Precedence,
+strongest first:
+
+    environment  >  config.local.yaml  >  config.yaml  >  built-in default
+
+Secrets stay in `.env` — `config.yaml` is meant to be committed. Each key in
+it names the variable that overrides it, so nothing has to be looked up twice.
+
+> **Booleans.** Write `true` / `false`. Bare `yes` / `no` / `on` / `off` are
+> deliberately read as **strings**: YAML 1.1 would turn them into booleans, and
+> a two-letter language code like `no` (Norwegian) becoming `False` is exactly
+> the kind of bug that takes an afternoon to find.
+
+Everything below can be set as an environment variable; the ones that also have
+a `config.yaml` home are marked in that file.
 
 | Variable | Meaning |
 |---|---|
@@ -249,7 +302,9 @@ path / PR URL across turns.
 | `TURN_FAILURE_PREFIX` | Marker prepended to those reports. Default `⚠️`. |
 | `TURN_FAILURE_QUOTE_CHARS` | How much of claude's output to quote as the reason. Default `600`. |
 | `SESSION_RECOVERY_DELAY_SECONDS` | After a session turns out to be lost, wait this long before replaying the turn in a fresh session — enough for anything queued behind the dead turn to claim the chat first (it would supersede the replay). Default `2`. |
-| `CLAUDE_PUMP_DRAIN_SECONDS` | How long to keep draining claude's output after it exits, before giving up on a grandchild (a lingering MCP server) that inherited the pipe and never closed it. Default `10`. |
+| `TURN_REPORT_SILENT` | Default `true`. Post a note when a turn ends cleanly but the agent never wrote into the chat. `false` restores the old silence. |
+| `TURN_LOG_KEEP` | Per-turn output logs kept in `logs/turns/`. Default `200`. |
+| `TURN_ADOPT_POLL_SECONDS` | How often to poll a turn adopted from a previous receiver process (it is no longer a child, so it cannot be `wait()`ed on). Default `5`. |
 | `RULES_FILE` | Default `rules.toml`. |
 | `MESSAGES_LANG` | Which `messages/<lang>.toml` the receiver speaks. Default `ru`. See [Wording](#wording--messageslangtoml). |
 | `MESSAGES_FILE` | Absolute path to a messages file, overriding `MESSAGES_LANG`. |
@@ -308,6 +363,50 @@ For rules with `session_per_chat = true` (default):
 
 To reset a single chat: `rm state/chats/<chatId>.json`. The next trigger
 will start a fresh session and re-inject full history.
+
+### Exactly once: the delivery watermark
+
+`last_message_id` is the id of the newest message that has been **handed to
+the agent**. Each turn fetches everything after it, adds the trigger message
+if the webhook outran the messages API, and moves the mark to the newest id in
+that batch — counting the ones filtered out of the prompt, or they would be
+re-fetched on every later turn forever.
+
+The mark moves **the moment the process is live**, not when the turn ends.
+`claude -p` writes its prompt into the session transcript at startup, so once
+the process exists those messages are in the session and a later `--resume`
+will see them even if this turn is killed a second later. Moving the mark at
+exit instead is how a turn that never reaches its exit — a receiver restart, a
+kill, a crash — makes the next turn re-serve messages the agent has already
+answered. The one case that really is "not delivered" is a session claude
+refused to open; that rolls the mark back to `prev_watermark` from the turn
+record.
+
+If the batch is bigger than `history.delta_limit`, the newest N are sent and
+the prompt says how many were left out — silently trimming would drop messages
+the agent never saw, because the mark has already stepped past them.
+
+### A turn outlives the receiver
+
+claude runs in its own process session, so restarting the receiver does not
+kill a running turn. Everything needed to *finish* that turn therefore lives on
+disk too, in `state/turns/<chatId>.json`: the pid, the session, where the
+output went, the watermark to roll back, and any instruction queued behind an
+interrupt.
+
+- claude's output goes to `logs/turns/<chat>-<ts>.log`, **not** a pipe. A pipe
+  has a reader that dies with the receiver, after which claude blocks on a full
+  buffer or is killed writing to a closed one — mid-turn, having answered
+  nothing. A file has no reader to lose, so an orphaned turn runs to completion
+  and still posts its own reply over MCP.
+- On startup the receiver reconciles `state/turns/`: a turn whose pid is still
+  alive is **adopted** (re-supervised by polling, and its chat marked busy
+  again, so nothing `--resume`s a session another process is holding); a turn
+  whose pid is gone is **finished right there** — metrics, card, queued
+  instruction, and a word to the chat if the agent never got one out.
+
+The prompt of every turn is still appended to `logs/claude.log`, which is the
+file to grep when asking "what exactly did we send it?".
 
 ### Rotation — why a task spans several sessions
 
@@ -376,12 +475,22 @@ so a dead turn can never look like a slow one:
 | The turn never launched (`spawn-failed` / `exception`) | `⚠️ Не смог запустить агента` + where to look. |
 | The session couldn't be opened | `⚠️ Не смог продолжить сессию этого чата` + the error, then an automatic replay in a fresh session. |
 | Global concurrency cap | `CONCURRENCY_BUSY_MESSAGE` (unchanged). |
+| The turn exited 0 but the agent posted nothing | `⚠️ Ход завершился, но агент так ничего и не написал` (`turn.report_silent`). |
+| A turn was cut off by a receiver restart | `⚠️ Ход оборвался на перезапуске обвязки` — found by the startup reconcile. |
 | We interrupted the turn ourselves | Nothing — a newer turn is already running. |
+
+The last two exist because the receiver **never writes the agent's answers** —
+the agent posts them itself over MCP — so "the process exited" and "the user
+got a reply" are separate facts. When they disagree the chat would otherwise
+show a 👍 and then silence forever, which looks exactly like a turn still
+running. Before saying so, the receiver asks YouGile whether anything from the
+agent's account landed after this turn's messages; if the API can't be reached
+it stays quiet rather than accusing a turn that did reply.
 
 The reason quoted is claude's own output: a recognised startup error
 (no session, usage limit, expired login, missing binary, 5xx) when there is
-one, otherwise the tail of what it printed. It is read from a per-turn
-in-memory buffer, never from a byte range of the shared `logs/claude.log` —
+one, otherwise the tail of what it printed. It is read from that turn's own
+`logs/turns/*.log`, never from a byte range of the shared `logs/claude.log` —
 several turns append there at once, so a range can hold another chat's
 answer.
 
@@ -635,12 +744,16 @@ previous column.
 | `prompts/*.example.txt` | Prompt templates (commit). |
 | `messages/<lang>.toml` | Everything the receiver says in a chat (commit). |
 | `rules.toml`, `prompts/*.txt` | Your real rules and prompts (**gitignored**). |
-| `.env.example` / `.env` | Runtime config (`.env` gitignored). |
+| `config.yaml` | Grouped behaviour settings (commit). |
+| `config.local.yaml` | Per-machine overrides, deep-merged on top (**gitignored**). |
+| `.env.example` / `.env` | Secrets and env overrides (`.env` gitignored). |
 | `state/chats/<chatId>.json` | Per-chat session state (gitignored). |
+| `state/turns/<chatId>.json` | The chat's in-flight turn: pid, session, watermark, queued instruction. Exists only while a turn is running (gitignored). |
 | `state/agent.json` | The agent's own YouGile user id, learned from a mention (gitignored). |
 | `state/attachments/<chatId>/` | Locally-cached chat attachments (gitignored). |
 | `logs/events.jsonl` | All inbound webhooks. |
-| `logs/claude.log` | Spawned claude stdout/stderr. |
+| `logs/claude.log` | Every turn's prompt, plus a pointer to its output log. |
+| `logs/turns/*.log` | One file per turn: claude's stdout/stderr. |
 
 ## Security
 

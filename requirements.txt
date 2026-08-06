@@ -1,2 +1,5 @@
 fastapi
 uvicorn[standard]
+# Already pulled in by uvicorn[standard], but config.yaml depends on it
+# directly — a transitive dependency is not a contract.
+PyYAML

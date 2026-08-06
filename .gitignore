@@ -12,5 +12,8 @@ prompts/*.txt
 !prompts/*.example.txt
 !prompts/_formatting.txt
 
+# per-machine settings overriding config.yaml
+config.local.yaml
+
 # local Claude Code instructions (per-checkout, not for the public repo)
 CLAUDE.local.md

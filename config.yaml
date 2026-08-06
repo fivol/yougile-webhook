@@ -1,0 +1,70 @@
+# yougile-webhook — behaviour settings.
+#
+# Precedence, strongest first:
+#   1. environment variables (.env or the shell) — every key below names the
+#      variable that overrides it, so nothing here breaks an existing .env
+#   2. config.local.yaml — per-machine, gitignored
+#   3. this file
+#   4. the default compiled into app.py
+#
+# Secrets do NOT belong here: YOUGILE_API_KEY and friends stay in .env, because
+# this file is meant to be committed.
+#
+# Booleans: write `true` / `false`. Bare `yes`/`no`/`on`/`off` are read as
+# STRINGS on purpose — otherwise a two-letter language code like `no`
+# (Norwegian) would silently become False.
+
+claude:
+  # Global cap on turns running at once, across all chats.
+  max_concurrent: 10          # CLAUDE_MAX_CONCURRENT
+  # Attempts when claude dies on a transient API error.
+  api_retries: 3              # CLAUDE_API_RETRIES
+
+history:
+  # How much of the chat the FIRST turn of a session gets.
+  first_time_limit: 20        # CHAT_HISTORY_FIRST_TIME_LIMIT
+  # Cap on the "new since last turn" batch. A larger batch is trimmed to the
+  # newest N and the prompt says how many were left out — the watermark has
+  # already stepped past them, so nothing brings them back.
+  delta_limit: 50             # CHAT_HISTORY_DELTA_LIMIT
+
+turn:
+  # Tell the chat when a turn dies with a non-zero exit code.
+  report_failure: true        # TURN_FAILURE_REPORT
+  # Tell the chat when a turn ends cleanly but the agent posted nothing. The
+  # receiver never writes the agent's replies, so "process exited" and "the
+  # user got an answer" are different facts.
+  report_silent: true         # TURN_REPORT_SILENT
+  # How often to poll a turn adopted from a previous receiver process.
+  adopt_poll_seconds: 5       # TURN_ADOPT_POLL_SECONDS
+  # Per-turn output logs to keep in logs/turns/.
+  log_keep: 200               # TURN_LOG_KEEP
+
+rotation:
+  # "manual" only advises in the ack; "auto" retires the session itself.
+  mode: manual                # SESSION_ROTATE_MODE
+  # Retire once the NEXT turn's expected input cost would exceed this.
+  turn_cost_usd: 1.50         # ROTATE_TURN_COST_USD
+  # Retire regardless of cost past this context size.
+  hard_ctx: 600000            # ROTATE_HARD_CTX
+  # Never retire a session smaller than this, whatever the arithmetic says.
+  min_ctx: 40000              # ROTATE_MIN_CTX
+
+handoff:
+  # 0 = the whole chat goes into the handoff.
+  history_limit: 0            # HANDOFF_HISTORY_LIMIT
+  # Messages the rotated session's first prompt repeats alongside the handoff.
+  inline_messages: 30         # HANDOFF_INLINE_MESSAGES
+  # How many of the retired session's own remarks to carry over. This is
+  # running commentary between tool calls, not state — its conclusions are
+  # already in the chat. A few show where it was cut off; 0 drops the section.
+  narration: 6                # HANDOFF_NARRATION
+  digest:
+    # "auto" compresses only a handoff past the threshold; "off" never does.
+    mode: auto                # HANDOFF_DIGEST
+    threshold_kb: 64          # HANDOFF_DIGEST_THRESHOLD_KB
+    model: sonnet             # HANDOFF_DIGEST_MODEL
+
+chat:
+  # Append the context/cost block to the ack the agent posts.
+  ack_stats: true             # ACK_STATS
