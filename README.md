@@ -245,6 +245,11 @@ path / PR URL across turns.
 | `INTERRUPT_SIGKILL_GRACE_TICKS` | When a new `@Agent` message interrupts a running turn for the same chat, how many 0.1s ticks to wait after `SIGTERM` before `SIGKILL` (lets claude flush its session transcript). Default `30` (~3s). |
 | `CLAUDE_API_RETRIES` | Total attempts (incl. the first) when the spawned claude exits non-zero AND its output matches a transient Anthropic API error (`API Error: 5xx`, `Overloaded`, `overloaded_error`, `rate_limit_error`). Default `3`. |
 | `CLAUDE_RETRY_DELAYS` | Comma-separated backoff in seconds between retries. Default `30,120,300`. The last value repeats if there are more retries than entries. |
+| `TURN_FAILURE_REPORT` | Default `true`. Post a status message into the chat when a turn dies without the agent answering — exit code plus claude's own error (see [When a turn dies](#when-a-turn-dies--the-chat-always-hears-about-it)). `false` restores the old silent behaviour. |
+| `TURN_FAILURE_PREFIX` | Marker prepended to those reports. Default `⚠️`. |
+| `TURN_FAILURE_QUOTE_CHARS` | How much of claude's output to quote as the reason. Default `600`. |
+| `SESSION_RECOVERY_DELAY_SECONDS` | After a session turns out to be lost, wait this long before replaying the turn in a fresh session — enough for anything queued behind the dead turn to claim the chat first (it would supersede the replay). Default `2`. |
+| `CLAUDE_PUMP_DRAIN_SECONDS` | How long to keep draining claude's output after it exits, before giving up on a grandchild (a lingering MCP server) that inherited the pipe and never closed it. Default `10`. |
 | `RULES_FILE` | Default `rules.toml`. |
 | `WEBHOOK_ENSURE_INTERVAL_SECONDS` | How often the service sweeps its own YouGile subscription and revives it if YouGile auto-disabled it after a streak of failed deliveries (e.g. while we were down). Default `900` (15 min). The same check runs once at startup. Set to a large value to disable the timer; the startup check still fires. |
 | `WEBHOOK_ENSURE_RETRY_SECONDS` | After a *failed* ensure cycle (couldn't reach YouGile / couldn't revive the subscription), retry this soon instead of waiting the full interval — so recovery from an outage takes minutes. Default `60`. |
@@ -342,6 +347,38 @@ This is how you redirect the agent mid-task — just `@Agent` again with the
 new instruction. Webhook returns `spawn_reason: interrupting`. Because an
 interrupt replaces an existing turn 1-for-1, it never counts against
 `CLAUDE_MAX_CONCURRENT`; that cap only limits genuinely distinct chats.
+
+### When a turn dies — the chat always hears about it
+
+The 👍 on your message means "received", not "answered". If the turn dies
+before the agent posts anything, the receiver — not the agent — reports it,
+so a dead turn can never look like a slow one:
+
+| What happened | What lands in the chat |
+|---|---|
+| claude exited non-zero | `⚠️ Ход завершился с ошибкой (код N)` + the last thing claude printed. |
+| The turn never launched (`spawn-failed` / `exception`) | `⚠️ Не смог запустить агента` + where to look. |
+| The session couldn't be opened | `⚠️ Не смог продолжить сессию этого чата` + the error, then an automatic replay in a fresh session. |
+| Global concurrency cap | `CONCURRENCY_BUSY_MESSAGE` (unchanged). |
+| We interrupted the turn ourselves | Nothing — a newer turn is already running. |
+
+The reason quoted is claude's own output: a recognised startup error
+(no session, usage limit, expired login, missing binary, 5xx) when there is
+one, otherwise the tail of what it printed. It is read from a per-turn
+in-memory buffer, never from a byte range of the shared `logs/claude.log` —
+several turns append there at once, so a range can hold another chat's
+answer.
+
+**Lost session, and why the chat isn't bricked by one.** `claude --resume
+<id>` on a session that is no longer on disk exits 1 within two seconds
+having printed one line. That id is then unusable in both directions, so
+every later mention would die exactly the same way. When that error is
+seen, the receiver retires the session (a normal chain rotation with reason
+`session-lost`, visible in `/sessions`), re-points the feature workspace at
+the new id so the replay keeps its branch and PR, and re-runs the same turn
+**once** in the fresh session. The replay is skipped if a newer turn has
+already taken the chat, and never recurses: a second failure is reported and
+left alone.
 
 ## Addressing the agent — mention or reply
 

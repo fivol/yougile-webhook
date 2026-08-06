@@ -185,6 +185,58 @@ CLAUDE_RETRY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# --- A turn must never die silently ------------------------------------------
+# A turn can die before the agent gets a single word out: a --resume that finds
+# no session, a bad flag, an expired login, a spawn that never happens. The
+# trigger message has been 👍'd by then, so the chat shows "received" and then
+# nothing forever — from the outside, a dead turn is indistinguishable from a
+# slow one. Every failed turn now posts what actually went wrong.
+TURN_FAILURE_REPORT = os.environ.get(
+    "TURN_FAILURE_REPORT", "true").lower() not in ("0", "false", "no")
+TURN_FAILURE_PREFIX = os.environ.get("TURN_FAILURE_PREFIX", "⚠️").strip()
+# How much of claude's own output to quote back into the chat.
+TURN_FAILURE_QUOTE_CHARS = int(os.environ.get("TURN_FAILURE_QUOTE_CHARS", "600"))
+# Bound on the per-turn output buffer kept in memory. Startup errors are the
+# first thing printed and the answer is the last, so keeping the head and the
+# tail of the stream covers every case the report cares about.
+CLAUDE_CAPTURE_HEAD_CHARS = 8 * 1024
+CLAUDE_CAPTURE_TAIL_CHARS = 56 * 1024
+# How long to keep draining claude's output after it exits, before giving up on
+# a grandchild that inherited the pipe and never closed it.
+CLAUDE_PUMP_DRAIN_SECONDS = float(os.environ.get("CLAUDE_PUMP_DRAIN_SECONDS", "10"))
+
+# `claude --resume <id>` on a session that is no longer on disk exits 1 within
+# seconds having printed just this one line. That id is then unusable in BOTH
+# directions (--resume can't find it, --session-id can consider it taken), so
+# the only way out is a fresh link in the chat's session chain — otherwise the
+# chat is bricked and every later mention dies the same way.
+SESSION_LOST_PATTERN = re.compile(
+    r"No conversation found with session ID"
+    r"|Session ID .{0,80}? is already in use"
+    r"|Invalid session ID",
+    re.IGNORECASE,
+)
+# Other ways a turn dies with one line and no work done. Matching them by name
+# means the chat gets the actual cause instead of the tail of whatever scrolled
+# past last — these are the ones the user can act on themselves.
+CLAUDE_FATAL_PATTERN = re.compile(
+    r"usage limit reached"
+    r"|credit balance is too low"
+    r"|Invalid API key"
+    r"|OAuth token has expired"
+    r"|Please run /login"
+    r"|command not found"
+    r"|No such file or directory"
+    r"|error: unknown option"
+    r"|Permission denied",
+    re.IGNORECASE,
+)
+# Give _release_chat time to start whatever was queued behind the dead turn
+# before the replay checks whether the chat is busy.
+SESSION_RECOVERY_DELAY_SECONDS = float(
+    os.environ.get("SESSION_RECOVERY_DELAY_SECONDS", "2"))
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
 SENDER_KEYS = [
     k.strip()
     for k in os.environ.get(
@@ -2751,6 +2803,132 @@ def _post_capacity_message(chat_id: Optional[str]) -> None:
     threading.Thread(target=_send, daemon=True).start()
 
 
+def _paragraph_html(text: str) -> str:
+    """Blank-line-separated text as YouGile-friendly HTML paragraphs."""
+    return "<p>" + "</p><p>".join(
+        _html_escape(block).replace("\n", "<br>") for block in text.split("\n\n")
+    ) + "</p>"
+
+
+def _post_turn_failure(
+    chat_id: Optional[str], headline: str, reason: str = "", footer: str = "",
+) -> None:
+    """Tell the chat that a turn died, and why (fire-and-forget).
+
+    The 👍 on the trigger message is a promise that something is happening. When
+    the turn can't keep that promise, this message says so — with the actual
+    error, not a generic apology, because the cause is usually something only
+    the user can act on (re-mention, /new, check the login).
+    """
+    if not (chat_id and TURN_FAILURE_REPORT):
+        return
+    blocks = [f"{TURN_FAILURE_PREFIX} {headline}".strip()]
+    if reason:
+        blocks.append(reason)
+    if footer:
+        blocks.append(footer)
+    text = "\n\n".join(blocks)
+
+    def _send() -> None:
+        try:
+            ok = send_chat_message(chat_id, text, _paragraph_html(text))
+            log.info("turn failure reported to chat=%s ok=%s", chat_id, ok)
+        except Exception:
+            log.exception("turn failure report failed chat=%s", chat_id)
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _report_dead_turn(
+    chat_id: Optional[str],
+    rc: int,
+    reason: str,
+    session_lost: bool,
+    recovering: bool,
+) -> None:
+    """Phrase a dead turn for the chat: what died, why, and what happens next."""
+    if session_lost and recovering:
+        _post_turn_failure(
+            chat_id,
+            f"Не смог продолжить сессию этого чата — claude вышел с кодом {rc}:",
+            reason,
+            "Транскрипт сессии не найден, контекст прошлых ходов утерян. "
+            "Перезапускаю этот же ход в новой сессии — задачу перечитаю из "
+            "чата, ветку и PR подхвачу из воркспейса.",
+        )
+    elif session_lost:
+        _post_turn_failure(
+            chat_id,
+            f"Ход не запустился даже в новой сессии (код {rc}):",
+            reason,
+            "Дальше не пробую, чтобы не крутиться в цикле. Позови @Agent "
+            "ещё раз или посмотри logs/claude.log.",
+        )
+    else:
+        # The tail is claude's last word, whatever it was — an error, or (if it
+        # died only after answering) the end of the answer. The wording works
+        # either way; guessing which one it is would be worse than saying both.
+        _post_turn_failure(
+            chat_id,
+            f"Ход завершился с ошибкой (код {rc}). Последнее, что написал claude:",
+            reason,
+            "Если ответа в чате нет — упомяни @Agent ещё раз, чтобы повторить. "
+            "Полный лог: logs/claude.log.",
+        )
+
+
+def _recover_lost_session(chat_id: str, rule: "Rule", payload: Any) -> None:
+    """Retire a session claude refused to open, then replay the turn once.
+
+    A lost session is terminal for that id, so leaving the chat pointed at it
+    bricks the chat: every later mention resumes the same dead id, exits 1 in
+    two seconds and answers nothing. Advancing the session chain (the same
+    bookkeeping a normal rotation does, minus the handoff — there is no
+    transcript left to hand off) makes the next turn bootstrap a fresh session,
+    and the replay means the user's message is acted on now rather than after
+    they notice and re-send it.
+    """
+
+    def _run() -> None:
+        try:
+            state = get_chat_state(chat_id)
+            facts = session_facts(chat_id, state, rule)
+            old_id = facts["session"]["id"]
+            new_state = rotate_session(chat_id, state, "session-lost", facts, rule)
+            new_id = new_state["session_id"]
+            log.warning(
+                "chat %s: session %s is gone — recovering into %s",
+                chat_id, old_id, new_id,
+            )
+            # Re-point the feature workspace at the new session id, or the
+            # replay would fail to find its branch and open a second PR.
+            ws = find_workspace(rule.workdir, [old_id, chat_id], chat_id)
+            if ws:
+                patch_feature_json(ws, new_id, chat_id)
+                update_chat_state(chat_id, workspace_path=str(ws))
+
+            time.sleep(SESSION_RECOVERY_DELAY_SECONDS)
+            if chat_turn_in_flight(chat_id):
+                # Something was queued behind the dead turn and already took
+                # over. It bootstraps the fresh session by itself, and it is
+                # newer than what we would replay — let it have the chat.
+                log.info("chat %s: newer turn took over — skipping replay", chat_id)
+                return
+            ok, why = spawn_claude(rule, payload, allow_session_recovery=False)
+            log.info("chat %s: session-loss replay ok=%s reason=%s", chat_id, ok, why)
+            if not ok:
+                _post_turn_failure(
+                    chat_id,
+                    f"Не смог перезапустить ход в новой сессии ({why}).",
+                    footer="Упомяни @Agent ещё раз — сессия уже новая, "
+                           "запуск должен пройти.",
+                )
+        except Exception:
+            log.exception("chat %s: session-loss recovery failed", chat_id)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _mark_turn_finished(chat_id: Optional[str], task_id: Optional[str]) -> None:
     """Flip the card to "answered" now that the agent has stopped — the user's
     cue that the reply is in the chat and it's their turn.
@@ -2844,6 +3022,45 @@ def _build_prompt(
     return rendered
 
 
+class _OutputCapture:
+    """Bounded head+tail window over a stream, for one turn's claude output.
+
+    Startup errors ("No conversation found …") arrive first and the answer
+    arrives last, so both ends are worth keeping; the middle — tool calls,
+    thinking, file dumps — is what would blow the buffer up, and is the part no
+    report needs. Written by the pump thread, read by the reaper after it joins.
+    """
+
+    def __init__(self) -> None:
+        self._head: List[str] = []
+        self._head_len = 0
+        self._tail: List[str] = []
+        self._tail_len = 0
+        self._dropped = 0
+
+    def add(self, chunk: str) -> None:
+        if self._head_len < CLAUDE_CAPTURE_HEAD_CHARS:
+            room = CLAUDE_CAPTURE_HEAD_CHARS - self._head_len
+            self._head.append(chunk[:room])
+            self._head_len += min(room, len(chunk))
+            chunk = chunk[room:]
+            if not chunk:
+                return
+        self._tail.append(chunk)
+        self._tail_len += len(chunk)
+        while self._tail_len - len(self._tail[0]) >= CLAUDE_CAPTURE_TAIL_CHARS:
+            gone = self._tail.pop(0)
+            self._tail_len -= len(gone)
+            self._dropped += len(gone)
+
+    def text(self) -> str:
+        head = "".join(self._head)
+        tail = "".join(self._tail)
+        if self._dropped:
+            return f"{head}\n…[{self._dropped} chars omitted]…\n{tail}"
+        return head + tail
+
+
 def _spawn_subprocess(
     rule: Rule,
     cmd: List[str],
@@ -2861,24 +3078,23 @@ def _spawn_subprocess(
             f"ts={datetime.now(timezone.utc).isoformat()} ---\n"
         )
     log_fp.flush()
-    output_start = log_fp.tell()
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=rule.workdir,
-            stdout=log_fp,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-    except Exception:
+    except Exception as exc:
         log.exception("rule %s: failed to spawn claude (attempt %d)", rule.name, attempt)
         log_fp.close()
         # On first-attempt spawn failure the caller cleans up (chat_lock etc.).
         # On retry there is no caller waiting — make sure on_exit still fires.
         if attempt > 1:
             try:
-                on_exit(-1)
+                on_exit(-1, f"{type(exc).__name__}: {exc}")
             except Exception:
                 log.exception("rule %s: on_exit hook failed", rule.name)
         return None
@@ -2893,8 +3109,48 @@ def _spawn_subprocess(
         rule.name, pid, attempt, cmd[:3] + ["..."],
     )
 
+    # claude's output is teed: streamed into the shared claude.log for live
+    # tailing, and kept in a bounded per-turn buffer. The buffer — not a slice of
+    # the log — is what the retry decision and the failure report read: several
+    # turns append to claude.log at once, so a byte range in it can hold another
+    # chat's answer, and quoting that back would leak it into the wrong chat.
+    captured = _OutputCapture()
+
+    def _pump() -> None:
+        complained = False
+        while True:
+            try:
+                raw = proc.stdout.read1(4096)  # type: ignore[union-attr]
+            except (ValueError, OSError):
+                break  # pipe gone — nothing left to drain
+            if not raw:
+                break
+            chunk = raw.decode("utf-8", errors="replace")
+            # Draining is the one thing this loop MUST keep doing: claude blocks
+            # on a full pipe, so a hiccup in the bookkeeping (a closed log file
+            # after _reap, anything else) can never be allowed to end it.
+            try:
+                captured.add(chunk)
+                log_fp.write(chunk)
+                log_fp.flush()
+            except Exception:
+                if not complained:
+                    complained = True
+                    log.exception("rule %s: output pump degraded (pid=%s)", rule.name, pid)
+        try:
+            proc.stdout.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+    pump = threading.Thread(target=_pump, daemon=True)
+    pump.start()
+
     def _reap():
         rc = proc.wait()
+        # Drain what claude wrote before it exited. Bounded: a grandchild that
+        # inherited stdout (a lingering MCP server) can hold the pipe open long
+        # after claude is gone, and the turn must not hang on it.
+        pump.join(timeout=CLAUDE_PUMP_DRAIN_SECONDS)
         with _active_lock:
             _active_procs.discard(pid)
             was_interrupted = pid in _interrupted_pids
@@ -2906,12 +3162,12 @@ def _spawn_subprocess(
             f"ts={datetime.now(timezone.utc).isoformat()} ---\n"
         )
         log_fp.flush()
-        end_pos = log_fp.tell()
         log_fp.close()
+        output = captured.text()
         log.info("rule %s: claude pid=%s attempt=%d rc=%s", rule.name, pid, attempt, rc)
 
         if (not was_interrupted and rc != 0 and attempt < CLAUDE_API_RETRIES
-                and _output_is_transient(output_start, end_pos)):
+                and CLAUDE_RETRY_PATTERN.search(output)):
             delay = CLAUDE_RETRY_DELAYS[min(attempt - 1, len(CLAUDE_RETRY_DELAYS) - 1)]
             log.warning(
                 "rule %s: transient API error (rc=%s) — retrying in %ds (attempt %d/%d)",
@@ -2925,8 +3181,11 @@ def _spawn_subprocess(
             threading.Thread(target=_delayed_retry, daemon=True).start()
             return
 
+        # An interrupt is our own doing and a fresh turn is already chained
+        # behind it — that is not a failure worth telling the chat about.
+        failure = None if (rc == 0 or was_interrupted) else _failure_reason(rc, output)
         try:
-            on_exit(rc)
+            on_exit(rc, failure)
         except Exception:
             log.exception("rule %s: on_exit hook failed", rule.name)
 
@@ -2934,22 +3193,32 @@ def _spawn_subprocess(
     return proc
 
 
-def _output_is_transient(start: int, end: int) -> bool:
-    """Read this attempt's slice of CLAUDE_LOG and check for an Anthropic 5xx /
-    overload / rate-limit signature."""
-    if end <= start:
-        return False
-    try:
-        with CLAUDE_LOG.open("r", encoding="utf-8", errors="replace") as f:
-            f.seek(start)
-            output = f.read(end - start)
-    except Exception:
-        log.exception("failed to read claude.log slice for retry decision")
-        return False
-    return bool(CLAUDE_RETRY_PATTERN.search(output))
+def _failure_reason(rc: int, output: str) -> str:
+    """Why a turn died, in claude's own words.
+
+    A recognised startup error if there is one (those are printed first and are
+    the whole story), otherwise the tail of whatever was printed last. Never
+    empty: the caller uses it as the reason line of a chat message, and "no
+    output at all" is itself the diagnosis.
+    """
+    text = _ANSI_RE.sub("", output or "")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for pattern in (SESSION_LOST_PATTERN, CLAUDE_FATAL_PATTERN, CLAUDE_RETRY_PATTERN):
+        for line in lines:
+            if pattern.search(line):
+                return line[:TURN_FAILURE_QUOTE_CHARS]
+    if not lines:
+        return f"процесс завершился с кодом {rc}, не написав ни строчки"
+    tail = "\n".join(lines[-6:])
+    return tail[-TURN_FAILURE_QUOTE_CHARS:]
 
 
-def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, str]:
+def spawn_claude(
+    rule: Rule,
+    payload,
+    interrupted: bool = False,
+    allow_session_recovery: bool = True,
+) -> Tuple[bool, str]:
     chat_id = extract_chat_id(payload) if rule.session_per_chat else None
     # The task whose checkbox tracks this turn. Same UUID as the chat, but
     # resolved independently of session_per_chat so the status flag works for
@@ -3151,15 +3420,23 @@ def spawn_claude(rule: Rule, payload, interrupted: bool = False) -> Tuple[bool, 
         # the cache-survival statistic, recorded once the turn's usage lands.
         idle_before = facts.get("idle_min") if chat_id else None
 
-        def on_exit(rc: int) -> None:
+        def on_exit(rc: int, failure: Optional[str] = None) -> None:
+            # `failure` is claude's own last word, or None when the turn ended
+            # normally / we killed it ourselves to run a newer instruction.
+            session_lost = bool(failure and SESSION_LOST_PATTERN.search(failure))
+            recovering = session_lost and bool(chat_id) and allow_session_recovery
             try:
                 if chat_id and newest_msg_id:
                     update_chat_state(chat_id, last_message_id=newest_msg_id)
                 if chat_id and session_id:
                     _record_turn_metrics(chat_id, session_id, rule, idle_before)
                 _mark_turn_finished(chat_id, task_id)
+                if failure:
+                    _report_dead_turn(chat_id, rc, failure, session_lost, recovering)
             finally:
                 _release_chat(chat_id, chat_lock)
+            if recovering and chat_id:
+                _recover_lost_session(chat_id, rule, payload)
 
         proc = _spawn_subprocess(rule, cmd, header, on_exit, chat_id=chat_id)
         if proc is None:
@@ -3331,6 +3608,16 @@ async def yougile_webhook(req: Request):
         elif why == "global-max-concurrent":
             # Saturated by OTHER chats — tell the user instead of dropping silently.
             _post_capacity_message(extract_chat_id(payload))
+        elif why in ("spawn-failed", "exception"):
+            # The turn never got off the ground (claude binary missing, history
+            # fetch blew up, …). The trigger message is already 👍'd, so say so
+            # rather than leaving the chat waiting for an agent that never ran.
+            _post_turn_failure(
+                extract_chat_id(payload),
+                f"Не смог запустить агента — ход не стартовал ({why}).",
+                footer="Смотри logs/uvicorn.err. Упомяни @Agent ещё раз, "
+                       "чтобы повторить.",
+            )
 
     event = isinstance(payload, dict) and payload.get("event")
     log.info(
