@@ -3172,6 +3172,19 @@ def _plain_text(payload: Any) -> str:
     return _TAG_RE.sub(" ", text or "").strip()
 
 
+# `/new` and `/keep` only set what the NEXT turn should do. When one of them
+# carries text beyond itself, that text is an instruction, not a reason:
+# "@Agent /new доделай …" reads as "start fresh AND do this". Consuming it as a
+# plain command arms the flag and drops the instruction, leaving the receiver to
+# answer "принято" for a task nobody is working on — so these fall through to
+# the ordinary rules and the agent runs.
+COMMAND_MODIFIERS = frozenset({"new", "keep"})
+
+
+def command_carries_instruction(cmd: str, arg: str) -> bool:
+    return cmd in COMMAND_MODIFIERS and bool((arg or "").strip())
+
+
 def _is_command_noise(text: str) -> bool:
     """True for a slash command or for one of our own replies to one."""
     if not COMMANDS_ENABLED:
@@ -3179,7 +3192,13 @@ def _is_command_noise(text: str) -> bool:
     plain = _TAG_RE.sub(" ", text or "").strip()
     if COMMAND_REPLY_PREFIX and plain.startswith(COMMAND_REPLY_PREFIX):
         return True
-    return bool(COMMAND_RE.match(plain))
+    m = COMMAND_RE.match(plain)
+    if not m:
+        return False
+    # A modifier that carries an instruction is a real message: filtering it out
+    # of the history would hide from the agent the very thing it was asked to do.
+    return not command_carries_instruction(
+        m.group(1).lower(), (m.group(2) or "").strip())
 
 
 def parse_command(payload: Any) -> Optional[Tuple[str, str]]:
@@ -3244,11 +3263,17 @@ def handle_command(cmd: str, arg: str, payload: Any) -> Dict[str, Any]:
         text, html = render_sessions(chat_id, rule)
     elif cmd == "new":
         update_chat_state(chat_id, pending_rotation=True, skip_rotation_once=False)
+        if command_carries_instruction(cmd, arg):
+            # No reply of our own: the agent is about to post its ack, and the
+            # "started a new session" line rides on that. One message per turn.
+            return {"handled": True, "command": cmd, "continue_to_rules": True}
         extra = msg("command.new_reason", reason=arg) if arg else ""
         text, html = render_message(
             [msg("command.new_ok", prefix=COMMAND_REPLY_PREFIX) + extra])
     elif cmd == "keep":
         update_chat_state(chat_id, skip_rotation_once=True, pending_rotation=False)
+        if command_carries_instruction(cmd, arg):
+            return {"handled": True, "command": cmd, "continue_to_rules": True}
         text, html = render_message(
             [msg("command.keep_ok", prefix=COMMAND_REPLY_PREFIX)])
     elif cmd == "stop":
@@ -4439,8 +4464,14 @@ async def yougile_webhook(req: Request):
                 return {"ok": True, "command": cmd[0], "handled": False,
                         "reason": "sender-not-allowed"}
             result = await asyncio.to_thread(handle_command, cmd[0], cmd[1], payload)
-            log.info("command /%s handled=%s", cmd[0], result.get("handled"))
-            return {"ok": True, **result}
+            log.info(
+                "command /%s handled=%s continue=%s", cmd[0],
+                result.get("handled"), result.get("continue_to_rules", False),
+            )
+            if not result.get("continue_to_rules"):
+                return {"ok": True, **result}
+            # The command only set state for this turn; the rest of the message
+            # is the instruction, so carry on into rule matching.
 
     rule, reasons = find_matching_rule(payload)
     fired_rule: Optional[str] = None

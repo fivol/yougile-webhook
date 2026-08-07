@@ -20,8 +20,28 @@ message text with tags stripped, so YouGile's HTML wrapping does not matter.
 | `/stop` | Interrupt the running turn |
 | `/help` | The list above, in chat |
 
-`@Agent /new <instruction>` combines the two: rotate, then act on the
-instruction in the new session.
+### Commands that carry an instruction
+
+`/new` and `/keep` only decide what the **next** turn does, so they can be
+prefixed to an ordinary request:
+
+```
+@Agent /new доделай (подними бек, настрой энвы)
+```
+
+That arms the rotation **and** runs the turn — the trailing text is treated as
+the instruction, not as a `[reason]` label. The receiver posts no `⚙️` reply of
+its own in that case: the agent is about to post its ack, and the "started a
+new session" line rides on it, so the chat still sees one message per turn.
+
+The other commands (`/status`, `/sessions`, `/stop`, `/help`) never fall
+through — they answer and stop, whatever follows them.
+
+> Without this, `@Agent /new доделай …` was consumed as a bare `/new` with
+> `доделай …` echoed back as the rotation *reason*: the flag was armed, the
+> chat was told "принято", and no agent was ever started. The message also
+> looked like a slash command to the history filter, so even a later turn would
+> not have seen the instruction.
 
 ## `/status`
 
