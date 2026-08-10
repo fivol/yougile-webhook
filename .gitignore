@@ -17,3 +17,7 @@ config.local.yaml
 
 # local Claude Code instructions (per-checkout, not for the public repo)
 CLAUDE.local.md
+
+# per-checkout tooling: Claude Code worktrees, IDE settings
+.claude/
+.idea/
