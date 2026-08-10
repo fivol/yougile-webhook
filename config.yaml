@@ -43,12 +43,19 @@ turn:
 rotation:
   # "manual" only advises in the ack; "auto" retires the session itself.
   mode: manual                # SESSION_ROTATE_MODE
-  # Retire once the NEXT turn's expected input cost would exceed this.
-  turn_cost_usd: 1.50         # ROTATE_TURN_COST_USD
+  # Retire once the NEXT turn's expected input cost would exceed this. A turn
+  # is many API calls and each re-sends the prefix, so this is
+  #   ctx * (calls * cache_read_mult + p_miss * (cache_write_mult - read_mult))
+  # At a 45-call turn it puts the rotate point near 130k of context while warm
+  # and near 100k after an hour's pause.
+  turn_cost_usd: 3.00         # ROTATE_TURN_COST_USD
   # Retire regardless of cost past this context size.
   hard_ctx: 600000            # ROTATE_HARD_CTX
-  # Never retire a session smaller than this, whatever the arithmetic says.
-  min_ctx: 40000              # ROTATE_MIN_CTX
+  # Never retire a session smaller than this, whatever the arithmetic says —
+  # below it the handoff costs more than staying put.
+  min_ctx: 60000              # ROTATE_MIN_CTX
+  # Seed for the observed-turn-length average; self-corrects after one turn.
+  calls_per_turn: 45          # ROTATE_CALLS_PER_TURN
 
 handoff:
   # 0 = the whole chat goes into the handoff.

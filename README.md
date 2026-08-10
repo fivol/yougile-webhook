@@ -410,14 +410,15 @@ file to grep when asking "what exactly did we send it?".
 
 ### Rotation — why a task spans several sessions
 
-A session that has been running for days costs real money to resume: every
-turn re-sends the whole conversation, and whether that is served from cache
-(0.1× input price) or re-written (2×) depends almost entirely on how long the
-chat has been idle. Because both inputs — context size and idle time — are
-known for free *before* a turn starts, the receiver can price the next turn in
-advance and retire the session when it gets too expensive, handing the new one
+A session that has been running for days costs real money to resume. Every
+turn re-sends the whole conversation, and a turn is not one API call but
+dozens — measured turns on this machine run 22 to 106 calls, each re-reading
+the entire prefix at 0.1× the input price (or 2× on the first one, if the cache
+died meanwhile). So the bill scales with context size × turn length, and both
+are known for free *before* a turn starts: the receiver prices the next turn in
+advance and retires the session when it gets too expensive, handing the new one
 a **handoff file** (task chat, workspace, branches, PR diffs) instead of the
-raw transcript.
+raw transcript. In practice that puts the reset point around 100–130k tokens.
 
 Off by default (`SESSION_ROTATE_MODE=manual` only advises). See
 **[docs/session-rotation.md](docs/session-rotation.md)** for the measured

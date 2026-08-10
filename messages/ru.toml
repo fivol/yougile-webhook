@@ -33,6 +33,9 @@
 turns_one = "ход"
 turns_few = "хода"
 turns_many = "ходов"
+calls_one = "вызов"
+calls_few = "вызова"
+calls_many = "вызовов"
 tokens_one = "токен"
 tokens_few = "токена"
 tokens_many = "токенов"
@@ -78,7 +81,7 @@ line = "{prefix} Контекст {tokens} · следующий ход ≈ {cos
 [rotation]
 started = "{prefix} Новая сессия: {why} — продолжаю в ней"
 previous = "прошлая {id} · контекст {tokens} · потрачено ≈ {spent} · ход на ней стоил бы ≈ {expected} при пороге {threshold}"
-reason_cost = "пауза {age}, кеш почти наверняка мёртв"
+reason_cost = "контекст дорого перечитывать на каждом шаге хода (пауза {age})"
 reason_hard_ctx = "контекст подошёл к пределу окна"
 reason_command = "запрошено командой /new"
 
@@ -106,7 +109,7 @@ agent_busy = "работает"
 agent_idle = "свободен"
 
 session = "**Сессия** {position}-я из {total} · `{id}`"
-context = "{tokens} · {turns} · последний {age} назад"
+context = "{tokens} · {calls} · последний {age} назад"
 context_unknown = "контекста ещё нет — транскрипт не найден"
 last_turn_warm = "✅ прошлый ход попал в кеш — {cost}"
 last_turn_cold = "❌ прошлый ход мимо кеша — {cost} (read {read} · write {write})"
@@ -120,7 +123,7 @@ verdict_rotate = "начнётся НОВАЯ сессия"
 verdict_keep = "продолжу текущую"
 verdict_advisory_only = " (режим {mode} — только предупрежу)"
 next_if_idle = "после часа простоя ≈ {cost} → и тогда новая"
-policy = "порог {threshold} за ход · потолок {ctx_cap} токенов · режим {mode}"
+policy = "порог {threshold} за ход · ход ≈ {calls} вызовов · потолок {ctx_cap} токенов · режим {mode}"
 cache_decay = "кеш стынет: {buckets}"
 cache_decay_bucket = "{percent}% {after}"
 cache_decay_after_0_10 = "за 10 мин"
@@ -145,8 +148,8 @@ processed_up_to = "обработано до сообщения {last_message_id
 # /sessions
 [sessions]
 title = "# {prefix} Сессии задачи — {count} · всего ≈ {spent}"
-retired = "- #{seq} `{id}` · {turns} · ≈ {cost} · закрыта {retired_at} ({reason})"
-current = "- #{seq} `{id}` · {turns} · ≈ {cost} · **текущая**"
+retired = "- #{seq} `{id}` · {calls} · ≈ {cost} · закрыта {retired_at} ({reason})"
+current = "- #{seq} `{id}` · {calls} · ≈ {cost} · **текущая**"
 footer = "Открыть любую локально: `claude --resume <id>`"
 
 

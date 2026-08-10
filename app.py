@@ -502,25 +502,43 @@ AGENT_STICKER_ANSWERED_COLOR = os.environ.get("AGENT_STICKER_ANSWERED_COLOR", "#
 #   <10 min  7% miss     30-60 min  75% miss
 #   10-30    24% miss    >60 min   100% miss
 #
-# So the expected cost of the next turn is fully knowable BEFORE spending a
-# token: `ctx_tokens` comes from the previous turn's usage block and the idle
-# time from the clock. When that expected cost crosses ROTATE_TURN_COST_USD we
-# retire the session and start a fresh one, carrying the essence over in a
-# handoff file (task history + workspace + PR diffs) instead of the raw
-# transcript. The effect is that a live back-and-forth keeps its context (it is
-# cheap while warm) and a chat resumed after a long pause resets (its context
-# would be re-billed at the write rate).
+# The miss is the smaller half of the story, though. ONE agent turn is not one
+# API call — the agent reads, edits, greps, screenshots, and every one of those
+# steps re-sends the whole prefix again. Three consecutive turns on one real
+# task measured 106, 64 and 22 calls; a turn resumed on a 313k context was
+# paying ~31k tokens per call before it did anything. So the read side gets
+# multiplied by the length of the turn and the write side does not:
+#
+#   expected input = ctx * (calls * READ_MULT + p_miss * (WRITE_MULT - READ_MULT))
+#
+# Both inputs are knowable BEFORE spending a token: `ctx_tokens` comes from the
+# previous turn's usage block, the idle time from the clock, and `calls` from
+# the running average of how long this machine's turns actually are. When that
+# expected cost crosses ROTATE_TURN_COST_USD we retire the session and start a
+# fresh one, carrying the essence over in a handoff file (task history +
+# workspace + PR diffs) instead of the raw transcript. A short exchange keeps
+# its context; a big one resets, because on a fat context every single tool call
+# is billed against the whole transcript.
 SESSION_ROTATE_MODE = conf(
     "rotation.mode", "SESSION_ROTATE_MODE", "manual", str).strip().lower()
 # The one knob that matters: rotate once the next turn's expected input cost
 # exceeds this. In dollars, so it means something without a token calculator.
+# At the default turn length this puts the rotate point around 130k of context
+# while warm and around 100k after an hour's pause — comfortably above what a
+# handoff costs to hand over (~7k, plus ~5 calls of re-orientation), so a
+# rotation always buys back more than it spends.
 ROTATE_TURN_COST_USD = conf(
-    "rotation.turn_cost_usd", "ROTATE_TURN_COST_USD", 1.50, float)
+    "rotation.turn_cost_usd", "ROTATE_TURN_COST_USD", 3.00, float)
 # Rotate regardless of cost past this context size — the 1M window is a wall we
 # must not hit mid-task (observed sessions reached 950k).
 ROTATE_HARD_CTX = conf("rotation.hard_ctx", "ROTATE_HARD_CTX", 600000, int)
-# Never rotate a small session, whatever the arithmetic says.
-ROTATE_MIN_CTX = conf("rotation.min_ctx", "ROTATE_MIN_CTX", 40000, int)
+# Never rotate a small session, whatever the arithmetic says. Below this the
+# handoff plus re-orientation costs more than staying put.
+ROTATE_MIN_CTX = conf("rotation.min_ctx", "ROTATE_MIN_CTX", 60000, int)
+# Seed for "how many API calls does one turn make". Self-corrects from observed
+# turns; this value only matters until the first one lands.
+ROTATE_CALLS_PER_TURN = conf(
+    "rotation.calls_per_turn", "ROTATE_CALLS_PER_TURN", 45.0, float)
 
 # --- Handoff -----------------------------------------------------------------
 # What the new session gets instead of the old transcript. Everything here is
@@ -2240,9 +2258,15 @@ def _usage_totals(path: Path) -> Dict[str, Any]:
 
     ~1s on a 13 MB transcript thanks to the substring pre-filter — only called
     when a turn ends, on rotation, and by /status.
+
+    One API response is written to the transcript once per content block, so a
+    reply with thinking + text + two tool calls appears as four lines carrying
+    the SAME `usage`. Summing them blind counts the response that many times —
+    it read one real session as 261 calls / $38.69 when it was 170 / $26.23.
+    Hence the dedupe on the message id: `calls` is API calls, not lines.
     """
     empty = {
-        "turns": 0, "write_tokens": 0, "read_tokens": 0,
+        "calls": 0, "write_tokens": 0, "read_tokens": 0,
         "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "cold_turns": 0,
     }
     try:
@@ -2255,6 +2279,7 @@ def _usage_totals(path: Path) -> Dict[str, Any]:
         _totals_cache.move_to_end(key)
         return hit
     tot = dict(empty)
+    seen: set = set()
     try:
         with path.open("rb") as f:
             for raw in f:
@@ -2264,11 +2289,19 @@ def _usage_totals(path: Path) -> Dict[str, Any]:
                     d = json.loads(raw)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
-                u = (d.get("message") or {}).get("usage")
+                m = d.get("message") or {}
+                u = m.get("usage")
                 if not isinstance(u, dict):
                     continue
+                mid = m.get("id")
+                # No id (shouldn't happen) — count it, losing a duplicate is
+                # worse than counting a one-off twice.
+                if mid is not None:
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
                 t = _turn_from_usage(u, None)
-                tot["turns"] += 1
+                tot["calls"] += 1
                 tot["write_tokens"] += t["cache_creation"]
                 tot["read_tokens"] += t["cache_read"]
                 tot["input_tokens"] += t["input_tokens"]
@@ -2412,12 +2445,16 @@ def _idle_bucket(idle_min: Optional[float]) -> str:
     return "60+"
 
 
-def _load_cache_stats() -> Dict[str, Dict[str, int]]:
+def _load_stats_file() -> Dict[str, Any]:
     try:
         data = json.loads(CACHE_STATS_FILE.read_text(encoding="utf-8"))
-        buckets = data.get("buckets") or {}
     except (OSError, json.JSONDecodeError):
-        buckets = {}
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_cache_stats() -> Dict[str, Dict[str, int]]:
+    buckets = _load_stats_file().get("buckets") or {}
     merged = {k: dict(v) for k, v in _CACHE_STATS_SEED.items()}
     for k, v in buckets.items():
         if k in merged and isinstance(v, dict):
@@ -2425,12 +2462,41 @@ def _load_cache_stats() -> Dict[str, Dict[str, int]]:
     return merged
 
 
-def _save_cache_stats(buckets: Dict[str, Dict[str, int]]) -> None:
+def _save_stats(**fields: Any) -> None:
+    """Merge into the stats file — the two estimators share it and are written
+    from different code paths, so a blind overwrite would drop the other one."""
+    data = _load_stats_file()
+    data.update(fields)
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
     tmp = CACHE_STATS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(
-        {"buckets": buckets, "updated_at": datetime.now(timezone.utc).isoformat()},
-        ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(CACHE_STATS_FILE)
+
+
+def calls_per_turn() -> float:
+    """How many API calls one agent turn makes, on this machine, lately."""
+    try:
+        n = float(_load_stats_file().get("calls_per_turn") or 0)
+    except (TypeError, ValueError):
+        n = 0.0
+    return n if n > 0 else ROTATE_CALLS_PER_TURN
+
+
+def record_calls_per_turn(calls: int) -> None:
+    """One observation of "how long was that turn". EWMA, not a mean: turn
+    length swings hard by request type (a "готово" is 22 calls, an implement is
+    106) and what we want is what the NEXT one is likely to look like."""
+    if calls <= 0:
+        return
+    with _cache_stats_lock:
+        prev = calls_per_turn()
+        # Clamped so one runaway turn can't park the estimator at an absurd
+        # value and rotate every session on sight.
+        nxt = min(200.0, max(5.0, prev * 0.75 + calls * 0.25))
+        try:
+            _save_stats(calls_per_turn=round(nxt, 1))
+        except OSError:
+            log.exception("failed to persist calls-per-turn stat")
 
 
 def miss_probability(bucket: str) -> float:
@@ -2453,17 +2519,24 @@ def record_turn_outcome(idle_min: Optional[float], cold: bool) -> None:
             b["turns"] //= 2
             b["misses"] //= 2
         try:
-            _save_cache_stats(buckets)
+            _save_stats(buckets=buckets)
         except OSError:
             log.exception("failed to persist cache stats")
 
 
 def expected_turn_cost(ctx_tokens: Optional[int], idle_min: Optional[float]) -> Optional[float]:
-    """What the next turn's input will cost, before we spend anything on it."""
+    """What the next TURN's input will cost, before we spend anything on it.
+
+    A turn is `calls` API calls, and each one re-sends the prefix. Only the
+    first can miss the cache, so the write premium is paid once while the read
+    is paid every call — which is why turn length, not idle time, dominates the
+    figure once a session gets fat.
+    """
     if not ctx_tokens:
         return None
     p = miss_probability(_idle_bucket(idle_min))
-    rate = p * CACHE_WRITE_MULT + (1 - p) * CACHE_READ_MULT
+    rate = (calls_per_turn() * CACHE_READ_MULT
+            + p * (CACHE_WRITE_MULT - CACHE_READ_MULT))
     return ctx_tokens * rate * PRICE_IN_PER_MTOK / 1_000_000
 
 
@@ -2480,12 +2553,19 @@ def _record_turn_metrics(
         last = _usage_tail(path)
         if last is None:
             return
+        # Before the update: the session's call count as of the PREVIOUS turn.
+        # The difference is how many calls this turn made — the only place that
+        # number is observable, and the input to the next rotation decision.
+        before = ((get_chat_state(chat_id).get("session_totals") or {})
+                  .get("calls") or 0)
         totals = _usage_totals(path)
         update_chat_state(chat_id, last_turn=last, session_totals=totals)
         record_turn_outcome(idle_before, bool(last.get("cold")))
+        record_calls_per_turn((totals.get("calls") or 0) - before)
         log.info(
-            "chat %s: turn ctx=%s cold=%s cost=%.3f session=%.2f",
-            chat_id, last.get("ctx_tokens"), last.get("cold"),
+            "chat %s: turn ctx=%s calls=%s cold=%s cost=%.3f session=%.2f",
+            chat_id, last.get("ctx_tokens"),
+            (totals.get("calls") or 0) - before, last.get("cold"),
             last.get("cost_usd") or 0.0, totals.get("cost_usd") or 0.0,
         )
     except Exception:
@@ -2618,7 +2698,7 @@ def rotate_session(
         "retired_at": datetime.now(timezone.utc).isoformat(),
         "reason": reason,
         "ctx_tokens": facts.get("ctx_tokens"),
-        "turns": totals.get("turns"),
+        "calls": totals.get("calls"),
         "cost_usd": totals.get("cost_usd"),
     }
     chain = list(state.get("sessions") or [])
@@ -3052,7 +3132,7 @@ def render_status(chat_id: str, rule: "Rule") -> Tuple[str, str]:
     if facts.get("ctx_tokens"):
         L.append(msg("status.context",
                      tokens=_fmt_count(facts["ctx_tokens"], "tokens"),
-                     turns=_fmt_count(totals.get("turns", 0), "turns"),
+                     calls=_fmt_count(totals.get("calls", 0), "calls"),
                      age=_fmt_age(facts.get("idle_min"))))
     else:
         L.append(msg("status.context_unknown"))
@@ -3086,6 +3166,7 @@ def render_status(chat_id: str, rule: "Rule") -> Tuple[str, str]:
             L.append(msg("status.next_if_idle", cost=_fmt_usd(cold_cost)))
     L.append(msg("status.policy", mode=SESSION_ROTATE_MODE,
                  threshold=_fmt_usd(ROTATE_TURN_COST_USD),
+                 calls=f"{calls_per_turn():.0f}",
                  ctx_cap=_fmt_int(ROTATE_HARD_CTX)))
     L.append(msg("status.cache_decay", buckets=" · ".join(
         msg("status.cache_decay_bucket",
@@ -3146,12 +3227,12 @@ def render_sessions(chat_id: str, rule: "Rule") -> Tuple[str, str]:
              count=len(chain) + 1, spent=_fmt_usd(spent)), ""]
     for s in chain:
         L.append(msg("sessions.retired", seq=s.get("seq"), id=s.get("id"),
-                     turns=_fmt_count(s.get("turns"), "turns"),
+                     calls=_fmt_count(s.get("calls", s.get("turns")), "calls"),
                      cost=_fmt_usd(s.get("cost_usd")),
                      retired_at=_fmt_when(s.get("retired_at")),
                      reason=s.get("reason")))
     L.append(msg("sessions.current", seq=sv["seq"], id=sv["id"],
-                 turns=_fmt_count(totals.get("turns"), "turns"),
+                 calls=_fmt_count(totals.get("calls"), "calls"),
                  cost=_fmt_usd(totals.get("cost_usd"))))
     L += ["", msg("sessions.footer")]
     return render_message(L)
