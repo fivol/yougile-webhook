@@ -24,6 +24,59 @@ YouGile ──POST──▶ https://your.domain/yougile/webhook
                   --resume     <chatId>   (subsequent)
 ```
 
+## Requirements
+
+| What | Why |
+|---|---|
+| Python 3.11+ | this service |
+| The `claude` CLI, logged in | every turn is a `claude -p` process |
+| Node 18+ and a **YouGile MCP server** | how the agent talks back to the chat — see below |
+| A YouGile API key | this service reads chat history and drives the status sticker |
+
+### The YouGile MCP server — not optional
+
+This receiver is one half of the loop. It *starts* an agent and hands it the
+chat history; everything the agent sends **back** — the ack, the answer,
+files, task updates — goes through MCP tools, which come from a separate
+YouGile MCP server. Without it the agent runs, works, and says nothing:
+`/healthz` is green, the sticker flips to `working`, and the chat stays
+silent.
+
+The prompts shipped here call `mcp__yougile-mcp__send_task_message`,
+`…__send_task_file`, `…__get_task_messages`, `…__get_task` and
+`…__update_task`. Any MCP server exposing those names works; the one these
+prompts were written against is
+[github.com/ichinya/yougile-mcp](https://github.com/ichinya/yougile-mcp)
+(note: the unrelated `yougile-mcp` package on npm is a different project —
+don't `npx` it):
+
+```bash
+git clone https://github.com/ichinya/yougile-mcp ~/mcp-servers/yougile-mcp
+cd ~/mcp-servers/yougile-mcp && npm install && npm run build
+```
+
+Register it for the account that runs the agent. The turn is spawned as
+`claude … -p` with `cwd = rule.workdir` and no `--mcp-config`, so the server
+has to be reachable from there — **user scope** (available in every
+directory) is the simple choice:
+
+```bash
+claude mcp add --scope user yougile-mcp \
+  --env YOUGILE_API_KEY=<your-key> \
+  -- node ~/mcp-servers/yougile-mcp/yougile.cjs
+```
+
+Verify from the workdir, not from this repo — that's where the agent runs:
+
+```bash
+cd /path/to/your/company-root && claude mcp list
+```
+
+A project-scoped `.mcp.json` inside `rule.workdir` works too. The MCP server
+needs its own copy of the API key: it authenticates as the account the agent
+posts **as**, which is usually a dedicated bot user, while this service's
+`YOUGILE_API_KEY` only reads history and stickers.
+
 ## Install
 
 ```bash
@@ -640,6 +693,45 @@ on next restart — no per-prompt copy-paste. The shipped file enforces:
 If a particular HTML tag renders as literal text in your deployment,
 drop it from `prompts/_formatting.txt`.
 
+### The reply contract — repeated on every turn
+
+The file has two parts, split by a `=== ALWAYS ===` marker line:
+
+- **above it** — the full spec. Substituted at `{formatting}`, i.e. once per
+  session, on the first turn;
+- **below it** — a ~12-line reply contract, appended **last to every
+  prompt**, follow-ups included.
+
+The split exists because presence and attention aren't the same thing. A
+turn that runs a `feature`/`iteration`-style skill spends 100k tokens
+implementing, and the last output template it read is the skill's, not this
+file's. The result is a report with the right blocks and no markup: correct
+content, `textHtml` empty, an unformatted wall in the chat. Restating the
+contract at the end of every prompt is what keeps that from happening; the
+long spec above the marker stays a first-turn cost.
+
+A file with no marker is all spec and behaves exactly as before.
+
+### When a skill owns the report
+
+Skills bring their own chat-output template — which blocks, in which order,
+where the links go. That is **what** to say; this file is **how** it reaches
+the user. The prompts state the bridge explicitly: keep the skill's blocks,
+render them as HTML, send them as one `send_task_message` call. Without that
+line the agent resolves the clash by dropping the formatting and keeping the
+blocks, which is the failure above.
+
+### Unformatted replies are detected, not just discouraged
+
+The agent never sees how its own message rendered, and YouGile can't
+re-render one after the fact (its message `PUT` only takes
+`deleted`/`label`/`react`). So the receiver watches its own agent's messages
+as they come back as deliveries: a reply of at least
+`chat.plain_reply_min_chars` (400) characters that carries no `textHtml` is
+logged as a warning and recorded on the chat (`last_reply_plain`). The next
+prompt for that chat opens the reply contract with a one-line notice that
+the previous answer went out unformatted. One good reply clears the flag.
+
 ## Wording — `messages/<lang>.toml`
 
 Everything the **receiver itself** says in a chat — `/help`, `/status`,
@@ -743,6 +835,7 @@ previous column.
 | `register_webhook.py` | CLI to manage YouGile subscriptions. |
 | `rules.example.toml` | Rule template (commit). |
 | `prompts/*.example.txt` | Prompt templates (commit). |
+| `prompts/_formatting.txt` | Channel rules: how a reply is rendered for YouGile, plus the always-repeated reply contract (commit). |
 | `messages/<lang>.toml` | Everything the receiver says in a chat (commit). |
 | `rules.toml`, `prompts/*.txt` | Your real rules and prompts (**gitignored**). |
 | `config.yaml` | Grouped behaviour settings (commit). |
