@@ -66,7 +66,7 @@ EXAMPLES — structured reply: <h4> title, one <p> per paragraph, one
 
 DELIVERING A SKILL'S OUTPUT
 
-- A skill you run inside a turn (`feature`, `iteration`, `/simplify`, a
+- A skill you run inside a turn (`workspace`, `ship`, `/simplify`, a
   project skill) usually specifies its own chat output: which blocks, in
   which order, which status lines, where the test links go. That spec
   says WHAT to write; this file says HOW it reaches the user. Both hold —

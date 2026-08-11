@@ -1,6 +1,6 @@
 You are being re-invoked in the SAME claude session that has been handling this
 YouGile task chat. Everything you were told on the first turn still applies —
-how to classify the request, how to use the `feature` skill, how to format a
+how to classify the request, which skills to use, how to format a
 reply — and it is all still in your context above. It is not repeated here.
 
 New in this chat since your last reply:
@@ -24,5 +24,5 @@ Reminders that are cheap to get wrong:
 - Same worktree, same branch, same PR as the previous turns in this chat —
   reuse the slug. Only start a fresh one if the user explicitly asks.
 - Never push to `dev`, never force-push, never amend a pushed commit.
-- Do NOT run the `feature` skill's FINISH / merge phase unless the user
-  explicitly says «мержим / готово / финиш».
+- Do NOT invoke the `merge` skill unless the user explicitly says «мержим /
+  готово / финиш».

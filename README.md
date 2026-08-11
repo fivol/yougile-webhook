@@ -272,7 +272,7 @@ actual request. So a rule has two templates:
 | | `prompt_file` | `prompt_file_followup` |
 |---|---|---|
 | Used on | first turn of a session (incl. after a rotation) | every turn after that |
-| Carries | the standing instructions: how to classify, how to use the `feature` skill, the full formatting rules, the whole chat so far | the new messages, the stats block, and a short reminder of what is cheap to get wrong |
+| Carries | the standing instructions: how to classify, which skills to use, the full formatting rules, the whole chat so far | the new messages, the stats block, and a short reminder of what is cheap to get wrong |
 
 What a follow-up turn no longer carries:
 
@@ -703,7 +703,7 @@ The file has two parts, split by a `=== ALWAYS ===` marker line:
   prompt**, follow-ups included.
 
 The split exists because presence and attention aren't the same thing. A
-turn that runs a `feature`/`iteration`-style skill spends 100k tokens
+turn that runs a `workspace`/`ship`-style skill spends 100k tokens
 implementing, and the last output template it read is the skill's, not this
 file's. The result is a report with the right blocks and no markup: correct
 content, `textHtml` empty, an unformatted wall in the chat. Restating the
