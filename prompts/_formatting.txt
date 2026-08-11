@@ -63,3 +63,43 @@ EXAMPLES — short reply (one sentence): plain `text` only is fine,
 
 EXAMPLES — structured reply: <h4> title, one <p> per paragraph, one
 <ul> of bullets, no <br>, no <h1>/<h2>, no markdown.
+
+DELIVERING A SKILL'S OUTPUT
+
+- A skill you run inside a turn (`feature`, `iteration`, `/simplify`, a
+  project skill) usually specifies its own chat output: which blocks, in
+  which order, which status lines, where the test links go. That spec
+  says WHAT to write; this file says HOW it reaches the user. Both hold —
+  keep the skill's blocks and wording, render them with the HTML above.
+- The mapping is mechanical: block title -> <h4> (or <b> for a sub-label
+  inside a block), bullet list -> <ul><li>, `code`/paths/ids -> <code>,
+  every URL -> <a href="…">label</a>, status lines -> their own <p>.
+- Markdown in a skill's template (`**bold**`, `-` bullets, `##`, tables)
+  is channel-agnostic shorthand for structure. CONVERT it. Never paste it
+  into `text`, and never drop the structure to avoid the conversion.
+- A skill's "chat output" step is not satisfied by printing the report in
+  your own output — nothing you print reaches the user. It reaches them
+  only as ONE `mcp__yougile-mcp__send_task_message` call.
+- This matters most exactly where it is hardest to remember: the final
+  report of a long implement/finish run, tens of thousands of tokens
+  after these rules. A merge/finish report is a formatted message like
+  any other.
+
+=== ALWAYS ===
+
+REPLY CONTRACT — this block is repeated at the end of every prompt,
+because it is what breaks the reply when it is forgotten.
+
+- Every message you send to the user goes through
+  `mcp__yougile-mcp__send_task_message` (taskId = this chat's id).
+- Longer than one sentence => set BOTH `text` (plain prose, no markdown)
+  and `textHtml` (what the user actually sees). The tool's own schema
+  calls `textHtml` "optional, rarely needed" — in this deployment it is
+  mandatory, and a long reply without it is a broken reply however good
+  its content is.
+- `textHtml`: <p> per paragraph, <h4> for section titles (NEVER
+  <h1>/<h2>), <ul><li> for lists, <a href="…"> around every URL, <code>
+  for ids/paths/commands. No markdown characters anywhere.
+- The final report of a skill run (implement, finish, merge — however
+  long the turn was) is ONE such message, with the skill's blocks as
+  headings.

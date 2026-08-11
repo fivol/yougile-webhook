@@ -30,7 +30,7 @@ from fastapi import FastAPI, Request
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -331,6 +331,16 @@ INTERRUPT_NOTICE = (
     "mid-run and may have left uncommitted edits or a half-finished step.\n"
     "  3. Then continue, extend, or change direction as the new message "
     "requires, and proceed through your normal flow (ack → work → final reply)."
+)
+
+# Prepended to the reply contract when the agent's previous reply in this chat
+# went out unformatted. The agent never sees its own messages rendered — it gets
+# no feedback from the channel at all — so a turn that dropped `textHtml` has no
+# way of knowing, and the next turn repeats it. This is that feedback.
+PLAINTEXT_NOTICE = (
+    "⚠️ Your previous reply in this chat was posted as PLAIN TEXT — it went "
+    "out with `textHtml` empty, so the user got an unformatted wall instead of "
+    "the report you wrote. Do not repeat it in this turn."
 )
 
 # Retry policy for transient API errors. The Anthropic API surfaces overload /
@@ -641,6 +651,10 @@ AGENT_USER_EMAIL = os.environ.get("AGENT_USER_EMAIL", "").strip().lower()
 # How much of the replied-to message to quote back into the prompt so the agent
 # knows which of its own messages the user is answering.
 REPLY_QUOTE_MAX_CHARS = int(os.environ.get("REPLY_QUOTE_MAX_CHARS", "2000"))
+# Below this an agent message is an ack or a one-liner, where plain text is the
+# right answer — only longer replies are expected to carry `textHtml`.
+PLAIN_REPLY_MIN_CHARS = conf(
+    "chat.plain_reply_min_chars", "PLAIN_REPLY_MIN_CHARS", 400, int)
 
 RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
 
@@ -659,12 +673,26 @@ WEBHOOK_ENSURE_RETRY_SECONDS = int(os.environ.get("WEBHOOK_ENSURE_RETRY_SECONDS"
 # Single source of truth so all spawned agents post visually-consistent messages
 # into YouGile chats. Optional file — if it's missing the placeholder just gets
 # stripped, so existing prompts that don't use it keep working.
+#
+# The file is split by a marker line into two parts with different lifetimes:
+# the spec above it goes in once per session (at {formatting}, first turn), the
+# short contract below it is appended LAST to EVERY prompt. Presence is not the
+# same as attention: a rule read on turn one, 100k tokens before the reply it
+# governs, loses to whatever the agent read last — which, on an implement turn,
+# is a skill's own output template. The part whose loss the agent cannot see and
+# the user cannot miss (a plain-text wall instead of a report) is the part that
+# has to be re-stated at the end of every turn. No marker => the whole file is
+# the spec, exactly as before.
 _FORMATTING_FILE = ROOT / os.environ.get("FORMATTING_FILE", "prompts/_formatting.txt")
-FORMATTING_BLOCK = (
-    _FORMATTING_FILE.read_text(encoding="utf-8").strip()
+_FORMATTING_MARKER = "=== ALWAYS ==="
+_formatting_raw = (
+    _FORMATTING_FILE.read_text(encoding="utf-8")
     if _FORMATTING_FILE.exists()
     else ""
 )
+FORMATTING_BLOCK, _, REPLY_CONTRACT = _formatting_raw.partition(_FORMATTING_MARKER)
+FORMATTING_BLOCK = FORMATTING_BLOCK.strip()
+REPLY_CONTRACT = REPLY_CONTRACT.strip()
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
@@ -1374,6 +1402,51 @@ def learn_agent_user_id(payload) -> None:
             log.exception("agent identity: could not cache %s", _AGENT_STATE_FILE)
         log.info("agent identity: %s resolved to user %s", AGENT_MENTION, uid)
         return
+
+
+def note_reply_formatting(payload) -> None:
+    """Record whether the agent's own last message reached the chat formatted.
+
+    The receiver never sends the agent's replies — the agent posts them over MCP
+    and we only see them come back as deliveries — so this is the single point
+    where "the report went out as an unformatted wall" is observable at all.
+    Nothing can be done to the message itself: YouGile's message PUT only takes
+    deleted/label/react, so a plain-text reply cannot be re-rendered after the
+    fact. The fix has to be prospective — flag it on the chat and let the next
+    prompt say so, since the agent has no other way to learn how its own
+    messages look.
+
+    Only long messages count: acks and one-liners are plain text by design.
+    """
+    if not isinstance(payload, dict) or payload.get("event") != "chat_message-created":
+        return
+    me = agent_user_id()
+    if not me or payload.get("fromUserId") != me:
+        return
+    chat_id = extract_chat_id(payload)
+    message = payload.get("payload")
+    if not (chat_id and isinstance(message, dict)):
+        return
+    text = message.get("text") or ""
+    if len(text) < PLAIN_REPLY_MIN_CHARS:
+        return
+    # YouGile carries the rendered body in `properties.textHtml`, not at the top
+    # level of the message the webhook delivers.
+    props = message.get("properties")
+    html = props.get("textHtml") if isinstance(props, dict) else None
+    plain = not (isinstance(html, str) and html.strip())
+    if plain:
+        log.warning(
+            "chat %s: agent posted a %d-char reply with no textHtml — the user "
+            "sees it unformatted; the next prompt will say so",
+            chat_id, len(text),
+        )
+    # Written either way: one formatted reply clears the flag, so the notice
+    # never outlives the mistake. Never for an unknown chat — the state file's
+    # existence is what `skip_if_chat_known` reads as "we have run here", and a
+    # bookkeeping write must not silence a future first mention.
+    if chat_known(chat_id):
+        update_chat_state(chat_id, last_reply_plain=plain)
 
 
 def _fetch_message(chat_id: str, message_id: str) -> Optional[dict]:
@@ -3793,6 +3866,7 @@ def _build_prompt(
     handoff_path: Optional[Path] = None,
     session_stats: str = "",
     dropped: int = 0,
+    last_reply_plain: bool = False,
 ) -> str:
     """Render the prompt for one turn.
 
@@ -3873,6 +3947,14 @@ def _build_prompt(
             f"---\nAttachments referenced above are saved locally — open them "
             f"with your Read tool to view their contents:\n{listed}\n"
         )
+    # Dead last, on every turn including follow-ups — see REPLY_CONTRACT. The
+    # rest of the prompt says what to do; this says how the answer has to leave
+    # the process, and it is the thing a 100k-token implement turn forgets.
+    if REPLY_CONTRACT:
+        contract = REPLY_CONTRACT
+        if last_reply_plain and PLAINTEXT_NOTICE:
+            contract = f"{PLAINTEXT_NOTICE}\n\n{contract}"
+        rendered = f"{rendered}\n\n---\n{contract}\n"
     if interrupted and INTERRUPT_NOTICE:
         rendered = f"{INTERRUPT_NOTICE}\n\n---\n{rendered}"
     return rendered
@@ -4330,6 +4412,7 @@ def spawn_claude(
             session_id=session_id, interrupted=interrupted,
             handoff_path=handoff_path, session_stats=session_stats,
             dropped=dropped,
+            last_reply_plain=bool(chat_state.get("last_reply_plain")),
         )
         cmd = [CLAUDE_BIN, *rule.extra_args, *session_flag, "-p", prompt]
 
@@ -4524,6 +4607,10 @@ async def yougile_webhook(req: Request):
         # A reply to the agent's own message is a mention in every sense except
         # the literal text — mark it before the rules look at the payload.
         learn_agent_user_id(payload)
+        # Cheap and on this path only: the agent's own replies come back as
+        # deliveries too, and this is where we notice one that went out
+        # unformatted (no API call, no rule matching involved).
+        note_reply_formatting(payload)
         replied_to_agent = await asyncio.to_thread(annotate_agent_reply, payload)
 
     # Slash commands are answered by the receiver itself — no agent spawn, no

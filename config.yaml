@@ -75,3 +75,7 @@ handoff:
 chat:
   # Append the context/cost block to the ack the agent posts.
   ack_stats: true             # ACK_STATS
+  # An agent reply at least this long is expected to carry `textHtml`; one that
+  # doesn't is logged and called out in the next prompt. Shorter messages (acks,
+  # one-liners) are plain text by design and never counted.
+  plain_reply_min_chars: 400  # PLAIN_REPLY_MIN_CHARS

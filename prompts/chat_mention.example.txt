@@ -86,6 +86,11 @@ STEP 3 — DO THE WORK.
 
 STEP 4 — Post the final reply (taskId = `payload.chatId`).
 
+  If a skill produced the work, its own "chat output" step decides WHAT the
+  report says; this call is HOW it reaches the user. Keep the skill's blocks,
+  render them as HTML (block title → <h4>, bullets → <ul><li>, URLs →
+  <a href>), send them as ONE message. Text you merely print reaches nobody.
+
   RESEARCH: concise answer.
 
   IMPLEMENT — first time:

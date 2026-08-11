@@ -18,9 +18,9 @@ a line:
 Reminders that are cheap to get wrong:
 - Ack first («Исследую» / «Начал работу» / «Продолжаю в ветке task-<slug>»),
   then do the work, then post the final reply. Two messages, not one.
-- The chat renders `textHtml`, NOT markdown. Set both `text` (plain prose) and
-  `textHtml` for anything longer than one sentence. No `**bold**`, no backticks,
-  no `-` bullets in `text`. No <h1>/<h2> anywhere. Wrap every URL in <a href>.
+- A skill's "chat output" step says WHAT the report contains; it still leaves
+  this process as ONE `send_task_message` call, rendered per the reply contract
+  at the end of this prompt. Printing it posts nothing.
 - Same worktree, same branch, same PR as the previous turns in this chat —
   reuse the slug. Only start a fresh one if the user explicitly asks.
 - Never push to `dev`, never force-push, never amend a pushed commit.
