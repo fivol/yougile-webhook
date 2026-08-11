@@ -240,27 +240,31 @@ picks ONE of two modes:
   Ack: `Начал работу` + session id (first time) or `Продолжаю в ветке
   task-<slug>` + session id (continuation).
 
-In IMPLEMENT mode the agent keeps **one worktree + one branch + one PR
-per task chat** (base = `dev`):
+In IMPLEMENT mode the receiver does **not** own the build flow. It hands the
+turn to whatever skill the workdir provides — for the
+[`feature` plugin](https://github.com/fivol/claude-make-better) that is the
+`workspace` skill, which owns worktrees, branches, dev servers, the review gate
+and the PR, and reads the project's own `.claude/feature/config.json` for all of
+it. Base branch, mode, gates, report format: none of that is repeated in this
+repo's prompts, so there is one place to change it and no second copy to drift.
 
-1. **First time:** for each affected repo:
-   - `git worktree add worktrees/<slug>/<repo> -b task-<slug> origin/dev`
-     (worktrees live under the company root, `dev` is required)
-   - Implements + commits in the worktree
-   - `git push -u origin task-<slug>`
-   - `gh pr create --base dev` → captures the PR URL
-   - Posts ONE chat message listing each touched repo's branch name and
-     PR URL.
-2. **Continuation** (same chat, follow-up `@Agent`): agent re-uses the
-   existing worktree/branch, adds commits, `git push` — the existing PR
-   auto-updates. No second PR.
-3. **Fresh branch/PR**: only when the user explicitly asks for one
-   ("новая ветка", "новый PR", "fresh PR"). Then the first-time flow
-   runs again with a new slug.
+What the prompts here keep is what only the chat knows:
+
+- **who** is talking and whether they're allowed to trigger a run;
+- **the slug** — a stable kebab-case name derived from the task title and reused
+  on every turn of this chat, which is what keeps one worktree / branch / PR per
+  chat instead of a new one per message;
+- **when the user said the word** — merging happens on «мержим / готово / финиш»
+  in this chat and nowhere else;
+- **how the answer leaves** — one `send_task_message` call, rendered per
+  [the formatting contract](#replying-from-the-agent--shared-formatting).
 
 Claude's session memory (`--session-id <chatId>` first time, `--resume
-<chatId>` after) is what lets the agent remember the slug / worktree
-path / PR URL across turns.
+<chatId>` after) is what lets the agent remember the slug / worktree path / PR
+URL across turns.
+
+If the workdir has no such skill, the prompts still work: the agent falls back
+to plain git in the current checkout, and the chat contract above is unchanged.
 
 ### Two prompts per session
 
