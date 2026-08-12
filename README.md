@@ -87,9 +87,16 @@ python3.11 -m venv .venv
 
 cp .env.example .env
 cp rules.example.toml rules.toml
-cp prompts/chat_mention.example.txt    prompts/chat_mention.txt
-cp prompts/task_in_progress.example.txt prompts/task_in_progress.txt
-# edit .env, rules.toml, and the prompts
+# edit .env and rules.toml — the prompts already work as shipped
+```
+
+The prompts in `prompts/` are the shipped defaults and need no copying. To change
+one for your install, drop a file of the same name into **`prompts/local/`** —
+it shadows the shipped one, and `prompts/local/` is gitignored:
+
+```bash
+mkdir -p prompts/local
+cp prompts/chat_mention.txt prompts/local/chat_mention.txt   # then edit the copy
 ```
 
 Make `https://your.domain/yougile/webhook` publicly reach `127.0.0.1:9100`
@@ -673,12 +680,12 @@ filePath = local path).
 
 Every spawned agent should produce visually consistent messages — same
 density, same heading discipline, same link style. The single source of
-truth is **`prompts/_formatting.txt`**: it's loaded once at startup and
+truth is **`prompts/formatting.txt`**: it's loaded once at startup and
 substituted into every prompt that contains `{formatting}` (and appended
 as a fallback to prompts that don't). Override with `FORMATTING_FILE` env
 var.
 
-Edit `prompts/_formatting.txt` once and every rule picks up the change
+Edit it once (or shadow it with `prompts/local/formatting.txt`) and every rule picks up the change
 on next restart — no per-prompt copy-paste. The shipped file enforces:
 
 - `textHtml` is what YouGile actually renders; `text` is the plain
@@ -695,7 +702,7 @@ on next restart — no per-prompt copy-paste. The shipped file enforces:
   bullets) into `text` — YouGile shows it as raw characters.
 
 If a particular HTML tag renders as literal text in your deployment,
-drop it from `prompts/_formatting.txt`.
+drop it from your `prompts/local/formatting.txt`.
 
 ### The reply contract — repeated on every turn
 
@@ -735,6 +742,20 @@ as they come back as deliveries: a reply of at least
 logged as a warning and recorded on the chat (`last_reply_plain`). The next
 prompt for that chat opens the reply contract with a one-line notice that
 the previous answer went out unformatted. One good reply clears the flag.
+
+### What is committed, and what is yours
+
+One line decides it: **committed is the engine** — behaviour that should be the
+same for every install — and **ignored is this instance**, meaning anything that
+names your machine, your people or your workspace.
+
+| Committed | Yours (gitignored) |
+|---|---|
+| `prompts/*.txt`, `messages/<lang>.toml`, `config.yaml`, `app.py` | `prompts/local/*.txt`, `rules.toml`, `config.local.yaml`, `.env`, `state/`, `logs/` |
+
+Both halves use the same mechanism — a file of the same name in a `local/`
+directory, or a `.local.` twin, shadows the shipped one — so upgrading the
+engine never touches your text, and your text never has to be merged by hand.
 
 ## Wording — `messages/<lang>.toml`
 
@@ -838,10 +859,10 @@ previous column.
 | `run.sh` | Loads `.env` and exec's uvicorn. |
 | `register_webhook.py` | CLI to manage YouGile subscriptions. |
 | `rules.example.toml` | Rule template (commit). |
-| `prompts/*.example.txt` | Prompt templates (commit). |
-| `prompts/_formatting.txt` | Channel rules: how a reply is rendered for YouGile, plus the always-repeated reply contract (commit). |
+| `prompts/*.txt` | Shipped prompt defaults, including `formatting.txt` — the channel rules and the always-repeated reply contract (commit). |
+| `prompts/local/*.txt` | Per-install overrides: same filename shadows the shipped one (**gitignored**). |
 | `messages/<lang>.toml` | Everything the receiver says in a chat (commit). |
-| `rules.toml`, `prompts/*.txt` | Your real rules and prompts (**gitignored**). |
+| `rules.toml` | Your real rules: workdirs, allowed senders, which prompt each event uses (**gitignored**). |
 | `config.yaml` | Grouped behaviour settings (commit). |
 | `config.local.yaml` | Per-machine overrides, deep-merged on top (**gitignored**). |
 | `.env.example` / `.env` | Secrets and env overrides (`.env` gitignored). |

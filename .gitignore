@@ -5,12 +5,12 @@ state/
 __pycache__/
 *.pyc
 
-# user-specific rules + prompt files (templates with .example.* are committed;
-# _formatting.txt is engine-shared boilerplate without secrets, also committed)
+# Committed = the engine (same for every install). Ignored = this instance:
+# anything naming your machine, your people or your workspace. Prompts follow
+# the same line: `prompts/*.txt` ship as defaults, `prompts/local/<same-name>`
+# shadows one without touching it.
 rules.toml
-prompts/*.txt
-!prompts/*.example.txt
-!prompts/_formatting.txt
+prompts/local/
 
 # per-machine settings overriding config.yaml
 config.local.yaml

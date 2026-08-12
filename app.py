@@ -30,7 +30,7 @@ from fastapi import FastAPI, Request
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -658,6 +658,21 @@ PLAIN_REPLY_MIN_CHARS = conf(
 
 RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
 
+# Engine text ships in the repo; an install customises it by dropping a file of
+# the same name into `prompts/local/`, which shadows it. One idiom for every
+# prompt, instead of `X.example.txt`-copy-me (two files that drift apart the
+# first time either is edited) plus a `_`-prefixed name meaning "shared, don't
+# copy". `local/` is gitignored wholesale, so what is committed is the engine
+# and what is ignored is the instance — you can tell which is which by where the
+# file lives, not by its name.
+PROMPT_LOCAL_DIR = "local"
+
+
+def resolve_prompt(path: Path) -> Path:
+    """`prompts/local/<name>` if it exists, else the shipped `prompts/<name>`."""
+    local = path.parent / PROMPT_LOCAL_DIR / path.name
+    return local if local.is_file() else path
+
 # YouGile auto-disables a webhook subscription after enough failed deliveries
 # (e.g. while we were down or the tunnel was unreachable). Sweep our subscriptions
 # at startup and on a timer so a temporary outage doesn't permanently silence us.
@@ -683,7 +698,8 @@ WEBHOOK_ENSURE_RETRY_SECONDS = int(os.environ.get("WEBHOOK_ENSURE_RETRY_SECONDS"
 # the user cannot miss (a plain-text wall instead of a report) is the part that
 # has to be re-stated at the end of every turn. No marker => the whole file is
 # the spec, exactly as before.
-_FORMATTING_FILE = ROOT / os.environ.get("FORMATTING_FILE", "prompts/_formatting.txt")
+_FORMATTING_FILE = resolve_prompt(
+    ROOT / os.environ.get("FORMATTING_FILE", "prompts/formatting.txt"))
 _FORMATTING_MARKER = "=== ALWAYS ==="
 _formatting_raw = (
     _FORMATTING_FILE.read_text(encoding="utf-8")
@@ -742,7 +758,7 @@ def load_rules(path: Path) -> List[Rule]:
     rules: List[Rule] = []
     for raw in data.get("rules", []):
         name = raw.get("name", "<unnamed>")
-        prompt_path = ROOT / raw.get("prompt_file", "")
+        prompt_path = resolve_prompt(ROOT / raw.get("prompt_file", ""))
         if not prompt_path.exists():
             log.warning("rule %s: prompt file %s missing — skipping", name, prompt_path)
             continue
@@ -752,9 +768,12 @@ def load_rules(path: Path) -> List[Rule]:
         # is enough; no rules.toml change needed.
         followup = ""
         followup_file = raw.get("prompt_file_followup")
-        followup_path = (
+        followup_path = resolve_prompt(
             ROOT / followup_file if followup_file
-            else prompt_path.with_suffix(".followup.txt")
+            # Beside the *configured* prompt, not the resolved one: a local
+            # override of the main template must not drag the shipped follow-up
+            # out of `local/`, nor the other way round.
+            else (ROOT / raw.get("prompt_file", "")).with_suffix(".followup.txt")
         )
         if followup_path.exists():
             followup = followup_path.read_text(encoding="utf-8")
