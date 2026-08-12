@@ -357,6 +357,7 @@ a `config.yaml` home are marked in that file.
 | `CLAUDE_BIN` | Path to the `claude` CLI. |
 | `CLAUDE_WORKDIR` | Default workdir for spawned claude processes. |
 | `CLAUDE_EXTRA_ARGS` | Default CLI args. |
+| `CLAUDE_EFFORT` | Reasoning effort every turn runs at, passed as `claude --effort <level>`: `low`, `medium`, `high`, `xhigh`, `max`. Default `xhigh`. Empty = don't pass the flag, i.e. inherit the machine's `settings.json` `effortLevel`. A rule whose `extra_args` already contain `--effort` keeps its own. |
 | `CLAUDE_MAX_CONCURRENT` | Hard cap on concurrent claude processes across DISTINCT chats (default 10). A re-mention in an already-running chat interrupts that turn instead of counting here. When a genuinely new chat hits the cap, it gets `CONCURRENCY_BUSY_MESSAGE` rather than a silent drop. |
 | `CONCURRENCY_BUSY_MESSAGE` / `_HTML` | Message posted into a chat when the global cap is saturated by OTHER chats (so the user knows to retry shortly). Empty = stay silent. |
 | `INTERRUPT_SIGKILL_GRACE_TICKS` | When a new `@Agent` message interrupts a running turn for the same chat, how many 0.1s ticks to wait after `SIGTERM` before `SIGKILL` (lets claude flush its session transcript). Default `30` (~3s). |

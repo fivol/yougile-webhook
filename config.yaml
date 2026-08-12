@@ -17,6 +17,11 @@
 claude:
   # Global cap on turns running at once, across all chats.
   max_concurrent: 10          # CLAUDE_MAX_CONCURRENT
+  # Reasoning effort every turn runs at: low | medium | high | xhigh | max.
+  # Passed as `claude --effort <level>`. Leave empty to inherit whatever
+  # `effortLevel` the machine's settings.json carries; a rule that sets its own
+  # --effort in extra_args wins over this.
+  effort: xhigh               # CLAUDE_EFFORT
   # Attempts when claude dies on a transient API error.
   api_retries: 3              # CLAUDE_API_RETRIES
 

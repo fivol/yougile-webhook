@@ -298,6 +298,29 @@ CLAUDE_DEFAULT_EXTRA_ARGS = shlex.split(
 CLAUDE_MAX_CONCURRENT = conf(
     "claude.max_concurrent", "CLAUDE_MAX_CONCURRENT", 10, int)
 
+# Reasoning effort every spawned turn runs at. Without the flag the CLI falls
+# back to whatever `effortLevel` the machine's settings.json happens to carry —
+# invisible from here, and different on the next machine. Naming it makes what
+# the service runs a fact of this repo. Set it empty to hand the choice back to
+# settings.json; a rule that puts its own --effort in extra_args still wins.
+CLAUDE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+CLAUDE_EFFORT = conf("claude.effort", "CLAUDE_EFFORT", "xhigh", str).strip().lower()
+if CLAUDE_EFFORT and CLAUDE_EFFORT not in CLAUDE_EFFORT_LEVELS:
+    # A typo here would make the CLI reject every single spawn, so drop the
+    # flag instead of shipping a broken command line.
+    log.warning("config claude.effort: %r is not one of %s — not passing --effort",
+                CLAUDE_EFFORT, ", ".join(CLAUDE_EFFORT_LEVELS))
+    CLAUDE_EFFORT = ""
+
+
+def effort_args(extra_args: List[str]) -> List[str]:
+    """`--effort <level>`, unless disabled or the rule already names one."""
+    if not CLAUDE_EFFORT:
+        return []
+    if any(a == "--effort" or a.startswith("--effort=") for a in extra_args):
+        return []
+    return ["--effort", CLAUDE_EFFORT]
+
 # When a new @Agent message lands in a chat whose turn is STILL running, we
 # interrupt the in-flight turn (kill its process group) and immediately start a
 # fresh turn that --resumes the same session — so the agent sees the new
@@ -4433,13 +4456,14 @@ def spawn_claude(
             dropped=dropped,
             last_reply_plain=bool(chat_state.get("last_reply_plain")),
         )
-        cmd = [CLAUDE_BIN, *rule.extra_args, *session_flag, "-p", prompt]
+        spawn_args = [*effort_args(rule.extra_args), *rule.extra_args, *session_flag]
+        cmd = [CLAUDE_BIN, *spawn_args, "-p", prompt]
 
         ts = datetime.now(timezone.utc).isoformat()
         header = (
             f"\n\n=== {ts} | rule={rule.name} | chat={chat_id} | session={session_id} "
             f"| first_turn={is_first_turn} | spawn ===\n"
-            f"cwd: {rule.workdir}\nbin: {CLAUDE_BIN}\nargs: {rule.extra_args + session_flag}\n"
+            f"cwd: {rule.workdir}\nbin: {CLAUDE_BIN}\nargs: {spawn_args}\n"
             f"--- prompt ---\n{prompt}\n"
         )
 
@@ -4572,6 +4596,7 @@ async def healthz():
         "version": APP_VERSION,
         "loop_heartbeat_age_s": round(time.monotonic() - _loop_heartbeat, 1),
         "claude_bin": CLAUDE_BIN,
+        "claude_effort": CLAUDE_EFFORT or "(settings.json)",
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,
         "active_claude_procs": len(_active_procs),
         # Armed once known: without it, a reply to the agent can't be told from
