@@ -426,6 +426,10 @@ TURN_ADOPT_POLL_SECONDS = conf(
 # directions (--resume can't find it, --session-id can consider it taken), so
 # the only way out is a fresh link in the chat's session chain — otherwise the
 # chat is bricked and every later mention dies the same way.
+# Matching here only means "the prompt never reached a session". Whether the
+# session is actually GONE is a second question finish_turn answers by looking
+# for the transcript: "already in use" over a transcript that is right there is
+# a collision, and rotating away from it would discard a live conversation.
 SESSION_LOST_PATTERN = re.compile(
     r"No conversation found with session ID"
     r"|Session ID .{0,80}? is already in use"
@@ -3830,15 +3834,24 @@ def finish_turn(
     task_id = rec.get("task_id")
     session_id = rec.get("session_id")
     rule = next((r for r in RULES if r.name == rec.get("rule")), None)
-    session_lost = bool(failure and SESSION_LOST_PATTERN.search(failure))
+    # The prompt never reached a session, whatever the reason — those messages
+    # were not delivered and the watermark has to go back.
+    undelivered = bool(failure and SESSION_LOST_PATTERN.search(failure))
+    # But "already in use" on a session whose transcript is sitting on disk is a
+    # collision, not a loss: the id is fine, this attempt just failed to claim
+    # it. Rotating away would throw a live session's context out over what is
+    # usually a self-inflicted double-claim.
+    session_lost = undelivered and not (
+        bool(session_id) and rule is not None
+        and _transcript_path(rule.workdir, session_id).exists()
+    )
     recovering = (
         session_lost and bool(chat_id) and bool(rule)
         and rec.get("allow_session_recovery", True)
     )
     try:
-        if chat_id and session_lost:
-            # The prompt never reached a session, so those messages were not
-            # delivered after all — put the watermark back or they are lost.
+        if chat_id and undelivered:
+            # Put the watermark back or those messages are lost.
             prev = rec.get("prev_watermark")
             update_chat_state(chat_id, last_message_id=prev)
             log.warning(
@@ -3858,7 +3871,15 @@ def finish_turn(
                         chat_id, (p_rule, pending.get("payload")))
         _mark_turn_finished(chat_id, task_id)
         if failure:
-            _report_dead_turn(chat_id, rc, failure, session_lost, recovering)
+            with _active_lock:
+                queued = bool(chat_id) and chat_id in _pending_turns
+            # A newer instruction is already chained behind this turn (see
+            # _release_chat) and answers in its place, so reporting here posts
+            # the same failure twice for what the user lived as one exchange.
+            # A lost session is the exception: the replacement runs into it too,
+            # and this is the message that explains the rotation.
+            if session_lost or not queued:
+                _report_dead_turn(chat_id, rc, failure, session_lost, recovering)
         elif chat_id and TURN_REPORT_SILENT and not rec.get("killed"):
             with _active_lock:
                 queued = chat_id in _pending_turns
@@ -4002,6 +4023,26 @@ def _build_prompt(
     return rendered
 
 
+def _retry_cmd(cmd: List[str], rule: "Rule") -> List[str]:
+    """The same command, but resuming the session instead of claiming its id.
+
+    Attempt 1 writes the session transcript before it ever calls the API, so a
+    retry after a 5xx would re-run `--session-id <id>` against an id that now
+    exists on disk and die in under a second with "already in use" — burning
+    every remaining attempt without a single API call, and then looking like a
+    lost session to finish_turn. Once the transcript is there the only way back
+    in is --resume.
+    """
+    try:
+        i = cmd.index("--session-id")
+    except ValueError:
+        return cmd  # already resuming, or a rule with no per-chat session
+    session_id = cmd[i + 1] if i + 1 < len(cmd) else None
+    if not session_id or not _transcript_path(rule.workdir, session_id).exists():
+        return cmd  # the attempt died before the session existed — claim it again
+    return [*cmd[:i], "--resume", session_id, *cmd[i + 2:]]
+
+
 def _spawn_subprocess(
     rule: Rule,
     cmd: List[str],
@@ -4109,7 +4150,13 @@ def _spawn_subprocess(
 
             def _delayed_retry():
                 time.sleep(delay)
-                p = _spawn_subprocess(rule, cmd, header, on_exit, chat_id=chat_id,
+                # Resolved here, not above: attempt 1 may still have been
+                # flushing its transcript when the retry was scheduled.
+                retry_cmd = _retry_cmd(cmd, rule)
+                if retry_cmd is not cmd:
+                    log.info("rule %s: retry resumes session %s instead of claiming it",
+                             rule.name, cmd[cmd.index("--session-id") + 1])
+                p = _spawn_subprocess(rule, retry_cmd, header, on_exit, chat_id=chat_id,
                                       turn_log=turn_log, attempt=attempt + 1)
                 if p is not None and chat_id:
                     write_turn(chat_id, pid=p.pid, attempt=attempt + 1)
