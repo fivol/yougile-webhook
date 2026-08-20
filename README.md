@@ -744,6 +744,47 @@ logged as a warning and recorded on the chat (`last_reply_plain`). The next
 prompt for that chat opens the reply contract with a one-line notice that
 the previous answer went out unformatted. One good reply clears the flag.
 
+### The empty bubble — a CDATA wrapper
+
+A rarer, louder version of the same failure: the agent wraps `textHtml` in
+an XML CDATA section, `<![CDATA[ ... ]]>`. YouGile stores the string
+verbatim and its renderer reads the section as one non-element node, so the
+message arrives as an **empty bubble** — the turn exits 0, nothing is logged,
+and the user sees a blank message from the agent. It is not something the
+agent can learn its way out of, because nothing in the channel tells it.
+
+So it is removed before the call is made. `hooks/strip_cdata.py` is a
+Claude Code **`PreToolUse` hook** on `mcp__yougile-mcp__send_task_message`:
+it takes the wrapper off `textHtml` (and `text`) and hands the call back
+through `updatedInput`. It is silent, exits 0 on anything unexpected — a
+broken hook must never cost a reply — and logs every message it sees to
+`logs/hooks.log`, so "the hook found nothing" and "the hook never ran" stay
+distinguishable.
+
+Install it once, in `~/.claude/settings.json` (user scope covers every
+`workdir` a rule spawns an agent in):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__yougile-mcp__send_task_message",
+        "hooks": [
+          { "type": "command", "command": "/abs/path/to/yougile-webhook/hooks/strip_cdata.py" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The receiver keeps its own net under the hook: a reply that reaches the chat
+CDATA-wrapped anyway is logged and recorded as `last_reply_cdata`, and the
+next prompt for that chat opens the reply contract by saying the previous
+answer rendered as an empty bubble. Unlike the plain-text check this one
+ignores length — a wrapper breaks a short ack just as completely.
+
 ### What is committed, and what is yours
 
 One line decides it: **committed is the engine** — behaviour that should be the
@@ -860,6 +901,7 @@ previous column.
 | `run.sh` | Loads `.env` and exec's uvicorn. |
 | `register_webhook.py` | CLI to manage YouGile subscriptions. |
 | `rules.example.toml` | Rule template (commit). |
+| `hooks/strip_cdata.py` | `PreToolUse` hook that strips a CDATA wrapper off an outgoing chat message; wire it up in `~/.claude/settings.json` (commit). |
 | `prompts/*.txt` | Shipped prompt defaults, including `formatting.txt` — the channel rules and the always-repeated reply contract (commit). |
 | `prompts/local/*.txt` | Per-install overrides: same filename shadows the shipped one (**gitignored**). |
 | `messages/<lang>.toml` | Everything the receiver says in a chat (commit). |
@@ -874,6 +916,7 @@ previous column.
 | `logs/events.jsonl` | All inbound webhooks. |
 | `logs/claude.log` | Every turn's prompt, plus a pointer to its output log. |
 | `logs/turns/*.log` | One file per turn: claude's stdout/stderr. |
+| `logs/hooks.log` | What `hooks/strip_cdata.py` saw and repaired. |
 
 ## Security
 

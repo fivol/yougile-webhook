@@ -366,6 +366,20 @@ PLAINTEXT_NOTICE = (
     "the report you wrote. Do not repeat it in this turn."
 )
 
+# Same feedback loop, louder failure: `textHtml` arrived wrapped in an XML CDATA
+# section. YouGile stores the string verbatim and its renderer reads
+# `<![CDATA[ ... ]]>` as one non-element node, so the message lands as an EMPTY
+# bubble — not unformatted, absent. Rare (4 of 858 formatted replies since May)
+# and self-repeating, because nothing in the channel tells the agent. The
+# PreToolUse hook in hooks/strip_cdata.py takes the wrapper off before the call
+# is made; this is the net under it, for a reply that reaches the chat anyway.
+CDATA_NOTICE = (
+    "⚠️ Your previous reply in this chat had its `textHtml` wrapped in "
+    "`<![CDATA[ ... ]]>`. YouGile renders that as an EMPTY message — the user "
+    "saw a blank bubble where your report should have been. Send the HTML on "
+    "its own, with no CDATA wrapper, in this turn."
+)
+
 # Retry policy for transient API errors. The Anthropic API surfaces overload /
 # rate-limit failures as 5xx; the claude CLI prints them to stdout and exits
 # with a non-zero code. We re-spawn the same command after a backoff.
@@ -1473,26 +1487,49 @@ def note_reply_formatting(payload) -> None:
     message = payload.get("payload")
     if not (chat_id and isinstance(message, dict)):
         return
-    text = message.get("text") or ""
-    if len(text) < PLAIN_REPLY_MIN_CHARS:
-        return
     # YouGile carries the rendered body in `properties.textHtml`, not at the top
     # level of the message the webhook delivers.
     props = message.get("properties")
-    html = props.get("textHtml") if isinstance(props, dict) else None
-    plain = not (isinstance(html, str) and html.strip())
-    if plain:
-        log.warning(
-            "chat %s: agent posted a %d-char reply with no textHtml — the user "
-            "sees it unformatted; the next prompt will say so",
-            chat_id, len(text),
-        )
-    # Written either way: one formatted reply clears the flag, so the notice
-    # never outlives the mistake. Never for an unknown chat — the state file's
-    # existence is what `skip_if_chat_known` reads as "we have run here", and a
-    # bookkeeping write must not silence a future first mention.
-    if chat_known(chat_id):
-        update_chat_state(chat_id, last_reply_plain=plain)
+    raw = props.get("textHtml") if isinstance(props, dict) else None
+    html = raw if isinstance(raw, str) else ""
+    text = message.get("text") or ""
+
+    # Written either way: one clean reply clears a flag, so a notice never
+    # outlives the mistake it describes.
+    updates: Dict[str, Any] = {}
+
+    # A CDATA wrapper breaks a message at ANY length, so unlike the plain-text
+    # check below this one is not excused by brevity. Only messages that carry
+    # `textHtml` are judged: one without it cannot be CDATA-broken, and must not
+    # clear the flag a broken reply just set.
+    if html.strip():
+        cdata = "<![CDATA[" in html
+        if cdata:
+            log.warning(
+                "chat %s: agent posted a reply with CDATA-wrapped textHtml — "
+                "YouGile shows it as an empty bubble; the next prompt will say "
+                "so (the strip_cdata hook should have caught this)",
+                chat_id,
+            )
+        updates["last_reply_cdata"] = cdata
+
+    # Only long messages count here: acks and one-liners are plain text by
+    # design, and must not clear the flag the real reply set.
+    if len(text) >= PLAIN_REPLY_MIN_CHARS:
+        plain = not html.strip()
+        if plain:
+            log.warning(
+                "chat %s: agent posted a %d-char reply with no textHtml — the "
+                "user sees it unformatted; the next prompt will say so",
+                chat_id, len(text),
+            )
+        updates["last_reply_plain"] = plain
+
+    # Never for an unknown chat — the state file's existence is what
+    # `skip_if_chat_known` reads as "we have run here", and a bookkeeping write
+    # must not silence a future first mention.
+    if updates and chat_known(chat_id):
+        update_chat_state(chat_id, **updates)
 
 
 def _fetch_message(chat_id: str, message_id: str) -> Optional[dict]:
@@ -3930,6 +3967,7 @@ def _build_prompt(
     session_stats: str = "",
     dropped: int = 0,
     last_reply_plain: bool = False,
+    last_reply_cdata: bool = False,
 ) -> str:
     """Render the prompt for one turn.
 
@@ -4017,6 +4055,8 @@ def _build_prompt(
         contract = REPLY_CONTRACT
         if last_reply_plain and PLAINTEXT_NOTICE:
             contract = f"{PLAINTEXT_NOTICE}\n\n{contract}"
+        if last_reply_cdata and CDATA_NOTICE:
+            contract = f"{CDATA_NOTICE}\n\n{contract}"
         rendered = f"{rendered}\n\n---\n{contract}\n"
     if interrupted and INTERRUPT_NOTICE:
         rendered = f"{INTERRUPT_NOTICE}\n\n---\n{rendered}"
@@ -4502,6 +4542,7 @@ def spawn_claude(
             handoff_path=handoff_path, session_stats=session_stats,
             dropped=dropped,
             last_reply_plain=bool(chat_state.get("last_reply_plain")),
+            last_reply_cdata=bool(chat_state.get("last_reply_cdata")),
         )
         spawn_args = [*effort_args(rule.extra_args), *rule.extra_args, *session_flag]
         cmd = [CLAUDE_BIN, *spawn_args, "-p", prompt]
