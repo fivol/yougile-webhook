@@ -11,6 +11,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import tomllib
@@ -321,6 +322,64 @@ def effort_args(extra_args: List[str]) -> List[str]:
         return []
     return ["--effort", CLAUDE_EFFORT]
 
+
+# The agent reaches YouGile through mcp_yougile.py, in this repo, handed to
+# claude explicitly rather than registered by hand in ~/.claude.json. Two
+# reasons, in order of importance:
+#
+#   * The reply channel is ours. The upstream server's schema described
+#     `textHtml` as "optional, rarely needed", and a schema read at call time
+#     beats a system prompt: about half of all replies went out as unformatted
+#     markdown. Our server repairs the message on the way out instead.
+#   * A deployment is reproducible from the checkout. Server, schema and tool
+#     set come from this working tree; the machine only supplies the API key,
+#     in .env with every other secret.
+#
+# Written on startup rather than committed because the paths are machine-local
+# (this checkout, this interpreter). Deliberately NOT --strict-mcp-config: the
+# agent's turns lean on the user's other MCP servers — chrome-devtools carries
+# more calls than every YouGile tool combined, and figma is used for design
+# work — so the user's config stays in play and ours is merged over it. A
+# same-named server in --mcp-config wins, which is what keeps `yougile-mcp`
+# tool names stable for sessions resumed from before this file existed.
+MCP_CONFIG_FILE = STATE_DIR / "mcp.json"
+MCP_SERVER_SCRIPT = ROOT / "mcp_yougile.py"
+
+
+def write_mcp_config() -> bool:
+    """Refresh state/mcp.json. False if the agent must run without our server."""
+    if not MCP_SERVER_SCRIPT.is_file():
+        log.error("MCP: %s is missing — falling back to whatever ~/.claude.json "
+                  "registers, where an unformatted reply is not repaired",
+                  MCP_SERVER_SCRIPT)
+        return False
+    config = {
+        "mcpServers": {
+            "yougile-mcp": {
+                "type": "stdio",
+                # This interpreter: the server imports chatmd from the same tree
+                # and must not depend on what `python3` means in the agent's cwd.
+                "command": sys.executable,
+                "args": [str(MCP_SERVER_SCRIPT)],
+                # The API key is inherited from this process (it is in .env and
+                # the server re-reads it anyway) and stays out of the file.
+                "env": {"PLAIN_REPLY_MIN_CHARS": str(PLAIN_REPLY_MIN_CHARS)},
+            }
+        }
+    }
+    try:
+        MCP_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MCP_CONFIG_FILE.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except OSError:
+        log.exception("MCP: cannot write %s", MCP_CONFIG_FILE)
+        return False
+
+
+def mcp_args() -> List[str]:
+    return ["--mcp-config", str(MCP_CONFIG_FILE)] if MCP_CONFIG_FILE.is_file() else []
+
 # When a new @Agent message lands in a chat whose turn is STILL running, we
 # interrupt the in-flight turn (kill its process group) and immediately start a
 # fresh turn that --resumes the same session — so the agent sees the new
@@ -370,9 +429,10 @@ PLAINTEXT_NOTICE = (
 # section. YouGile stores the string verbatim and its renderer reads
 # `<![CDATA[ ... ]]>` as one non-element node, so the message lands as an EMPTY
 # bubble — not unformatted, absent. Rare (4 of 858 formatted replies since May)
-# and self-repeating, because nothing in the channel tells the agent. The
-# PreToolUse hook in hooks/strip_cdata.py takes the wrapper off before the call
-# is made; this is the net under it, for a reply that reaches the chat anyway.
+# and self-repeating, because nothing in the channel tells the agent. The MCP
+# server strips the wrapper before the message is posted (chatmd.strip_cdata);
+# this is the net under it, for a reply that reaches the chat anyway — which now
+# means our server did not answer the call, so read state/mcp.json first.
 CDATA_NOTICE = (
     "⚠️ Your previous reply in this chat had its `textHtml` wrapped in "
     "`<![CDATA[ ... ]]>`. YouGile renders that as an EMPTY message — the user "
@@ -1508,7 +1568,7 @@ def note_reply_formatting(payload) -> None:
             log.warning(
                 "chat %s: agent posted a reply with CDATA-wrapped textHtml — "
                 "YouGile shows it as an empty bubble; the next prompt will say "
-                "so (the strip_cdata hook should have caught this)",
+                "so (our MCP server should have caught this)",
                 chat_id,
             )
         updates["last_reply_cdata"] = cdata
@@ -3077,7 +3137,11 @@ def maybe_digest(path: Optional[Path], rule: "Rule") -> None:
     try:
         path.replace(raw)
         p = subprocess.run(
-            [CLAUDE_BIN, "--model", HANDOFF_DIGEST_MODEL,
+            # --strict-mcp-config with no --mcp-config: no MCP servers at all.
+            # This call rewrites a text file and has no business holding a
+            # handle on the chat, and every server's schema would otherwise ride
+            # along in its context for nothing.
+            [CLAUDE_BIN, "--model", HANDOFF_DIGEST_MODEL, "--strict-mcp-config",
              "--session-id", str(uuid.uuid4()), "-p", prompt],
             cwd=rule.workdir, capture_output=True, text=True,
             timeout=HANDOFF_DIGEST_TIMEOUT,
@@ -3571,6 +3635,10 @@ async def _start_background_tasks() -> None:
     # Keep a strong reference — asyncio only holds a weak one, so a fire-and-
     # forget task can be GC'd mid-await.
     _heartbeat_task_ref = asyncio.create_task(_loop_heartbeat_task())
+    # Before any turn can spawn: the config names this checkout and this
+    # interpreter, so it is rewritten on every start rather than trusted.
+    if write_mcp_config():
+        log.info("MCP: %s -> %s", MCP_CONFIG_FILE, MCP_SERVER_SCRIPT)
     if LOOP_WATCHDOG_TIMEOUT_SECONDS > 0:
         threading.Thread(target=_loop_watchdog, daemon=True).start()
         log.info(
@@ -4544,7 +4612,8 @@ def spawn_claude(
             last_reply_plain=bool(chat_state.get("last_reply_plain")),
             last_reply_cdata=bool(chat_state.get("last_reply_cdata")),
         )
-        spawn_args = [*effort_args(rule.extra_args), *rule.extra_args, *session_flag]
+        spawn_args = [*effort_args(rule.extra_args), *mcp_args(),
+                      *rule.extra_args, *session_flag]
         cmd = [CLAUDE_BIN, *spawn_args, "-p", prompt]
 
         ts = datetime.now(timezone.utc).isoformat()
