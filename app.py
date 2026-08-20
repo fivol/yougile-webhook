@@ -31,7 +31,7 @@ from fastapi import FastAPI, Request
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
