@@ -192,8 +192,12 @@ def tool_send_task_message(args: Dict[str, Any]) -> Dict[str, Any]:
         body["label"] = str(label)
     result = api("POST", f"/chats/{task_id}/messages", body)
 
-    if notes:
-        log(f"send_task_message {task_id}: " + "; ".join(notes))
+    # Logged for every message, not just repaired ones: "the server found
+    # nothing to fix" and "the server never ran" look identical from the chat,
+    # and the ratio of repaired to clean is the only measure of whether the
+    # prompt is still doing its half of the work.
+    log(f"send {task_id} text={len(text)} html={len(text_html)}"
+        + (" | repaired: " + "; ".join(notes) if notes else ""))
     # The repair is reported back in the tool result because it is the only
     # feedback this channel has: the agent cannot see its own rendered messages,
     # so a silent fix would be repeated forever.
