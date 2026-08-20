@@ -30,52 +30,40 @@ YouGile ──POST──▶ https://your.domain/yougile/webhook
 |---|---|
 | Python 3.11+ | this service |
 | The `claude` CLI, logged in | every turn is a `claude -p` process |
-| Node 18+ and a **YouGile MCP server** | how the agent talks back to the chat — see below |
 | A YouGile API key | this service reads chat history and drives the status sticker |
 
-### The YouGile MCP server — not optional
+### The YouGile MCP server — included, not installed
 
 This receiver is one half of the loop. It *starts* an agent and hands it the
 chat history; everything the agent sends **back** — the ack, the answer,
-files, task updates — goes through MCP tools, which come from a separate
-YouGile MCP server. Without it the agent runs, works, and says nothing:
-`/healthz` is green, the sticker flips to `working`, and the chat stays
-silent.
+files, task updates — goes through MCP tools. That server is
+[`mcp_yougile.py`](mcp_yougile.py), in this repo. Nothing to clone, no Node,
+no `claude mcp add`: on startup the service writes `state/mcp.json` naming
+this checkout and this interpreter, and every turn is spawned with
+`--mcp-config state/mcp.json`.
 
-The prompts shipped here call `mcp__yougile-mcp__send_task_message`,
-`…__send_task_file`, `…__get_task_messages`, `…__get_task` and
-`…__update_task`. Any MCP server exposing those names works; the one these
-prompts were written against is
-[github.com/ichinya/yougile-mcp](https://github.com/ichinya/yougile-mcp)
-(note: the unrelated `yougile-mcp` package on npm is a different project —
-don't `npx` it):
+It exposes nine tools — `send_task_message`, `send_task_file`,
+`get_task_messages`, `get_task`, `update_task`, `get_boards`, `get_columns`,
+`create_task`, plus `get_task_chat` as an unadvertised alias — under the
+server name `yougile-mcp`, so prompts and resumed sessions keep calling
+`mcp__yougile-mcp__…` unchanged.
 
-```bash
-git clone https://github.com/ichinya/yougile-mcp ~/mcp-servers/yougile-mcp
-cd ~/mcp-servers/yougile-mcp && npm install && npm run build
-```
+Two things worth knowing:
 
-Register it for the account that runs the agent. The turn is spawned as
-`claude … -p` with `cwd = rule.workdir` and no `--mcp-config`, so the server
-has to be reachable from there — **user scope** (available in every
-directory) is the simple choice:
+- **Your own MCP servers stay available.** The spawn deliberately omits
+  `--strict-mcp-config`, so whatever the machine registers globally
+  (chrome-devtools, figma, …) is still there and ours is merged over it. A
+  same-named server in `--mcp-config` wins, so a leftover global
+  `yougile-mcp` registration is harmless — the agent gets this one.
+- **The key.** The server authenticates as the account the agent posts
+  **as**. It uses `YOUGILE_API_KEY` from `.env`; set `YOUGILE_AGENT_API_KEY`
+  instead when the agent has its own bot user, separate from the account
+  this service reads history with.
 
-```bash
-claude mcp add --scope user yougile-mcp \
-  --env YOUGILE_API_KEY=<your-key> \
-  -- node ~/mcp-servers/yougile-mcp/yougile.cjs
-```
-
-Verify from the workdir, not from this repo — that's where the agent runs:
-
-```bash
-cd /path/to/your/company-root && claude mcp list
-```
-
-A project-scoped `.mcp.json` inside `rule.workdir` works too. The MCP server
-needs its own copy of the API key: it authenticates as the account the agent
-posts **as**, which is usually a dedicated bot user, while this service's
-`YOUGILE_API_KEY` only reads history and stickers.
+Why it is ours and not an off-the-shelf server: see
+[Replying from the agent](#replying-from-the-agent--shared-formatting) —
+the schema the agent reads at call time decides how the reply comes out, and
+that schema needs to be one we control.
 
 ## Install
 
@@ -733,57 +721,56 @@ render them as HTML, send them as one `send_task_message` call. Without that
 line the agent resolves the clash by dropping the formatting and keeping the
 blocks, which is the failure above.
 
-### Unformatted replies are detected, not just discouraged
+### Unformatted replies are repaired, not just discouraged
 
-The agent never sees how its own message rendered, and YouGile can't
-re-render one after the fact (its message `PUT` only takes
-`deleted`/`label`/`react`). So the receiver watches its own agent's messages
-as they come back as deliveries: a reply of at least
-`chat.plain_reply_min_chars` (400) characters that carries no `textHtml` is
-logged as a warning and recorded on the chat (`last_reply_plain`). The next
-prompt for that chat opens the reply contract with a one-line notice that
-the previous answer went out unformatted. One good reply clears the flag.
+The prompt above is not what makes this hold. For months it said `textHtml`
+was mandatory and roughly **half of all replies went out without it** — the
+schema the agent reads at call time described that field as "optional,
+rarely needed", and a tool schema sits closer to the call than any system
+prompt. That is why the MCP server is ours (see
+[The YouGile MCP server](#the-yougile-mcp-server--included-not-installed)):
+a message can now be repaired where it leaves.
 
-### The empty bubble — a CDATA wrapper
+[`chatmd.py`](chatmd.py) runs on every `send_task_message`, and its
+guarantee is narrow and absolute — **nothing the user would read as raw
+markup gets posted**:
 
-A rarer, louder version of the same failure: the agent wraps `textHtml` in
-an XML CDATA section, `<![CDATA[ ... ]]>`. YouGile stores the string
-verbatim and its renderer reads the section as one non-element node, so the
-message arrives as an **empty bubble** — the turn exits 0, nothing is logged,
-and the user sees a blank message from the agent. It is not something the
-agent can learn its way out of, because nothing in the channel tells it.
+| What arrives | What is posted |
+|---|---|
+| `text` with markdown, no `textHtml` | markdown rendered into `textHtml`; `text` keeps the words, loses the markers |
+| `textHtml` with `<h1>`/`<h2>` | demoted to `<h4>` |
+| `<p>` inside `<li>`, stacked `<br><br>`, empty `<p></p>` | flattened |
+| a bare URL in either field | wrapped in `<a href="…">` |
+| `<![CDATA[ … ]]>` around either field | unwrapped — see below |
+| a short one-line ack | left alone; plain text is right there |
+| a `/root/#file:` attachment marker | left alone, marker and all |
 
-So it is removed before the call is made. `hooks/strip_cdata.py` is a
-Claude Code **`PreToolUse` hook** on `mcp__yougile-mcp__send_task_message`:
-it takes the wrapper off `textHtml` (and `text`) and hands the call back
-through `updatedInput`. It is silent, exits 0 on anything unexpected — a
-broken hook must never cost a reply — and logs every message it sees to
-`logs/hooks.log`, so "the hook found nothing" and "the hook never ran" stay
-distinguishable.
+The repair is not silent. The tool result names what was fixed and says to
+write `textHtml` next time — the only feedback this channel has, since the
+agent never sees its own messages rendered. It is a floor, not a substitute:
+the converter renders line by line and cannot know that a wall of bullets
+should have been two paragraphs.
 
-Install it once, in `~/.claude/settings.json` (user scope covers every
-`workdir` a rule spawns an agent in):
+Two nets stay under it, because "the message was repaired" and "our server
+answered the call" are different facts. The receiver still watches its own
+agent's messages as they come back as deliveries: a reply of at least
+`chat.plain_reply_min_chars` (400) characters with no `textHtml` is logged
+and recorded on the chat (`last_reply_plain`), and the next prompt for that
+chat opens the reply contract with a notice that the previous answer went
+out unformatted. One good reply clears the flag. If that notice ever fires
+now, the interesting question is not the agent's discipline — it is whether
+`state/mcp.json` reached the turn at all.
 
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "mcp__yougile-mcp__send_task_message",
-        "hooks": [
-          { "type": "command", "command": "/abs/path/to/yougile-webhook/hooks/strip_cdata.py" }
-        ]
-      }
-    ]
-  }
-}
-```
+**The empty bubble.** A rarer, louder version of the same failure: `textHtml`
+wrapped in an XML CDATA section. YouGile stores the string verbatim and its
+renderer reads the section as one non-element node, so the message arrives as
+an **empty bubble** — the turn exits 0, nothing is logged, and the user sees a
+blank message. Unwrapped by the server like everything else; the receiver's
+own check (`last_reply_cdata`) ignores length, because a wrapper breaks a
+short ack just as completely.
 
-The receiver keeps its own net under the hook: a reply that reaches the chat
-CDATA-wrapped anyway is logged and recorded as `last_reply_cdata`, and the
-next prompt for that chat opens the reply contract by saying the previous
-answer rendered as an empty bubble. Unlike the plain-text check this one
-ignores length — a wrapper breaks a short ack just as completely.
+Every message the server touches is logged to `logs/mcp.log`, so "nothing
+needed repairing" and "the server never ran" stay distinguishable.
 
 ### What is committed, and what is yours
 
@@ -901,7 +888,8 @@ previous column.
 | `run.sh` | Loads `.env` and exec's uvicorn. |
 | `register_webhook.py` | CLI to manage YouGile subscriptions. |
 | `rules.example.toml` | Rule template (commit). |
-| `hooks/strip_cdata.py` | `PreToolUse` hook that strips a CDATA wrapper off an outgoing chat message; wire it up in `~/.claude/settings.json` (commit). |
+| `mcp_yougile.py` | The MCP server the agent talks to YouGile through: nine tools, and the repair that keeps a reply from going out as raw markdown (commit). |
+| `chatmd.py` | Markdown → the narrow HTML YouGile renders, plus the sanitizer for HTML the agent wrote (commit). |
 | `prompts/*.txt` | Shipped prompt defaults, including `formatting.txt` — the channel rules and the always-repeated reply contract (commit). |
 | `prompts/local/*.txt` | Per-install overrides: same filename shadows the shipped one (**gitignored**). |
 | `messages/<lang>.toml` | Everything the receiver says in a chat (commit). |
@@ -916,7 +904,8 @@ previous column.
 | `logs/events.jsonl` | All inbound webhooks. |
 | `logs/claude.log` | Every turn's prompt, plus a pointer to its output log. |
 | `logs/turns/*.log` | One file per turn: claude's stdout/stderr. |
-| `logs/hooks.log` | What `hooks/strip_cdata.py` saw and repaired. |
+| `logs/mcp.log` | Every message the MCP server posted, and what it had to repair. |
+| `state/mcp.json` | The `--mcp-config` handed to each turn; rewritten on every start (gitignored). |
 
 ## Security
 

@@ -73,7 +73,11 @@ def load_dotenv(path: Path) -> None:
 
 load_dotenv(ROOT / ".env")
 
-API_KEY = os.environ.get("YOUGILE_API_KEY", "")
+# The agent posts AS this key's user, which need not be the account the
+# receiver reads history and stickers with — set YOUGILE_AGENT_API_KEY when the
+# agent has its own bot user. Same key for both is the common case.
+API_KEY = (os.environ.get("YOUGILE_AGENT_API_KEY", "").strip()
+           or os.environ.get("YOUGILE_API_KEY", "").strip())
 API_BASE = os.environ.get("YOUGILE_API_BASE", "https://yougile.com/api-v2").rstrip("/")
 API_TIMEOUT = int(os.environ.get("YOUGILE_API_TIMEOUT", "30"))
 API_RETRIES = int(os.environ.get("YOUGILE_MCP_API_RETRIES", "3"))

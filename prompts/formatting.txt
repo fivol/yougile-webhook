@@ -93,10 +93,15 @@ because it is what breaks the reply when it is forgotten.
 - Every message you send to the user goes through
   `mcp__yougile-mcp__send_task_message` (taskId = this chat's id).
 - Longer than one sentence => set BOTH `text` (plain prose, no markdown)
-  and `textHtml` (what the user actually sees). The tool's own schema
-  calls `textHtml` "optional, rarely needed" — in this deployment it is
-  mandatory, and a long reply without it is a broken reply however good
-  its content is.
+  and `textHtml` (what the user actually sees). A long reply without
+  `textHtml` is a broken reply however good its content is.
+- The server that posts your message will not let markdown reach the
+  user: it renders `text` into HTML if you left `textHtml` empty, and
+  says so in the tool result. Do not lean on it. It converts what you
+  wrote line by line — it cannot know that a wall of bullets should have
+  been two paragraphs, or which three words are the ones that matter.
+  The layout is yours; that fallback only keeps a slip from reaching the
+  user as raw `**` and `#` characters.
 - `textHtml`: <p> per paragraph, <h4> for section titles (NEVER
   <h1>/<h2>), <ul><li> for lists, <a href="…"> around every URL, <code>
   for ids/paths/commands. No markdown characters anywhere.
