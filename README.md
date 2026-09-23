@@ -158,6 +158,12 @@ going silently dead:
 `PATH` must include the directory of the `claude` CLI, or the spawned
 process won't find it.
 
+The agent and everything it starts inherit the service's environment, with
+one addition: `PGGSSENCMODE=disable` (unless already set). Without it, a
+forked worker the agent launches — a celery prefork child, say — segfaults on
+macOS the moment it opens a Postgres connection, because libpq's Kerberos
+probe is not fork-safe.
+
 ```bash
 launchctl load -w ~/Library/LaunchAgents/org.local.yougile-webhook.plist
 launchctl list | grep yougile-webhook

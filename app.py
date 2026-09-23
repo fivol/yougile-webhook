@@ -292,6 +292,12 @@ LOOP_WATCHDOG_CHECK_SECONDS = int(os.environ.get("LOOP_WATCHDOG_CHECK_SECONDS", 
 _loop_heartbeat = time.monotonic()
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+# Agents start their repos' dev stacks (celery, gunicorn, ...) and those inherit
+# our environment. On macOS a forked worker opening a Postgres connection makes
+# libpq probe the Kerberos ccache for GSS encryption; that goes through XPC,
+# which is not fork-safe, so every such worker segfaults and pops a crash
+# dialog. Nobody here talks GSS to Postgres — skip the probe unless overridden.
+os.environ.setdefault("PGGSSENCMODE", "disable")
 CLAUDE_DEFAULT_WORKDIR = os.environ.get("CLAUDE_WORKDIR") or str(ROOT)
 CLAUDE_DEFAULT_EXTRA_ARGS = shlex.split(
     os.environ.get("CLAUDE_EXTRA_ARGS", "--dangerously-skip-permissions")
