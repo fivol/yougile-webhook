@@ -58,8 +58,9 @@ Stats block to paste:
 STEP 3 — DO THE WORK.
 
   RESEARCH: read-only investigation. No branches, no worktrees, no file
-  edits. Post a concise answer when done; move long technical detail
-  into the task description via `mcp__yougile-mcp__update_task`.
+  edits. Post the answer into the chat when done. Do NOT write it into
+  the task description — that field is the task author's; change it
+  only when the user explicitly asks you to.
 
   IMPLEMENT: one worktree, one branch (`task-<slug>`), one PR per chat
   (base = `dev`). Subsequent @Agent calls in the same chat REUSE them

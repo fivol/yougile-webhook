@@ -430,7 +430,10 @@ TOOLS: Tuple[Tuple[str, str, dict, Callable[[Dict[str, Any]], Any]], ...] = (
             "properties": {
                 "id": _STRING | {"description": "Task UUID."},
                 "title": _STRING,
-                "description": _STRING,
+                "description": _STRING | {"description": (
+                    "Replaces the task's description. Only when the user "
+                    "explicitly asks — reports and findings go to the chat."
+                )},
                 "columnId": _STRING | {"description": "Column to move the task to."},
                 "assigned": {"type": "array", "items": {"type": "string"},
                              "description": "User IDs to assign."},
