@@ -1,0 +1,108 @@
+{
+  "checked_at": "2026-10-15",
+  "basis": "standard global API prices; USD per million tokens",
+  "sources": [
+    "https://platform.claude.com/docs/en/about-claude/pricing",
+    "https://developers.openai.com/api/docs/pricing"
+  ],
+  "models": {
+    "claude-opus-5-5": {
+      "input": 4,
+      "output": 20,
+      "read": 0.2,
+      "write_5m": 5.0,
+      "write_1h": 8
+    },
+    "claude-opus-5": {
+      "input": 5,
+      "output": 25,
+      "read": 0.5,
+      "write_5m": 6.25,
+      "write_1h": 10
+    },
+    "claude-opus-4-8": {
+      "input": 5,
+      "output": 25,
+      "read": 0.5,
+      "write_5m": 6.25,
+      "write_1h": 10
+    },
+    "claude-opus-4-7": {
+      "input": 5,
+      "output": 25,
+      "read": 0.5,
+      "write_5m": 6.25,
+      "write_1h": 10
+    },
+    "claude-opus-4-6": {
+      "input": 5,
+      "output": 25,
+      "read": 0.5,
+      "write_5m": 6.25,
+      "write_1h": 10
+    },
+    "claude-opus-4-5": {
+      "input": 5,
+      "output": 25,
+      "read": 0.5,
+      "write_5m": 6.25,
+      "write_1h": 10
+    },
+    "claude-sonnet-5-5": {
+      "input": 2,
+      "output": 10,
+      "read": 0.1,
+      "write_5m": 2.5,
+      "write_1h": 4
+    },
+    "claude-sonnet-5": {
+      "input": 2,
+      "output": 10,
+      "read": 0.2,
+      "write_5m": 2.5,
+      "write_1h": 4
+    },
+    "claude-sonnet-4-6": {
+      "input": 3,
+      "output": 15,
+      "read": 0.3,
+      "write_5m": 3.75,
+      "write_1h": 6
+    },
+    "claude-sonnet-4-5": {
+      "input": 3,
+      "output": 15,
+      "read": 0.3,
+      "write_5m": 3.75,
+      "write_1h": 6
+    },
+    "claude-haiku-4-5": {
+      "input": 1,
+      "output": 5,
+      "read": 0.1,
+      "write_5m": 1.25,
+      "write_1h": 2
+    },
+    "gpt-6-astra": {
+      "input": 10,
+      "output": 50,
+      "read": 1,
+      "write": 12.5,
+      "long_context_threshold": 272000
+    },
+    "gpt-6.1-sol": {
+      "input": 2,
+      "output": 10,
+      "read": 0.1,
+      "write": 2.5,
+      "long_context_threshold": 272000
+    },
+    "gpt-6-luna": {
+      "input": 0.1,
+      "output": 0.5,
+      "read": 0.01,
+      "write": 0.125,
+      "long_context_threshold": 272000
+    }
+  }
+}

@@ -6,6 +6,8 @@ import unittest
 from unittest.mock import patch
 
 import agent_backends as backends
+import usage_summary as usage
+START = '2026-10-15T09:00:00+00:00'
 
 
 class BackendTests(unittest.TestCase):
@@ -215,6 +217,63 @@ class FlowTests(unittest.TestCase):
             body = api.call_args.args[2]
             self.assertTrue(body['text'].startswith('Модель: GPT-6 Astra'))
             self.assertTrue(body['textHtml'].startswith('<p>Модель: GPT-6 Astra · effort: medium</p>'))
+
+    def test_compact_finish_and_no_duplicate(self):
+        a = self.app
+        rec = self.record('', single_reply=True, reply_path=str(self.root/'reply.json'), started_at=START)
+        usage.write_json(Path(rec['reply_path']), {'body': {'text': 'Done', 'textHtml': '<p>Done</p>'}})
+        records = {'response': {'provider': 'codex', 'model': 'gpt-6-astra', 'at': START,
+                                 'usage': {'input_tokens': 100, 'output_tokens': 10}}}
+        with patch.object(a.usage_summary, 'task_records', return_value=(records, False)), \
+             patch.object(a, 'ROOT', Path(__file__).parent), \
+             patch.object(a.agent_backends, 'reply_label', return_value='GPT-6 Astra · effort: medium'), \
+             patch.object(a, '_send_final_body', return_value=True) as send:
+            a.finish_turn(rec, 0, None)
+            a._publish_compact_reply(rec, self.rule, None)
+            self.assertEqual(send.call_count, 1)
+            text = send.call_args.args[1]['text']
+            self.assertTrue(text.startswith('Done\n\nGPT-6 Astra'))
+            self.assertIn('Токены: ход 110 / задача 110', text)
+            a._report_silent_turn.assert_not_called()
+            a._report_dead_turn.assert_not_called()
+
+    def test_usage_failure_does_not_drop_answer(self):
+        a = self.app
+        rec = self.record('', single_reply=True, reply_path=str(self.root/'reply.json'), started_at=START)
+        usage.write_json(Path(rec['reply_path']), {'body': {'text': 'Done'}})
+        with patch.object(a.usage_summary, 'task_records', side_effect=ValueError('bad stats')), \
+             patch.object(a, '_send_final_body', return_value=True) as send:
+            a.finish_turn(rec, 0, None)
+            self.assertIn('Done', send.call_args.args[1]['text'])
+            self.assertIn('статистика временно недоступна', send.call_args.args[1]['text'])
+
+    def test_quota_keeps_start_and_suppresses_draft(self):
+        a = self.app
+        rec = self.record(json.dumps({'type': 'result', 'is_error': True, 'result': 'Usage limit reached'}),
+                          single_reply=True, started_at=START)
+        with patch.object(a, '_publish_compact_reply') as publish:
+            a.finish_turn(rec, 1, 'limit')
+            publish.assert_not_called()
+            self.assertEqual(a._pending_turns['task'][1]['_agent_turn_started_at'], START)
+            a._report_dead_turn.assert_not_called()
+
+    def test_mcp_buffers_without_api_post(self):
+        import mcp_yougile as mcp
+        with patch.object(mcp.reply_delivery, 'queue', return_value=True) as queue, \
+             patch.object(mcp, 'api') as api:
+            response = mcp.tool_send_task_message({'taskId': 'task', 'text': 'Done'})
+            self.assertTrue(response['queued'])
+            self.assertEqual(queue.call_args.args[2]['text'], 'Done')
+            api.assert_not_called()
+
+    def test_cancelled_compact_turn_stays_quiet(self):
+        a = self.app
+        rec = self.record('', single_reply=True, killed=True)
+        with patch.object(a, '_publish_compact_reply') as publish:
+            a.finish_turn(rec, 0, None)
+            publish.assert_not_called()
+            a._report_silent_turn.assert_not_called()
+            a._report_dead_turn.assert_not_called()
 
 
 if __name__ == '__main__':

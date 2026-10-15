@@ -45,6 +45,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import agent_backends
+import reply_delivery
 import html
 
 import chatmd  # noqa: E402  (after sys.path, so a bare `python mcp_yougile.py` works)
@@ -189,15 +190,18 @@ def tool_send_task_message(args: Dict[str, Any]) -> Dict[str, Any]:
     if not (text or text_html):
         raise ApiError("refusing to post an empty message")
 
-    model = agent_backends.reply_label(ROOT / os.environ.get("STATE_DIR", "state"), task_id)
-    if model:
-        text = f"Модель: {model}\n\n{text}"
-        if text_html:
-            text_html = f"<p>Модель: {html.escape(model)}</p>{text_html}"
     body: Dict[str, Any] = {"text": text, "textHtml": text_html or ""}
     label = args.get("label")
     if label:
         body["label"] = str(label)
+    if reply_delivery.queue(ROOT / os.environ.get("STATE_DIR", "state"), task_id, body):
+        return {"ok": True, "queued": True,
+                "reminder": "Final reply saved. End your turn now; the receiver adds measured statistics and delivers it once."}
+    model = agent_backends.reply_label(ROOT / os.environ.get("STATE_DIR", "state"), task_id)
+    if model:
+        body["text"] = f"Модель: {model}\n\n{text}"
+        if text_html:
+            body["textHtml"] = f"<p>Модель: {html.escape(model)}</p>{text_html}"
     result = api("POST", f"/chats/{task_id}/messages", body)
 
     # Logged for every message, not just repaired ones: "the server found
@@ -307,7 +311,11 @@ TOOLS: Tuple[Tuple[str, str, dict, Callable[[Dict[str, Any]], Any]], ...] = (
         "send_task_message",
         # Read by the agent immediately before it posts — the last word on the
         # channel, and the reason replies used to go out unformatted.
-        "Post a message into a task's chat. This is the ONLY way to reach the "
+        "Submit ONE final answer or necessary question, then end your turn. No ack, "
+        "progress, session notices or statistics. In a managed turn this replaces "
+        "the pending draft; queued:true is success, not a reason to retry. The "
+        "receiver delivers it with measured statistics after the turn ends. "
+        "This is the ONLY way to reach the "
         "user: nothing you print in your own output is ever shown to them.\n"
         "YouGile renders `textHtml` and does NOT render markdown. Anything "
         "longer than one short sentence MUST set `textHtml` — a report sent as "

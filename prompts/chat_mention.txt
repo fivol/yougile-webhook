@@ -33,27 +33,7 @@ STEP 1 — CLASSIFY the request:
   - IMPLEMENT — code changes (add, fix, refactor, extend, write tests).
   Default to RESEARCH when ambiguous.
 
-STEP 2 — Post the ack IMMEDIATELY with `mcp__yougile-mcp__send_task_message`
-(taskId = `payload.chatId`). Always end it with the stats block below, copied
-VERBATIM — do not reword it, do not recompute the numbers, do not drop a line.
-It carries the session id and what this turn is costing, and — when the chat
-has just moved to a fresh session — the line announcing that. This ack is the
-only message the user gets about it, so a dropped line is information lost.
-
-Stats block to paste:
-{session_stats}
-
-  RESEARCH:
-      Investigating
-      <stats block>
-
-  IMPLEMENT — first time:
-      Starting work
-      <stats block>
-
-  IMPLEMENT — continuation (existing worktree/branch for this chat):
-      Continuing on branch task-<slug>
-      <stats block>
+STEP 2 — Work silently. No ack, progress or session-change messages.
 
 STEP 3 — DO THE WORK.
 

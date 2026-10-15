@@ -81,7 +81,7 @@ codex:
 Use model IDs available to the CLI account and an effort supported by that
 model. Claude accepts `low`, `medium`, `high`, `xhigh`, `max` in this service;
 Codex support varies by model. An empty Claude model inherits the CLI default.
-The message prefix and `/status` show both model and effort, for example
+The final message footer and `/status` show both model and effort, for example
 `Модель: Opus 5.5 · effort: xhigh`. Effort is the requested CLI setting, not a
 measurement of tokens used. The receiver saves it at turn start so changing
 configuration cannot relabel a running turn.
@@ -1000,3 +1000,26 @@ previous column.
 - `.env`, `rules.toml`, `prompts/*.txt` (non-example) are gitignored. Don't
   commit them.
 - If you publish via a tunnel, its token is a separate secret.
+
+### One reply and task usage
+
+By default (`chat.single_reply: true`, env `SINGLE_REPLY`) each managed turn
+buffers `send_task_message` calls and sends only the last draft after the CLI
+exits. No start acknowledgement or session-rotation notice is posted. The
+agent should end the turn after its final answer or necessary question.
+The receiver adds model, requested effort, elapsed turn time, turn/task tokens
+and total task cost at standard API-equivalent rates. Subscription billing is
+not implied. Attachments and explicit slash commands remain separate actions.
+
+Usage comes from persisted Claude and Codex transcripts, including retired
+sessions, recorded child agents and newly tracked handoff digests. Older digest
+calls without a session association cause an incomplete-data marker. Duplicate response records are counted once;
+Codex reasoning tokens are already included in output. Quota fallback preserves
+the start time. Missing transcripts or unknown model prices are marked as
+incomplete instead of reporting a falsely precise total.
+
+`api-pricing.json` holds the dated standard global USD rates and official source
+URLs (checked 2026-10-15). Update its rates and `checked_at` together when prices
+change. Historical usage is repriced at this snapshot; external tool charges
+not present in usage records are excluded. Failed message delivery is retried
+from `state/replies` after restart.

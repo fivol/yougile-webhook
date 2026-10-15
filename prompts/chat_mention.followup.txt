@@ -9,15 +9,10 @@ New in this chat since your last reply:
 The YouGile chat/task UUID is `{chat_id}` — use it as the taskId for every
 `mcp__yougile-mcp__*` call. Reply in the language `{language}`.
 
-Post the ack IMMEDIATELY (before any real work), ending it with this block,
-copied VERBATIM — do not reword it, do not recompute the numbers, do not drop
-a line:
-
-{session_stats}
+Send one concise final answer when finished; no ack or session notices.
 
 Reminders that are cheap to get wrong:
-- Ack first («Исследую» / «Начал работу» / «Продолжаю в ветке task-<slug>»),
-  then do the work, then post the final reply. Two messages, not one.
+- Do the work, then submit ONE final reply. No preliminary messages.
 - A skill's "chat output" step says WHAT the report contains; it still leaves
   this process as ONE `send_task_message` call, rendered per the reply contract
   at the end of this prompt. Printing it posts nothing.

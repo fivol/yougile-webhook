@@ -79,7 +79,8 @@ handoff:
     model: sonnet             # HANDOFF_DIGEST_MODEL
 
 chat:
-  # Append the context/cost block to the ack the agent posts.
+  single_reply: true         # SINGLE_REPLY; final result plus measured task statistics
+  # Legacy mode only (single_reply: false): append the context/cost ack block.
   ack_stats: true             # ACK_STATS
   # An agent reply at least this long is expected to carry `textHtml`; one that
   # doesn't is logged and called out in the next prompt. Shorter messages (acks,

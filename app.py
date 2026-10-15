@@ -28,12 +28,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import yaml
 
 import agent_backends
+import usage_summary
+import reply_delivery
 from fastapi import FastAPI, Request
 
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -777,6 +779,7 @@ COMMAND_ALLOWED_EMAILS = [
 # the next agent turn sees.
 COMMAND_REPLY_PREFIX = os.environ.get("COMMAND_REPLY_PREFIX", "⚙️").strip()
 # Append the cost/context block to the ack the agent posts ("Продолжаю …").
+SINGLE_REPLY = conf("chat.single_reply", "SINGLE_REPLY", True, bool)
 ACK_STATS = conf("chat.ack_stats", "ACK_STATS", True, bool)
 
 # --- Replying to the agent counts as mentioning it ---------------------------
@@ -3167,7 +3170,7 @@ def handoff_text(path: Optional[Path]) -> str:
     return HANDOFF_BLOCK.format(body=body)
 
 
-def maybe_digest(path: Optional[Path], rule: "Rule") -> None:
+def maybe_digest(path: Optional[Path], rule: "Rule", chat_id: Optional[str] = None) -> None:
     """L1: compress a fat handoff with a cheap model in a FRESH session.
 
     Deliberately not `--resume` on the outgoing session: that would re-read the
@@ -3192,13 +3195,22 @@ def maybe_digest(path: Optional[Path], rule: "Rule") -> None:
     )
     try:
         path.replace(raw)
+        digest_session = str(uuid.uuid4())
+        if chat_id:
+            state = get_chat_state(chat_id)
+            ids = list(state.get("auxiliary_claude_session_ids", []))
+            ids.append(digest_session)
+            files = set(state.get("accounted_digest_files", []))
+            files.add(raw.name)
+            update_chat_state(chat_id, auxiliary_claude_session_ids=ids,
+                              accounted_digest_files=sorted(files))
         p = subprocess.run(
             # --strict-mcp-config with no --mcp-config: no MCP servers at all.
             # This call rewrites a text file and has no business holding a
             # handle on the chat, and every server's schema would otherwise ride
             # along in its context for nothing.
             [CLAUDE_BIN, "--model", HANDOFF_DIGEST_MODEL, "--strict-mcp-config",
-             "--session-id", str(uuid.uuid4()), "-p", prompt],
+             "--session-id", digest_session, "-p", prompt],
             cwd=rule.workdir, capture_output=True, text=True,
             timeout=HANDOFF_DIGEST_TIMEOUT,
         )
@@ -3710,6 +3722,7 @@ async def _start_background_tasks() -> None:
     # Turns outlive this process, so a fresh one starts by finding out what the
     # last one left behind. Off the event loop: it talks to the YouGile API.
     threading.Thread(target=reconcile_open_turns, daemon=True).start()
+    threading.Thread(target=_reply_delivery_worker, daemon=True).start()
 
 
 _active_lock = threading.Lock()
@@ -4006,7 +4019,9 @@ def finish_turn(
     if provider == "codex" and chat_id:
         codex_id, codex_error = agent_backends.codex_result(output)
         if codex_id:
-            update_chat_state(chat_id, codex_session_id=codex_id)
+            ids = set(get_chat_state(chat_id).get("codex_session_ids", []))
+            ids.add(codex_id)
+            update_chat_state(chat_id, codex_session_id=codex_id, codex_session_ids=sorted(ids))
         if codex_error and not rec.get("killed"):
             failure = codex_error
     quota = provider == "claude" and agent_backends.quota_failure(output)
@@ -4015,7 +4030,10 @@ def finish_turn(
         if CODEX_FALLBACK and chat_id and rule and rec.get("payload"):
             note_claude_quota()
             # Persist before releasing the lock so a restart can replay the request.
-            pending = rec.get("pending") or {"rule": rule.name, "payload": rec["payload"]}
+            replay = dict(rec["payload"])
+            if rec.get("started_at"):
+                replay["_agent_turn_started_at"] = rec["started_at"]
+            pending = rec.get("pending") or {"rule": rule.name, "payload": replay}
             rec["pending"] = pending
             write_turn(chat_id, pending=pending)
             failure = None
@@ -4055,7 +4073,12 @@ def finish_turn(
                     _pending_turns.setdefault(
                         chat_id, (p_rule, pending.get("payload")))
         _mark_turn_finished(chat_id, task_id)
-        if failure:
+        with _active_lock:
+            queued = bool(chat_id) and chat_id in _pending_turns
+        compact = bool(rec.get("single_reply") and chat_id and rule)
+        if compact and not queued and not rec.get("killed") and not recovering:
+            _publish_compact_reply(rec, rule, failure)
+        elif failure:
             with _active_lock:
                 queued = bool(chat_id) and chat_id in _pending_turns
             # A newer instruction is already chained behind this turn (see
@@ -4063,7 +4086,7 @@ def finish_turn(
             # the same failure twice for what the user lived as one exchange.
             # A lost session is the exception: the replacement runs into it too,
             # and this is the message that explains the rotation.
-            if session_lost or not queued:
+            if (session_lost or not queued) and not (compact and recovering):
                 _report_dead_turn(chat_id, rc, failure, session_lost, recovering)
         elif chat_id and TURN_REPORT_SILENT and not rec.get("killed"):
             with _active_lock:
@@ -4079,6 +4102,66 @@ def finish_turn(
         _release_chat(chat_id, lock, task_id)
     if recovering and chat_id and rule is not None:
         _recover_lost_session(chat_id, rule, rec.get("payload"))
+
+
+def _send_final_body(chat_id: str, body: dict) -> bool:
+    try:
+        # Use the same bot identity and retry policy as the agent's MCP channel.
+        import mcp_yougile
+        mcp_yougile.api("POST", f"/chats/{chat_id}/messages", body)
+        return True
+    except Exception:
+        log.exception("final reply delivery failed for chat %s", chat_id)
+        return False
+
+
+def _reply_delivery_worker() -> None:
+    while True:
+        for path in (STATE_DIR / "replies").glob("*.json"):
+            try:
+                reply_delivery.deliver(path, _send_final_body)
+            except Exception:
+                log.exception("outbox retry failed: %s", path)
+        time.sleep(30)
+
+
+def _publish_compact_reply(rec: dict, rule: Rule, failure: Optional[str]) -> None:
+    chat_id = rec["chat_id"]
+    path = Path(rec["reply_path"])
+    entry = usage_summary.read_json(path)
+    if entry.get("ready"):
+        reply_delivery.deliver(path, _send_final_body)
+        return
+    state = get_chat_state(chat_id)
+    ended = datetime.now(timezone.utc).isoformat()
+    started = rec.get("started_at") or ended
+    label = agent_backends.reply_label(STATE_DIR, chat_id) or (
+        f"{rec.get('provider', 'claude')} · effort: {state.get('agent_effort') or 'unknown'}")
+    totals = None
+    try:
+        records, missing = usage_summary.task_records(
+            state, chat_id, rule.workdir, Path.home(),
+            Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))))
+        # Older digest sessions had no task association, so their cost is unknown.
+        accounted = set(state.get("accounted_digest_files", []))
+        missing |= any(p.name not in accounted for p in (HANDOFF_DIR / chat_id).glob("*.raw.md"))
+        prices = usage_summary.read_json(ROOT / "api-pricing.json")
+        totals = usage_summary.summary(records, prices, started, missing)
+        stats = usage_summary.footer(label, totals, started, ended)
+    except Exception:
+        log.exception("usage summary unavailable for chat %s", chat_id)
+        stats = label + " · статистика временно недоступна"
+    body = entry.get("body") or {"text": "Ход завершился без итогового ответа."}
+    if failure:
+        body = {"text": f"Не удалось завершить ход: {failure[:TURN_FAILURE_QUOTE_CHARS]}"}
+    text = body.get("text") or ""
+    html = body.get("textHtml") or f"<p>{_html_escape(text)}</p>"
+    body = {**body, "text": text + "\n\n" + stats,
+            "textHtml": html + "<p>" + _html_escape(stats).replace("\n", "<br>") + "</p>"}
+    usage_summary.write_json(path, {"chat_id": chat_id, "body": body, "ready": True})
+    update_chat_state(chat_id, task_usage=totals, last_turn_seconds=(
+        datetime.fromisoformat(ended) - datetime.fromisoformat(started.replace('Z', '+00:00'))).total_seconds())
+    reply_delivery.deliver(path, _send_final_body)
 
 
 def _report_silent_turn(
@@ -4208,6 +4291,15 @@ def _build_prompt(
         rendered = f"{rendered}\n\n---\n{contract}\n"
     if interrupted and INTERRUPT_NOTICE:
         rendered = f"{INTERRUPT_NOTICE}\n\n---\n{rendered}"
+    if SINGLE_REPLY:
+        rendered += ("\n\nCURRENT DELIVERY CONTRACT (supersedes old ack/status instructions): "
+                     "Send exactly ONE concise final answer or necessary question using "
+                     "send_task_message, then end the turn. Do not send an ack, progress "
+                     "updates, session identifiers, rotation/switch notices, or statistics. "
+                     "The server queues your final answer and adds measured model, effort, "
+                     "token totals, task API cost and elapsed time AFTER your process exits. "
+                     "A queued:true tool result means success; do not retry or keep polling. "
+                     "Keep the result short: outcome, essential links and any blocker.\n")
     return rendered
 
 
@@ -4479,6 +4571,7 @@ def spawn_claude(
     interrupted: bool = False,
     allow_session_recovery: bool = True,
 ) -> Tuple[bool, str]:
+    turn_started_at = datetime.now(timezone.utc).isoformat()
     chat_id = extract_chat_id(payload) if rule.session_per_chat else None
     # The task whose checkbox tracks this turn. Same UUID as the chat, but
     # resolved independently of session_per_chat so the status flag works for
@@ -4591,7 +4684,7 @@ def spawn_claude(
                     chat_id, old_id, chat_state["session_seq"], rule,
                     facts, rotate_reason,
                 )
-                maybe_digest(handoff_path, rule)
+                maybe_digest(handoff_path, rule, chat_id)
                 ws = find_workspace(rule.workdir, [old_id, chat_id], chat_id)
                 if ws:
                     patch_feature_json(ws, new_id, chat_id)
@@ -4730,7 +4823,7 @@ def spawn_claude(
         prompt = _build_prompt(
             rule, payload, history_text, is_first_turn, attachment_paths,
             session_id=session_id, interrupted=interrupted,
-            handoff_path=handoff_path, session_stats=session_stats,
+            handoff_path=handoff_path, session_stats="" if SINGLE_REPLY else session_stats,
             dropped=dropped,
             last_reply_plain=bool(chat_state.get("last_reply_plain")),
             last_reply_cdata=bool(chat_state.get("last_reply_cdata")),
@@ -4774,11 +4867,13 @@ def spawn_claude(
         # finish_turn still needs the watermark to roll back.
         base_rec: Dict[str, Any] = {
             "chat_id": chat_id, "task_id": task_id, "session_id": session_id,
-            "provider": provider,
+            "provider": provider, "single_reply": SINGLE_REPLY,
             "rule": rule.name, "idle_before": idle_before,
             "prev_watermark": last_msg_id if chat_id else None,
             "watermark": newest_msg_id, "log_path": str(turn_log),
             "allow_session_recovery": allow_session_recovery, "payload": payload,
+            "started_at": payload.get("_agent_turn_started_at", turn_started_at),
+            "reply_path": str(STATE_DIR / "replies" / (turn_log.stem + ".json")),
         }
 
         def on_exit(rc: int, failure: Optional[str] = None) -> None:
@@ -4802,7 +4897,7 @@ def spawn_claude(
             prompt_path = TURNS_STATE_DIR / f"{chat_id}.prompt"
             prompt_path.write_text(prompt, encoding="utf-8")
             write_turn(chat_id, **{k: v for k, v in base_rec.items() if k != "chat_id"},
-                       prompt_path=str(prompt_path), pid=None, pending=None, started_at=ts)
+                       prompt_path=str(prompt_path), pid=None, pending=None)
             if provider == "codex" and codex_reset:
                 update_chat_state(chat_id, codex_session_id=None, pending_rotation=False)
             update_chat_state(chat_id, active_provider=provider,
@@ -4834,7 +4929,7 @@ def spawn_claude(
                 rule=rule.name,
                 pid=proc.pid,
                 attempt=1,
-                started_at=ts,
+                started_at=base_rec["started_at"],
                 log_path=str(turn_log),
                 prev_watermark=last_msg_id,
                 watermark=newest_msg_id,
@@ -4861,7 +4956,7 @@ def spawn_claude(
         # task and resume the same session from a terminal:
         #     claude --resume <id>
         # In a thread so urllib doesn't add latency to the webhook response.
-        if chat_id and rule.ack_message and session_id:
+        if not SINGLE_REPLY and chat_id and rule.ack_message and session_id:
             ack_chat_id = chat_id
             ack_session = session_id
             ack_text = f"{rule.ack_message}\n\nsession: {ack_session}"
@@ -4915,6 +5010,7 @@ async def healthz():
         "version": APP_VERSION,
         "loop_heartbeat_age_s": round(time.monotonic() - _loop_heartbeat, 1),
         "claude_bin": CLAUDE_BIN,
+        "single_reply": SINGLE_REPLY,
         "codex_fallback": CODEX_FALLBACK,
         "codex_bin": CODEX_BIN,
         "codex_model": CODEX_MODEL,
