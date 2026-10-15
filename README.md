@@ -24,6 +24,42 @@ YouGile ──POST──▶ https://your.domain/yougile/webhook
                   --resume     <chatId>   (subsequent)
 ```
 
+## Automatic Codex fallback
+
+Set `codex.fallback: true` in gitignored `config.local.yaml` (or
+`CODEX_FALLBACK=true`). Configure an absolute `codex.bin` pointing to a recent
+CLI supporting `exec --json` and `exec resume`; check `codex login status` using
+that same binary. `codex.model` selects a concrete account-supported model;
+`codex.effort` defaults to `medium`. The CLI uses its existing login, without
+copying credentials into configuration or prompts.
+
+Claude stays primary. A structured Claude usage-limit/credit-exhaustion error
+replays the current request through Codex. Authentication failures, ordinary
+429/5xx errors and a user interrupt do not trigger this switch. The shared
+cooldown survives restarts; after `codex.claude_retry_seconds` (default 900),
+the next request tries Claude again. Running Codex work is not stopped merely
+because the cooldown expires. If Codex also fails, the existing failure notice
+is posted; there is no unbounded retry between providers.
+
+Existing Claude session IDs are preserved. Each chat gets a separate native
+`codex_session_id`. On every provider switch, a local handoff includes the task,
+full chat, Claude transcript summary, recent Codex actions with a full-transcript
+pointer, and existing workspace/branch/PR/git state. The current request is
+replayed even if its watermark already advanced. Both CLIs continue the same
+files; provider switching does not create another worktree. Older transcript
+details are available on disk, not guaranteed to fit verbatim in the prompt.
+`/new` starts a fresh native session for the active provider with a handoff.
+
+Both providers receive the bundled YouGile MCP server. It adds the concrete
+model name to outgoing task messages: Claude's actual response model is read
+from its transcript, and Codex's model is explicitly supplied to the CLI.
+`/status` identifies the provider/model; existing token/cost statistics remain
+Claude-only. `/healthz` exposes fallback configuration and the next provider.
+Codex runs with `workspace-write` sandboxing, network access and noninteractive
+approval policy; operations requiring extra permissions fail visibly.
+
+Verification without live chat messages: `python -m unittest test_backends`.
+
 ## Requirements
 
 | What | Why |

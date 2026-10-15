@@ -84,3 +84,11 @@ chat:
   # doesn't is logged and called out in the next prompt. Shorter messages (acks,
   # one-liners) are plain text by design and never counted.
   plain_reply_min_chars: 400  # PLAIN_REPLY_MIN_CHARS
+
+# Claude remains primary. Enable only after checking `codex exec` and login.
+codex:
+  fallback: false            # CODEX_FALLBACK
+  bin: codex                 # CODEX_BIN (absolute path recommended for launchd)
+  model: gpt-6-astra          # CODEX_MODEL (must be available to your account)
+  effort: medium             # CODEX_EFFORT
+  claude_retry_seconds: 900   # CLAUDE_QUOTA_RETRY_SECONDS

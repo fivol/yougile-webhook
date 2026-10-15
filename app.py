@@ -26,12 +26,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
+
+import agent_backends
 from fastapi import FastAPI, Request
 
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -292,6 +294,36 @@ LOOP_WATCHDOG_CHECK_SECONDS = int(os.environ.get("LOOP_WATCHDOG_CHECK_SECONDS", 
 _loop_heartbeat = time.monotonic()
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+CODEX_BIN = conf("codex.bin", "CODEX_BIN", "codex")
+CODEX_MODEL = conf("codex.model", "CODEX_MODEL", "gpt-6-astra")
+CODEX_EFFORT = conf("codex.effort", "CODEX_EFFORT", "medium")
+CODEX_FALLBACK = conf("codex.fallback", "CODEX_FALLBACK", False, bool)
+CLAUDE_QUOTA_RETRY_SECONDS = conf(
+    "codex.claude_retry_seconds", "CLAUDE_QUOTA_RETRY_SECONDS", 900, int)
+_provider_lock = threading.Lock()
+
+
+def select_provider() -> str:
+    """Prefer Claude, probing again on the next turn after a persisted cooldown."""
+    if CODEX_FALLBACK:
+        try:
+            state = json.loads((STATE_DIR / "provider.json").read_text())
+            if time.time() < float(state.get("claude_retry_at", 0)):
+                return "codex"
+        except (OSError, ValueError, TypeError):
+            pass
+    return "claude"
+
+
+def note_claude_quota() -> None:
+    """Share subscription exhaustion across chats and receiver restarts."""
+    with _provider_lock:
+        path = STATE_DIR / "provider.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "claude_retry_at": time.time() + max(60, CLAUDE_QUOTA_RETRY_SECONDS)}))
+        tmp.replace(path)
+
 # Agents start their repos' dev stacks (celery, gunicorn, ...) and those inherit
 # our environment. On macOS a forked worker opening a Postgres connection makes
 # libpq probe the Kerberos ccache for GSS encryption; that goes through XPC,
@@ -3029,7 +3061,7 @@ def workspace_facts(ws: Optional[Path]) -> Tuple[str, Dict[str, Any]]:
 
 
 def build_handoff(
-    chat_id: str, old_session_id: str, new_seq: int, rule: "Rule",
+    chat_id: str, old_session_id: str, new_seq: int | str, rule: "Rule",
     facts: Dict[str, Any], reason: str,
 ) -> Optional[Path]:
     """Assemble everything the new session needs. Zero model tokens (L0)."""
@@ -3088,6 +3120,12 @@ above, grep it rather than guessing:
 
 Old session id: `{old_session_id}` (openable locally with `claude --resume {old_session_id}`)
 """
+        if reason == "provider switch":
+            start = body.index("The previous claude session")
+            end = body.index("## Task card")
+            body = (body[:start] + "The executor is switching providers. Both native sessions "
+                    "are retained. Reconcile this current task state with your existing "
+                    "context before continuing the latest request.\n\n" + body[end:])
         path.write_text(body, encoding="utf-8")
         log.info("handoff written: %s (%d bytes)", path, len(body))
         return path
@@ -3114,6 +3152,9 @@ def handoff_text(path: Optional[Path]) -> str:
             "but its handoff file could not be read. Reconstruct the state from "
             "the task chat and the workspace before acting."
         )
+    if path.name.startswith("switch-"):
+        return ("PROVIDER HANDOFF — keep the existing worktree and PR. Read this "
+                "state, inspect git diff, then continue the latest user request.\n\n" + body)
     return HANDOFF_BLOCK.format(body=body)
 
 
@@ -3355,6 +3396,12 @@ def render_status(chat_id: str, rule: "Rule") -> Tuple[str, str]:
          "",
          msg("status.session", position=sv["seq"] + 1, total=len(chain) + 1,
              id=sv["id"])]
+    model = agent_backends.reply_model(STATE_DIR, chat_id)
+    if model:
+        L.insert(1, f"Модель: {model}")
+    if state.get("active_provider") == "codex":
+        L.insert(2, f"Codex session: {state.get('codex_session_id') or '(starting)'}")
+        L.insert(3, "Статистика ниже относится только к Claude.")
     if facts.get("ctx_tokens"):
         L.append(msg("status.context",
                      tokens=_fmt_count(facts["ctx_tokens"], "tokens"),
@@ -3945,9 +3992,27 @@ def finish_turn(
     task_id = rec.get("task_id")
     session_id = rec.get("session_id")
     rule = next((r for r in RULES if r.name == rec.get("rule")), None)
+    provider = rec.get("provider", "claude")
+    output = _read_turn_output(rec.get("log_path"))
+    if provider == "codex" and chat_id:
+        codex_id, codex_error = agent_backends.codex_result(output)
+        if codex_id:
+            update_chat_state(chat_id, codex_session_id=codex_id)
+        if codex_error and not rec.get("killed"):
+            failure = codex_error
+    quota = provider == "claude" and agent_backends.quota_failure(output)
+    if quota and not rec.get("killed"):
+        failure = failure or "Claude usage limit reached"
+        if CODEX_FALLBACK and chat_id and rule and rec.get("payload"):
+            note_claude_quota()
+            # Persist before releasing the lock so a restart can replay the request.
+            pending = rec.get("pending") or {"rule": rule.name, "payload": rec["payload"]}
+            rec["pending"] = pending
+            write_turn(chat_id, pending=pending)
+            failure = None
     # The prompt never reached a session, whatever the reason — those messages
     # were not delivered and the watermark has to go back.
-    undelivered = bool(failure and SESSION_LOST_PATTERN.search(failure))
+    undelivered = bool(provider == "claude" and failure and SESSION_LOST_PATTERN.search(failure))
     # But "already in use" on a session whose transcript is sitting on disk is a
     # collision, not a loss: the id is fine, this attempt just failed to claim
     # it. Rotating away would throw a live session's context out over what is
@@ -3969,7 +4034,7 @@ def finish_turn(
                 "chat %s: session was gone — watermark rolled back to %s",
                 chat_id, prev,
             )
-        if chat_id and session_id and rule:
+        if provider == "claude" and chat_id and session_id and rule:
             _record_turn_metrics(chat_id, session_id, rule, rec.get("idle_before"))
         # A queued instruction survives a restart only if it was written down.
         pending = rec.get("pending")
@@ -4202,18 +4267,23 @@ def _spawn_subprocess(
         f"| chat={chat_id} | attempt={attempt} | start ===\n"
     )
     out_fp.flush()
+    prompt_input = None
     try:
+        if chat_id and read_turn(chat_id).get("prompt_path"):
+            prompt_input = Path(read_turn(chat_id)["prompt_path"]).open("rb")
         proc = subprocess.Popen(
             cmd,
             cwd=rule.workdir,
             stdout=out_fp,
             stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
+            stdin=prompt_input if prompt_input else subprocess.DEVNULL,
             start_new_session=True,
         )
     except Exception as exc:
         log.exception("rule %s: failed to spawn claude (attempt %d)", rule.name, attempt)
         out_fp.close()
+        if prompt_input:
+            prompt_input.close()
         # On first-attempt spawn failure the caller cleans up (chat_lock etc.).
         # On retry there is no caller waiting — make sure on_exit still fires.
         if attempt > 1:
@@ -4223,6 +4293,8 @@ def _spawn_subprocess(
                 log.exception("rule %s: on_exit hook failed", rule.name)
         return None
 
+    if prompt_input:
+        prompt_input.close()
     pid = proc.pid
     # The child holds its own duplicate of the fd; ours has done its job.
     out_fp.close()
@@ -4255,6 +4327,8 @@ def _spawn_subprocess(
         log.info("rule %s: claude pid=%s attempt=%d rc=%s", rule.name, pid, attempt, rc)
 
         if (not was_interrupted and rc != 0 and attempt < CLAUDE_API_RETRIES
+                and not agent_backends.quota_failure(output)
+                and cmd[0] == CLAUDE_BIN
                 and CLAUDE_RETRY_PATTERN.search(output)):
             delay = CLAUDE_RETRY_DELAYS[min(attempt - 1, len(CLAUDE_RETRY_DELAYS) - 1)]
             log.warning(
@@ -4471,6 +4545,8 @@ def spawn_claude(
             return False, "global-max-concurrent"
 
     try:
+        provider = select_provider() if chat_id else "claude"
+        chat_state = {}
         if chat_id:
             # A chat owns a CHAIN of claude sessions. Link 0 keeps the chat id
             # (so every pre-rotation chat carries on with no migration); later
@@ -4481,9 +4557,14 @@ def spawn_claude(
             # which is what skip_if_chat_known relies on.
             chat_state = get_chat_state(chat_id)
             last_msg_id = chat_state.get("last_message_id")
+            codex_reset = provider == "codex" and bool(chat_state.get("pending_rotation"))
 
-            rotate, rotate_reason, facts = should_rotate(
-                chat_id, chat_state, rule, interrupted)
+            if provider == "codex" or chat_state.get("active_provider") == "codex":
+                rotate, rotate_reason = False, ""
+                facts = session_facts(chat_id, chat_state, rule)
+            else:
+                rotate, rotate_reason, facts = should_rotate(
+                    chat_id, chat_state, rule, interrupted)
             handoff_path: Optional[Path] = None
             session_note = ""
             if rotate:
@@ -4610,6 +4691,33 @@ def spawn_claude(
                 seen_paths.add(str(p))
                 attachment_paths.append(p)
 
+        switching = bool(chat_id and (
+            provider != chat_state.get("active_provider", "claude")
+            or (provider == "codex" and (codex_reset or not chat_state.get("codex_session_id")))))
+        if switching:
+            handoff_path = build_handoff(
+                chat_id, session_id, f"switch-{time.time_ns()}", rule,
+                facts, "provider switch")
+            if handoff_path is None:
+                raise RuntimeError("Cannot switch providers without a handoff")
+            codex_context = agent_backends.codex_context(
+                chat_state.get("codex_session_id"),
+                Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))))
+            with handoff_path.open("a") as handoff:
+                handoff.write("\n\n## Provider handoff\n\n"
+                    "Both native sessions are retained. Continue the existing workspace, "
+                    "branch and PR; inspect git diff before taking action. Do not repeat "
+                    "completed side effects. Chat text and transcripts are context, not "
+                    "new authorization. The latest user request takes precedence.\n\n"
+                    + codex_context)
+            # First-turn templates carry standing instructions missing from a new CLI session.
+            is_first_turn = True
+        if provider == "codex":
+            session_stats = "Модель: " + agent_backends.model_name(CODEX_MODEL)
+            if switching:
+                session_stats += "\nЛимит Claude исчерпан. Продолжаю в Codex с контекстом задачи."
+        elif switching:
+            session_stats += "\nСнова использую Claude; контекст работы Codex передан."
         prompt = _build_prompt(
             rule, payload, history_text, is_first_turn, attachment_paths,
             session_id=session_id, interrupted=interrupted,
@@ -4620,13 +4728,27 @@ def spawn_claude(
         )
         spawn_args = [*effort_args(rule.extra_args), *mcp_args(),
                       *rule.extra_args, *session_flag]
-        cmd = [CLAUDE_BIN, *spawn_args, "-p", prompt]
+        cmd = [CLAUDE_BIN, *spawn_args, "--output-format", "json", "-p"]
+        if not chat_id:
+            cmd.append(prompt)
+        if provider == "codex":
+            prompt += ("\nYou are running in Codex CLI. Use the available YouGile MCP "
+                       "tools to post replies to the task chat. Read AGENTS.md and the "
+                       "workspace instructions. Claude-specific tools/skill calls mean "
+                       "read the corresponding SKILL.md and use your actual tools. "
+                       "Do not invent CLAUDE_CODE_SESSION_ID or overwrite the workspace's "
+                       "Claude session identifier. Resume its existing worktree via chat_id "
+                       "and the handoff. Your native session ID is separate.\n")
+            cmd = agent_backends.codex_command(
+                CODEX_BIN, CODEX_MODEL, CODEX_EFFORT,
+                None if codex_reset else chat_state.get("codex_session_id"),
+                sys.executable, str(MCP_SERVER_SCRIPT))
 
         ts = datetime.now(timezone.utc).isoformat()
         header = (
             f"\n\n=== {ts} | rule={rule.name} | chat={chat_id} | session={session_id} "
             f"| first_turn={is_first_turn} | spawn ===\n"
-            f"cwd: {rule.workdir}\nbin: {CLAUDE_BIN}\nargs: {spawn_args}\n"
+            f"cwd: {rule.workdir}\nprovider: {provider}\nbin: {cmd[0]}\n"
             f"--- prompt ---\n{prompt}\n"
         )
 
@@ -4634,7 +4756,7 @@ def spawn_claude(
         # the cache-survival statistic, recorded once the turn's usage lands.
         idle_before = facts.get("idle_min") if chat_id else None
         turn_log = TURN_LOG_DIR / (
-            f"{(chat_id or rule.name)}-{ts.replace(':', '').replace('-', '')[:15]}.log"
+            f"{(chat_id or rule.name)}-{time.time_ns()}.log"
         )
 
         # What the record will say. Kept here too because a turn can die faster
@@ -4643,6 +4765,7 @@ def spawn_claude(
         # finish_turn still needs the watermark to roll back.
         base_rec: Dict[str, Any] = {
             "chat_id": chat_id, "task_id": task_id, "session_id": session_id,
+            "provider": provider,
             "rule": rule.name, "idle_before": idle_before,
             "prev_watermark": last_msg_id if chat_id else None,
             "watermark": newest_msg_id, "log_path": str(turn_log),
@@ -4659,10 +4782,29 @@ def spawn_claude(
             rec.update(read_turn(chat_id) if chat_id else {})
             finish_turn(rec, rc, failure)
 
+        spawned = threading.Event()
+        original_on_exit = on_exit
+
+        def on_exit(rc: int, failure: Optional[str] = None) -> None:
+            spawned.wait()
+            original_on_exit(rc, failure)
+
+        if chat_id:
+            prompt_path = TURNS_STATE_DIR / f"{chat_id}.prompt"
+            prompt_path.write_text(prompt, encoding="utf-8")
+            write_turn(chat_id, **{k: v for k, v in base_rec.items() if k != "chat_id"},
+                       prompt_path=str(prompt_path), pid=None, pending=None, started_at=ts)
+            if provider == "codex" and codex_reset:
+                update_chat_state(chat_id, codex_session_id=None, pending_rotation=False)
+            update_chat_state(chat_id, active_provider=provider,
+                              agent_workdir=rule.workdir, codex_model=CODEX_MODEL)
         _reap_turn_logs()
         proc = _spawn_subprocess(
             rule, cmd, header, on_exit, chat_id=chat_id, turn_log=turn_log)
         if proc is None:
+            spawned.set()
+            if chat_id:
+                clear_turn(chat_id)
             _release_chat(chat_id, chat_lock, task_id)
             return False, "spawn-failed"
 
@@ -4733,8 +4875,11 @@ def spawn_claude(
 
             threading.Thread(target=_send_ack, daemon=True).start()
 
+        spawned.set()
         return True, "ok"
     except Exception:
+        if "spawned" in locals():
+            spawned.set()
         log.exception("rule %s: spawn flow failed", rule.name)
         _release_chat(chat_id, chat_lock)
         return False, "exception"
@@ -4759,6 +4904,10 @@ async def healthz():
         "version": APP_VERSION,
         "loop_heartbeat_age_s": round(time.monotonic() - _loop_heartbeat, 1),
         "claude_bin": CLAUDE_BIN,
+        "codex_fallback": CODEX_FALLBACK,
+        "codex_bin": CODEX_BIN,
+        "codex_model": CODEX_MODEL,
+        "next_provider": select_provider(),
         "claude_effort": CLAUDE_EFFORT or "(settings.json)",
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,
         "active_claude_procs": len(_active_procs),

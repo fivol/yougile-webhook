@@ -44,6 +44,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+import agent_backends
+import html
+
 import chatmd  # noqa: E402  (after sys.path, so a bare `python mcp_yougile.py` works)
 
 SERVER_NAME = "yougile-mcp"
@@ -186,6 +189,11 @@ def tool_send_task_message(args: Dict[str, Any]) -> Dict[str, Any]:
     if not (text or text_html):
         raise ApiError("refusing to post an empty message")
 
+    model = agent_backends.reply_model(ROOT / os.environ.get("STATE_DIR", "state"), task_id)
+    if model:
+        text = f"Модель: {model}\n\n{text}"
+        if text_html:
+            text_html = f"<p>Модель: {html.escape(model)}</p>{text_html}"
     body: Dict[str, Any] = {"text": text, "textHtml": text_html or ""}
     label = args.get("label")
     if label:
