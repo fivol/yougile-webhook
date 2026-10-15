@@ -189,7 +189,7 @@ def tool_send_task_message(args: Dict[str, Any]) -> Dict[str, Any]:
     if not (text or text_html):
         raise ApiError("refusing to post an empty message")
 
-    model = agent_backends.reply_model(ROOT / os.environ.get("STATE_DIR", "state"), task_id)
+    model = agent_backends.reply_label(ROOT / os.environ.get("STATE_DIR", "state"), task_id)
     if model:
         text = f"Модель: {model}\n\n{text}"
         if text_html:

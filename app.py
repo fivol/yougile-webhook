@@ -33,7 +33,7 @@ from fastapi import FastAPI, Request
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -297,6 +297,8 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CODEX_BIN = conf("codex.bin", "CODEX_BIN", "codex")
 CODEX_MODEL = conf("codex.model", "CODEX_MODEL", "gpt-6-astra")
 CODEX_EFFORT = conf("codex.effort", "CODEX_EFFORT", "medium")
+CODEX_AUTO_REVIEW = conf("codex.auto_review", "CODEX_AUTO_REVIEW", False, bool)
+CLAUDE_MODEL = conf("claude.model", "CLAUDE_MODEL", "").strip()
 CODEX_FALLBACK = conf("codex.fallback", "CODEX_FALLBACK", False, bool)
 CLAUDE_QUOTA_RETRY_SECONDS = conf(
     "codex.claude_retry_seconds", "CLAUDE_QUOTA_RETRY_SECONDS", 900, int)
@@ -359,6 +361,13 @@ def effort_args(extra_args: List[str]) -> List[str]:
     if any(a == "--effort" or a.startswith("--effort=") for a in extra_args):
         return []
     return ["--effort", CLAUDE_EFFORT]
+
+
+def model_args(extra_args: List[str]) -> List[str]:
+    """Select the configured Claude model unless the rule overrides it."""
+    if not CLAUDE_MODEL or agent_backends.option_value(extra_args, "--model") is not None:
+        return []
+    return ["--model", CLAUDE_MODEL]
 
 
 # The agent reaches YouGile through mcp_yougile.py, in this repo, handed to
@@ -3396,7 +3405,7 @@ def render_status(chat_id: str, rule: "Rule") -> Tuple[str, str]:
          "",
          msg("status.session", position=sv["seq"] + 1, total=len(chain) + 1,
              id=sv["id"])]
-    model = agent_backends.reply_model(STATE_DIR, chat_id)
+    model = agent_backends.reply_label(STATE_DIR, chat_id)
     if model:
         L.insert(1, f"Модель: {model}")
     if state.get("active_provider") == "codex":
@@ -4713,7 +4722,7 @@ def spawn_claude(
             # First-turn templates carry standing instructions missing from a new CLI session.
             is_first_turn = True
         if provider == "codex":
-            session_stats = "Модель: " + agent_backends.model_name(CODEX_MODEL)
+            session_stats = "Модель: " + agent_backends.model_name(CODEX_MODEL) + f" · effort: {CODEX_EFFORT}"
             if switching:
                 session_stats += "\nЛимит Claude исчерпан. Продолжаю в Codex с контекстом задачи."
         elif switching:
@@ -4726,7 +4735,7 @@ def spawn_claude(
             last_reply_plain=bool(chat_state.get("last_reply_plain")),
             last_reply_cdata=bool(chat_state.get("last_reply_cdata")),
         )
-        spawn_args = [*effort_args(rule.extra_args), *mcp_args(),
+        spawn_args = [*model_args(rule.extra_args), *effort_args(rule.extra_args), *mcp_args(),
                       *rule.extra_args, *session_flag]
         cmd = [CLAUDE_BIN, *spawn_args, "--output-format", "json", "-p"]
         if not chat_id:
@@ -4742,7 +4751,7 @@ def spawn_claude(
             cmd = agent_backends.codex_command(
                 CODEX_BIN, CODEX_MODEL, CODEX_EFFORT,
                 None if codex_reset else chat_state.get("codex_session_id"),
-                sys.executable, str(MCP_SERVER_SCRIPT))
+                sys.executable, str(MCP_SERVER_SCRIPT), auto_review=CODEX_AUTO_REVIEW)
 
         ts = datetime.now(timezone.utc).isoformat()
         header = (
@@ -4797,7 +4806,9 @@ def spawn_claude(
             if provider == "codex" and codex_reset:
                 update_chat_state(chat_id, codex_session_id=None, pending_rotation=False)
             update_chat_state(chat_id, active_provider=provider,
-                              agent_workdir=rule.workdir, codex_model=CODEX_MODEL)
+                              agent_workdir=rule.workdir, codex_model=CODEX_MODEL,
+                              agent_effort=(CODEX_EFFORT if provider == "codex" else
+                                            agent_backends.option_value(spawn_args, "--effort")))
         _reap_turn_logs()
         proc = _spawn_subprocess(
             rule, cmd, header, on_exit, chat_id=chat_id, turn_log=turn_log)
@@ -4907,6 +4918,9 @@ async def healthz():
         "codex_fallback": CODEX_FALLBACK,
         "codex_bin": CODEX_BIN,
         "codex_model": CODEX_MODEL,
+        "codex_effort": CODEX_EFFORT,
+        "codex_auto_review": CODEX_AUTO_REVIEW,
+        "claude_model": CLAUDE_MODEL or "(CLI default)",
         "next_provider": select_provider(),
         "claude_effort": CLAUDE_EFFORT or "(settings.json)",
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,

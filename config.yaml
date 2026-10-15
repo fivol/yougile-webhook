@@ -15,6 +15,7 @@
 # (Norwegian) would silently become False.
 
 claude:
+  model: ""                  # CLAUDE_MODEL; empty inherits the CLI default
   # Global cap on turns running at once, across all chats.
   max_concurrent: 10          # CLAUDE_MAX_CONCURRENT
   # Reasoning effort every turn runs at: low | medium | high | xhigh | max.
@@ -88,6 +89,7 @@ chat:
 # Claude remains primary. Enable only after checking `codex exec` and login.
 codex:
   fallback: false            # CODEX_FALLBACK
+  auto_review: false         # CODEX_AUTO_REVIEW; requires recent CLI --approve-for-me
   bin: codex                 # CODEX_BIN (absolute path recommended for launchd)
   model: gpt-6-astra          # CODEX_MODEL (must be available to your account)
   effort: medium             # CODEX_EFFORT

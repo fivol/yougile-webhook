@@ -55,8 +55,51 @@ model name to outgoing task messages: Claude's actual response model is read
 from its transcript, and Codex's model is explicitly supplied to the CLI.
 `/status` identifies the provider/model; existing token/cost statistics remain
 Claude-only. `/healthz` exposes fallback configuration and the next provider.
-Codex runs with `workspace-write` sandboxing, network access and noninteractive
-approval policy; operations requiring extra permissions fail visibly.
+Codex runs with `workspace-write` sandboxing and network access. Set
+`codex.auto_review: true` only after authorizing unattended permission review:
+this enables the recent CLI's `--approve-for-me`, keeping sandboxing while
+routing permission requests through automatic review. By default, requests
+requiring extra permissions are denied. Automatic review can still reject an
+operation; the agent must report it to the task chat.
+
+### Choosing model and effort
+
+Edit the existing blocks in gitignored `config.local.yaml`, preserving `bin`
+and your other settings:
+
+```yaml
+claude:
+  model: claude-opus-5-5
+  effort: xhigh
+codex:
+  model: gpt-6-astra
+  effort: medium
+  fallback: true
+  auto_review: true
+```
+
+Use model IDs available to the CLI account and an effort supported by that
+model. Claude accepts `low`, `medium`, `high`, `xhigh`, `max` in this service;
+Codex support varies by model. An empty Claude model inherits the CLI default.
+The message prefix and `/status` show both model and effort, for example
+`Модель: Opus 5.5 · effort: xhigh`. Effort is the requested CLI setting, not a
+measurement of tokens used. The receiver saves it at turn start so changing
+configuration cannot relabel a running turn.
+
+Environment variables (including `.env`) override YAML: `CLAUDE_MODEL`,
+`CLAUDE_EFFORT`, `CODEX_MODEL`, `CODEX_EFFORT`, `CODEX_AUTO_REVIEW`. A Claude
+rule's explicit `extra_args` model/effort overrides the corresponding defaults.
+Restart the receiver after editing; the next launched turn uses the new values,
+including resumed chats. Existing sessions and context are retained. On macOS:
+
+```sh
+launchctl unload ~/Library/LaunchAgents/org.local.yougile-webhook.plist
+launchctl load -w ~/Library/LaunchAgents/org.local.yougile-webhook.plist
+```
+
+Check `/healthz` for the loaded `claude_model`, `claude_effort`, `codex_model`,
+`codex_effort` and `codex_auto_review`. Claude remains primary regardless of
+which model ID is selected; the existing quota fallback chooses the provider.
 
 Verification without live chat messages: `python -m unittest test_backends`.
 

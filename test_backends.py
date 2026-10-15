@@ -30,18 +30,28 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(cmd[-1], '-')
         self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', cmd)
 
+    def test_auto_review_is_explicit_and_keeps_sandbox(self):
+        cmd = backends.codex_command('codex', 'gpt-6-astra', 'high', 'native-id',
+                                     'python', '/tmp/mcp.py', auto_review=True)
+        self.assertEqual(cmd[:5], ['codex', '--approve-for-me', 'exec', 'resume', 'native-id'])
+        self.assertNotIn('approval_policy="never"', cmd)
+        self.assertIn('sandbox_mode="workspace-write"', cmd)
+        self.assertIn('model_reasoning_effort="high"', cmd)
+
     def test_actual_claude_model(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(Path, 'home', return_value=Path(directory)):
             root = Path(directory)
             (root/'chats').mkdir()
-            (root/'chats/task.json').write_text(json.dumps({'agent_workdir': '/tmp/project', 'session_id': 'session'}))
+            (root/'chats/task.json').write_text(json.dumps({'agent_workdir': '/tmp/project', 'session_id': 'session', 'agent_effort': 'xhigh'}))
             slug = str(Path('/tmp/project').resolve()).replace('/', '-').replace('.', '-')
             transcript = root/'.claude/projects'/slug/'session.jsonl'
             transcript.parent.mkdir(parents=True)
             transcript.write_text(json.dumps({'type': 'assistant', 'message': {'model': 'claude-opus-5-5'}})+'\n')
             self.assertEqual(backends.reply_model(root, 'task'), 'Opus 5.5')
-            (root/'chats/task.json').write_text(json.dumps({'active_provider': 'codex', 'codex_model': 'gpt-6-astra'}))
+            self.assertEqual(backends.reply_label(root, 'task'), 'Opus 5.5 · effort: xhigh')
+            (root/'chats/task.json').write_text(json.dumps({'active_provider': 'codex', 'codex_model': 'gpt-6-astra', 'agent_effort': 'medium'}))
             self.assertEqual(backends.reply_model(root, 'task'), 'GPT-6 Astra')
+            self.assertEqual(backends.reply_label(root, 'task'), 'GPT-6 Astra · effort: medium')
 
 
 class FlowTests(unittest.TestCase):
@@ -187,14 +197,24 @@ class FlowTests(unittest.TestCase):
             self.assertEqual(a.get_chat_state('task')['codex_session_id'], 'codex-id')
             a._get_chat_lock('task').release()
 
+    def test_claude_settings_and_rule_override(self):
+        a = self.app
+        with patch.object(a, 'CLAUDE_MODEL', 'claude-opus-5-5'), patch.object(a, 'CLAUDE_EFFORT', 'xhigh'):
+            self.assertEqual(a.model_args([]), ['--model', 'claude-opus-5-5'])
+            self.assertEqual(a.effort_args([]), ['--effort', 'xhigh'])
+            for args in [['--model', 'sonnet', '--effort', 'high'], ['--model=sonnet', '--effort=high']]:
+                self.assertEqual(a.model_args(args), [])
+                self.assertEqual(a.effort_args(args), [])
+                self.assertEqual(backends.option_value(args, '--effort'), 'high')
+
     def test_mcp_adds_model_to_plain_and_html(self):
         import mcp_yougile as mcp
-        with patch.object(mcp.agent_backends, 'reply_model', return_value='GPT-6 Astra'), \
+        with patch.object(mcp.agent_backends, 'reply_label', return_value='GPT-6 Astra · effort: medium'), \
              patch.object(mcp, 'api', return_value={'id': '1'}) as api, patch.object(mcp, 'log'):
             mcp.tool_send_task_message({'taskId': 'task', 'text': 'Done', 'textHtml': '<p>Done</p>'})
             body = api.call_args.args[2]
             self.assertTrue(body['text'].startswith('Модель: GPT-6 Astra'))
-            self.assertTrue(body['textHtml'].startswith('<p>Модель: GPT-6 Astra</p>'))
+            self.assertTrue(body['textHtml'].startswith('<p>Модель: GPT-6 Astra · effort: medium</p>'))
 
 
 if __name__ == '__main__':

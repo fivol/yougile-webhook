@@ -73,6 +73,30 @@ def reply_model(root: Path, chat_id: str) -> str:
         return ''
 
 
+def option_value(args: list[str], flag: str) -> str | None:
+    """Read the final CLI option, supporting both --flag value and --flag=value."""
+    value = None
+    for i, arg in enumerate(args):
+        if arg == flag and i + 1 < len(args):
+            value = args[i + 1]
+        elif arg.startswith(flag + '='):
+            value = arg.split('=', 1)[1]
+    return value
+
+
+def reply_label(root: Path, chat_id: str) -> str:
+    """Label replies using the model and the effort captured for this running turn."""
+    model = reply_model(root, chat_id)
+    if not model:
+        return ''
+    try:
+        state = json.loads((root / 'chats' / f'{chat_id}.json').read_text())
+        effort = state.get('agent_effort') or 'CLI default'
+    except (OSError, ValueError, TypeError):
+        effort = 'unknown'
+    return f'{model} · effort: {effort}'
+
+
 def codex_context(session: str | None, home: Path) -> str:
     """Extract recent dialogue/actions and keep a pointer to the complete native transcript."""
     if not session or not re.fullmatch(r'[0-9a-fA-F-]{36}', session):
@@ -101,12 +125,14 @@ def codex_context(session: str | None, home: Path) -> str:
 
 
 def codex_command(binary: str, model: str, effort: str, session: str | None,
-                  python: str, mcp_script: str) -> list[str]:
+                  python: str, mcp_script: str, auto_review: bool = False) -> list[str]:
     """Build a noninteractive, sandboxed Codex invocation with the same reply channel."""
-    cmd = [binary, 'exec']
+    cmd = [binary, *(['--approve-for-me'] if auto_review else []), 'exec']
     if session:
         cmd += ['resume', session]
-    cmd += ['--json', '--model', model, '-c', 'approval_policy="never"',
+    if not auto_review:
+        cmd += ['-c', 'approval_policy="never"']
+    cmd += ['--json', '--model', model,
             '-c', 'sandbox_mode="workspace-write"',
             '-c', 'sandbox_workspace_write.network_access=true',
             '-c', f'model_reasoning_effort={json.dumps(effort)}',
