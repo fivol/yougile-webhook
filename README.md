@@ -1,6 +1,17 @@
-# yougile-webhook
+# board-agent
 
-Receive YouGile webhooks and spawn `claude --dangerously-skip-permissions`
+An agent that lives in YouGile cards. Each card gets its own persistent claude
+session; the agent starts only when it is handed a card — `@Agent` in the
+card's chat, or `board-agent kick` — and ends every turn by saying whose move
+it is now on the card's sticker.
+
+**Engine and flow are separate.** This checkout is the engine. A team's process
+— which columns matter, what each card status means, the prompt the agent
+works by — is a *flow spec* directory named by `SPEC_DIR` (see
+[Flow spec](#flow-spec--spec_dir)). Nothing about a particular board is
+hardcoded here.
+
+Under the hood: receive YouGile webhooks and spawn `claude --dangerously-skip-permissions`
 on configurable triggers. Each YouGile task chat maps 1:1 to a persistent
 claude session, so the agent remembers prior turns when re-mentioned —
 whether you type `@Agent` or just
@@ -22,6 +33,56 @@ YouGile ──POST──▶ https://your.domain/yougile/webhook
                   cwd = rule.workdir
                   --session-id <chatId>   (first time on this chat)
                   --resume     <chatId>   (subsequent)
+```
+
+## Flow spec — `SPEC_DIR`
+
+`SPEC_DIR` in `.env` points at a directory that holds one team's process:
+
+| File | What |
+|---|---|
+| `config.yaml` | Layered between the engine's `config.yaml` and `config.local.yaml`. Holds `board.columns` (title → id), `board.scope` (columns the CLI looks at by default), `sticker` (name, `working`, `answered`, `outcomes`) and `kick.text`. |
+| `rules.toml` | The trigger rules. Prompt paths in it are relative to the spec dir. |
+| `prompts/*.txt` | The prompts the rules name. A file missing here falls back to the engine's `prompts/` (e.g. `formatting.txt`). |
+
+Without `SPEC_DIR` the engine reads `rules.toml` and `prompts/` from this
+checkout, as before. `/healthz` reports `spec_dir`, `rules_file` and `kick_rule`.
+
+### Card status — the agent says whose move it is
+
+`sticker.outcomes` maps a sticker state to when to pick it:
+
+```yaml
+sticker:
+  name: Agent
+  working: working        # set by the receiver while a turn runs
+  answered: answered      # fallback when the agent names no outcome
+  outcomes:
+    done: PR is open and you are sure — the owner only has to merge.
+    question: You need the owner's answer to go on; questions are numbered.
+```
+
+The list is rendered into every prompt (`{statuses}`, or appended when the
+template lacks it). The agent passes `status` to `send_task_message`; the MCP
+server records it in `state/turns/<chatId>.status`, and when the turn ends the
+receiver puts that state on the card instead of `answered`. YouGile's API can't
+add states to a sticker — add each outcome in the UI, then restart.
+
+### Handing over cards without `@Agent` — `kick` and the CLI
+
+`POST /kick {"task_id", "text"}` starts a turn on a card exactly as if the
+first allowed sender of the kick rule had written `text` in its chat: same
+session, same prompts, so a later `@Agent` continues it. It never interrupts a
+running turn (`busy`). The receiver is exposed through the webhook tunnel, so
+the endpoint wants the `X-Kick-Token` header — the token is generated into
+`state/kick.token` (mode 600) on startup. `kick.rule` picks the rule; by default
+the first enabled `chat_message-created` rule.
+
+`bin/board-agent` (symlink it into your `PATH`) wraps both:
+
+```bash
+board-agent cards [COLUMN ...] [--json]   # cards with sticker, handed?, running?, unseen messages
+board-agent kick PRO-2062 2065 [--say TEXT]
 ```
 
 ## Automatic Codex fallback
@@ -93,8 +154,8 @@ Restart the receiver after editing; the next launched turn uses the new values,
 including resumed chats. Existing sessions and context are retained. On macOS:
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/org.local.yougile-webhook.plist
-launchctl load -w ~/Library/LaunchAgents/org.local.yougile-webhook.plist
+launchctl unload ~/Library/LaunchAgents/org.local.board-agent.plist
+launchctl load -w ~/Library/LaunchAgents/org.local.board-agent.plist
 ```
 
 Check `/healthz` for the loaded `claude_model`, `claude_effort`, `codex_model`,
@@ -148,7 +209,7 @@ that schema needs to be one we control.
 
 ```bash
 git clone <this-repo>
-cd yougile-webhook
+cd board-agent
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
@@ -210,21 +271,21 @@ going silently dead:
 
 ### Autostart (macOS launchd)
 
-`~/Library/LaunchAgents/org.local.yougile-webhook.plist`:
+`~/Library/LaunchAgents/org.local.board-agent.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>org.local.yougile-webhook</string>
+    <key>Label</key><string>org.local.board-agent</string>
     <key>ProgramArguments</key>
-    <array><string>/PATH/TO/yougile-webhook/run.sh</string></array>
-    <key>WorkingDirectory</key><string>/PATH/TO/yougile-webhook</string>
+    <array><string>/PATH/TO/board-agent/run.sh</string></array>
+    <key>WorkingDirectory</key><string>/PATH/TO/board-agent</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/PATH/TO/yougile-webhook/logs/uvicorn.log</string>
-    <key>StandardErrorPath</key><string>/PATH/TO/yougile-webhook/logs/uvicorn.err</string>
+    <key>StandardOutPath</key><string>/PATH/TO/board-agent/logs/uvicorn.log</string>
+    <key>StandardErrorPath</key><string>/PATH/TO/board-agent/logs/uvicorn.err</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -244,8 +305,8 @@ macOS the moment it opens a Postgres connection, because libpq's Kerberos
 probe is not fork-safe.
 
 ```bash
-launchctl load -w ~/Library/LaunchAgents/org.local.yougile-webhook.plist
-launchctl list | grep yougile-webhook
+launchctl load -w ~/Library/LaunchAgents/org.local.board-agent.plist
+launchctl list | grep board-agent
 ```
 
 ## Register the YouGile webhook
@@ -443,7 +504,8 @@ a `config.yaml` home are marked in that file.
 | `TURN_REPORT_SILENT` | Default `true`. Post a note when a turn ends cleanly but the agent never wrote into the chat. `false` restores the old silence. |
 | `TURN_LOG_KEEP` | Per-turn output logs kept in `logs/turns/`. Default `200`. |
 | `TURN_ADOPT_POLL_SECONDS` | How often to poll a turn adopted from a previous receiver process (it is no longer a child, so it cannot be `wait()`ed on). Default `5`. |
-| `RULES_FILE` | Default `rules.toml`. |
+| `SPEC_DIR` | The flow spec directory (see [Flow spec](#flow-spec--spec_dir)). Empty = engine defaults. |
+| `RULES_FILE` | Default `rules.toml`, inside `SPEC_DIR` when it is set. |
 | `MESSAGES_LANG` | Which `messages/<lang>.toml` the receiver speaks. Default `ru`. See [Wording](#wording--messageslangtoml). |
 | `MESSAGES_FILE` | Absolute path to a messages file, overriding `MESSAGES_LANG`. |
 | `WEBHOOK_ENSURE_INTERVAL_SECONDS` | How often the service sweeps its own YouGile subscription and revives it if YouGile auto-disabled it after a streak of failed deliveries (e.g. while we were down). Default `900` (15 min). The same check runs once at startup. Set to a large value to disable the timer; the startup check still fires. |
@@ -477,8 +539,8 @@ a `config.yaml` home are marked in that file.
 After editing `.env` or `rules.toml`, reload:
 
 ```bash
-launchctl unload  ~/Library/LaunchAgents/org.local.yougile-webhook.plist
-launchctl load -w ~/Library/LaunchAgents/org.local.yougile-webhook.plist
+launchctl unload  ~/Library/LaunchAgents/org.local.board-agent.plist
+launchctl load -w ~/Library/LaunchAgents/org.local.board-agent.plist
 ```
 
 ## Sessions and chat history

@@ -190,6 +190,13 @@ def tool_send_task_message(args: Dict[str, Any]) -> Dict[str, Any]:
     if not (text or text_html):
         raise ApiError("refusing to post an empty message")
 
+    status = str(args.get("status") or "").strip()
+    if status:
+        # Read back by the receiver when the turn ends; it sets the card sticker.
+        state_dir = ROOT / os.environ.get("STATE_DIR", "state")
+        (state_dir / "turns").mkdir(parents=True, exist_ok=True)
+        (state_dir / "turns" / f"{task_id}.status").write_text(status, encoding="utf-8")
+
     body: Dict[str, Any] = {"text": text, "textHtml": text_html or ""}
     label = args.get("label")
     if label:
@@ -342,6 +349,13 @@ TOOLS: Tuple[Tuple[str, str, dict, Callable[[Dict[str, Any]], Any]], ...] = (
                         "URL. No markdown characters."),
                 },
                 "label": {"type": "string", "description": "Quick-link label (rare)."},
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "The card status this reply leaves: one of the states listed "
+                        "under CARD STATUS in your instructions. Shown on the card's "
+                        "sticker when the turn ends."),
+                },
             },
             "required": ["taskId", "text"],
         },

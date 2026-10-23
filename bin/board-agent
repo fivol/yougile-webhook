@@ -1,0 +1,4 @@
+#!/bin/zsh
+# Runs the CLI from the checkout's venv, wherever this is symlinked from.
+here="${0:A:h}/.."
+exec "$here/.venv/bin/python" "$here/cli.py" "$@"

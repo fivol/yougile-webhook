@@ -66,7 +66,7 @@ class FlowTests(unittest.TestCase):
         cls.checkout = tempfile.TemporaryDirectory()
         root = Path(cls.checkout.name)
         source = Path(__file__).parent
-        for name in ('app.py', 'config.yaml'):
+        for name in ('app.py', 'settings.py', 'config.yaml'):
             shutil.copy(source/name, root/name)
         if (source/'messages').exists():
             shutil.copytree(source/'messages', root/'messages')
@@ -76,7 +76,13 @@ class FlowTests(unittest.TestCase):
         sys.modules[spec.name] = app
         with patch.dict(os.environ, {'YOUGILE_API_KEY': '', 'YOUGILE_WEBHOOK_URL': '',
                                      'STATE_DIR': str(root/'state')}), \
-             patch('urllib.request.urlopen', side_effect=OSError('offline test')):
+             patch('urllib.request.urlopen', side_effect=OSError('offline test')), \
+             patch.dict(sys.modules):
+            # The isolated settings, so this checkout's .env, local config and
+            # flow spec stay out of the test.
+            s_spec = importlib.util.spec_from_file_location('settings', root/'settings.py')
+            sys.modules['settings'] = importlib.util.module_from_spec(s_spec)
+            s_spec.loader.exec_module(sys.modules['settings'])
             spec.loader.exec_module(app)
         cls.app = app
 

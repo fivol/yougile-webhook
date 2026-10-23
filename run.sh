@@ -8,4 +8,4 @@ if [[ -f .env ]]; then
 fi
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-9100}"
-exec ./.venv/bin/uvicorn app:app --host "$HOST" --port "$PORT"
+exec ./.venv/bin/python -m uvicorn app:app --host "$HOST" --port "$PORT"

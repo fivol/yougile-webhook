@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import shlex
 import signal
 import socket
@@ -31,11 +32,12 @@ import agent_backends
 import usage_summary
 import reply_delivery
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 # Hand-maintained; bump on every change worth restarting the service for. The
 # launchd agent runs uvicorn from the checkout, so /healthz reporting this is
 # the quickest way to tell whether a restart actually picked up new code.
-APP_VERSION = "1.10.0"
+APP_VERSION = "2.0.0"
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -48,125 +50,14 @@ ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 EVENT_LOG = LOG_DIR / "events.jsonl"
 CLAUDE_LOG = LOG_DIR / "claude.log"
 
-
-def load_dotenv(path: Path) -> None:
-    if not path.exists():
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-load_dotenv(ROOT / ".env")
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("yougile-webhook")
-log.info("yougile-webhook %s starting from %s", APP_VERSION, ROOT)
+log = logging.getLogger("board-agent")
+log.info("board-agent %s starting from %s", APP_VERSION, ROOT)
 
-
-# --- Settings ----------------------------------------------------------------
-# Seventy flat environment variables is a lot of surface for something whose
-# knobs group naturally (rotation, handoff, history, turns). config.yaml gives
-# them that shape; config.local.yaml overrides it per machine and is not
-# committed. Environment variables still win over both, so a one-off override
-# needs no file edit and every existing .env keeps working unchanged.
-#
-# Secrets stay in .env deliberately: config.yaml is meant to be committable.
-
-CONFIG_FILE = ROOT / os.environ.get("CONFIG_FILE", "config.yaml")
-CONFIG_LOCAL_FILE = ROOT / os.environ.get("CONFIG_LOCAL_FILE", "config.local.yaml")
-
-
-class _StrictBoolLoader(yaml.SafeLoader):
-    """YAML 1.1 reads `no`, `off` and `yes` as booleans.
-
-    That is a live hazard here: `language: no` is Norwegian, not False, and the
-    same goes for locale lists and two-letter codes generally. Only `true` and
-    `false` stay boolean; everything else that looks like a word stays a string.
-    """
-
-
-_StrictBoolLoader.add_implicit_resolver(
-    "tag:yaml.org,2002:bool",
-    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
-    list("tTfF"),
+from settings import (  # noqa: E402  (after logging is configured)
+    CONFIG, SPEC_DIR, conf,
 )
-for _ch in list("yYnNoO"):
-    _StrictBoolLoader.yaml_implicit_resolvers.setdefault(_ch, [])
-    _StrictBoolLoader.yaml_implicit_resolvers[_ch] = [
-        (tag, rx) for tag, rx in _StrictBoolLoader.yaml_implicit_resolvers[_ch]
-        if tag != "tag:yaml.org,2002:bool"
-    ]
-
-
-def _deep_merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(base)
-    for key, value in (over or {}).items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
-def _load_config() -> Dict[str, Any]:
-    merged: Dict[str, Any] = {}
-    for path in (CONFIG_FILE, CONFIG_LOCAL_FILE):
-        if not path.exists():
-            continue
-        try:
-            with path.open("rb") as f:
-                data = yaml.load(f, Loader=_StrictBoolLoader) or {}
-        except (OSError, yaml.YAMLError):
-            log.exception("config %s is unreadable — ignoring it", path)
-            continue
-        if not isinstance(data, dict):
-            log.warning("config %s is not a mapping — ignoring it", path)
-            continue
-        merged = _deep_merge(merged, data)
-        log.info("config: loaded %s", path.name)
-    return merged
-
-
-CONFIG: Dict[str, Any] = _load_config()
-
-
-def conf(path: str, env: str, default: Any, cast: Any = str) -> Any:
-    """One setting, resolved: environment > config.local.yaml > config.yaml > default.
-
-    `path` is dotted ("rotation.turn_cost_usd"); `env` is the variable that has
-    always set it. Keeping both means no existing deployment has to change and
-    nothing has to be looked up in two places to know what is in effect.
-    """
-    raw = os.environ.get(env)
-    if raw is None:
-        node: Any = CONFIG
-        for part in path.split("."):
-            if not isinstance(node, dict) or part not in node:
-                node = None
-                break
-            node = node[part]
-        raw = node
-    if raw is None:
-        return default
-    try:
-        if cast is bool:
-            if isinstance(raw, bool):
-                return raw
-            return str(raw).strip().lower() not in ("0", "false", "no", "off", "")
-        if cast is list:
-            if isinstance(raw, list):
-                return [str(x).strip() for x in raw if str(x).strip()]
-            return [x.strip() for x in str(raw).split(",") if x.strip()]
-        return cast(raw)
-    except (TypeError, ValueError):
-        log.warning("config %s: %r is not a valid %s — using %r",
-                    path, raw, getattr(cast, "__name__", cast), default)
-        return default
-
+log.info("flow spec: %s", SPEC_DIR or "(none — engine defaults)")
 
 # --- User-facing text --------------------------------------------------------
 # Everything this receiver posts into a chat lives in messages/<lang>.toml, not
@@ -641,12 +532,19 @@ AGENT_STATUS_STICKER = os.environ.get("AGENT_STATUS_STICKER", "true").lower() no
 # you want it visible on (one-time, in the YouGile UI). State names must match
 # exactly — YouGile's API can rename a sticker but cannot edit its states, so a
 # typo here means adding the state by hand in the UI.
-AGENT_STICKER_NAME = os.environ.get("AGENT_STICKER_NAME", "Agent").strip()
-AGENT_STICKER_ICON = os.environ.get("AGENT_STICKER_ICON", "pin").strip()
-AGENT_STICKER_WORKING = os.environ.get("AGENT_STICKER_WORKING", "working").strip()
-AGENT_STICKER_ANSWERED = os.environ.get("AGENT_STICKER_ANSWERED", "answered").strip()
+AGENT_STICKER_NAME = conf("sticker.name", "AGENT_STICKER_NAME", "Agent").strip()
+AGENT_STICKER_ICON = conf("sticker.icon", "AGENT_STICKER_ICON", "pin").strip()
+AGENT_STICKER_WORKING = conf("sticker.working", "AGENT_STICKER_WORKING", "working").strip()
+AGENT_STICKER_ANSWERED = conf("sticker.answered", "AGENT_STICKER_ANSWERED", "answered").strip()
 AGENT_STICKER_WORKING_COLOR = os.environ.get("AGENT_STICKER_WORKING_COLOR", "#8CC2FF").strip()
 AGENT_STICKER_ANSWERED_COLOR = os.environ.get("AGENT_STICKER_ANSWERED_COLOR", "#79CE69").strip()
+# Final states the agent picks itself, {state name: when to pick it}. They say
+# whose move it is now; "answered" stays the fallback for a turn that names
+# none. Rendered into every prompt via {statuses}.
+_outcomes_raw = (CONFIG.get("sticker") or {}).get("outcomes") or {}
+AGENT_STICKER_OUTCOMES: Dict[str, str] = {
+    str(k).strip(): " ".join(str(v).split()) for k, v in _outcomes_raw.items()
+} if isinstance(_outcomes_raw, dict) else {}
 
 # --- Session rotation --------------------------------------------------------
 # A chat's claude session grows without bound: every turn re-sends the whole
@@ -807,7 +705,9 @@ REPLY_QUOTE_MAX_CHARS = int(os.environ.get("REPLY_QUOTE_MAX_CHARS", "2000"))
 PLAIN_REPLY_MIN_CHARS = conf(
     "chat.plain_reply_min_chars", "PLAIN_REPLY_MIN_CHARS", 400, int)
 
-RULES_FILE = ROOT / os.environ.get("RULES_FILE", "rules.toml")
+# A spec's rules.toml names its prompts relative to itself, so the spec dir is
+# self-contained; a bare engine install keeps resolving them against ROOT.
+RULES_FILE = (SPEC_DIR or ROOT) / os.environ.get("RULES_FILE", "rules.toml")
 
 # Engine text ships in the repo; an install customises it by dropping a file of
 # the same name into `prompts/local/`, which shadows it. One idiom for every
@@ -823,6 +723,13 @@ def resolve_prompt(path: Path) -> Path:
     """`prompts/local/<name>` if it exists, else the shipped `prompts/<name>`."""
     local = path.parent / PROMPT_LOCAL_DIR / path.name
     return local if local.is_file() else path
+
+
+def spec_path(rel: str) -> Path:
+    """A file named by the spec: the spec dir's copy wins over the engine's."""
+    if SPEC_DIR and (SPEC_DIR / rel).is_file():
+        return SPEC_DIR / rel
+    return resolve_prompt(ROOT / rel)
 
 # YouGile auto-disables a webhook subscription after enough failed deliveries
 # (e.g. while we were down or the tunnel was unreachable). Sweep our subscriptions
@@ -849,8 +756,7 @@ WEBHOOK_ENSURE_RETRY_SECONDS = int(os.environ.get("WEBHOOK_ENSURE_RETRY_SECONDS"
 # the user cannot miss (a plain-text wall instead of a report) is the part that
 # has to be re-stated at the end of every turn. No marker => the whole file is
 # the spec, exactly as before.
-_FORMATTING_FILE = resolve_prompt(
-    ROOT / os.environ.get("FORMATTING_FILE", "prompts/formatting.txt"))
+_FORMATTING_FILE = spec_path(os.environ.get("FORMATTING_FILE", "prompts/formatting.txt"))
 _FORMATTING_MARKER = "=== ALWAYS ==="
 _formatting_raw = (
     _FORMATTING_FILE.read_text(encoding="utf-8")
@@ -909,7 +815,7 @@ def load_rules(path: Path) -> List[Rule]:
     rules: List[Rule] = []
     for raw in data.get("rules", []):
         name = raw.get("name", "<unnamed>")
-        prompt_path = resolve_prompt(ROOT / raw.get("prompt_file", ""))
+        prompt_path = spec_path(raw.get("prompt_file", ""))
         if not prompt_path.exists():
             log.warning("rule %s: prompt file %s missing — skipping", name, prompt_path)
             continue
@@ -919,12 +825,12 @@ def load_rules(path: Path) -> List[Rule]:
         # is enough; no rules.toml change needed.
         followup = ""
         followup_file = raw.get("prompt_file_followup")
-        followup_path = resolve_prompt(
-            ROOT / followup_file if followup_file
+        followup_path = spec_path(
+            followup_file if followup_file
             # Beside the *configured* prompt, not the resolved one: a local
             # override of the main template must not drag the shipped follow-up
             # out of `local/`, nor the other way round.
-            else (ROOT / raw.get("prompt_file", "")).with_suffix(".followup.txt")
+            else str(Path(raw.get("prompt_file", "")).with_suffix(".followup.txt"))
         )
         if followup_path.exists():
             followup = followup_path.read_text(encoding="utf-8")
@@ -1213,12 +1119,14 @@ def react_to_message(chat_id: str, message_id: str, emoji: str) -> bool:
 
 # YouGile's "this sticker has no value" sentinel.
 STICKER_CLEAR = "-"
-# The two states we drive, and the labels/colours to create them with.
+# The two states the receiver drives, plus the outcomes the agent may pick, and
+# the labels/colours to create them with. An outcome's marker is its label.
 MARKER_WORKING = "working"
 MARKER_ANSWERED = "answered"
 _MARKER_SPECS = {
     MARKER_WORKING: (AGENT_STICKER_WORKING, AGENT_STICKER_WORKING_COLOR),
     MARKER_ANSWERED: (AGENT_STICKER_ANSWERED, AGENT_STICKER_ANSWERED_COLOR),
+    **{label.lower(): (label, AGENT_STICKER_ANSWERED_COLOR) for label in AGENT_STICKER_OUTCOMES},
 }
 
 _sticker_lock = threading.Lock()
@@ -1243,9 +1151,9 @@ def _sticker_states(raw: dict) -> Dict[str, str]:
         else:
             log.warning(
                 "agent sticker: '%s' has no state named '%s' — YouGile's API can't "
-                "add one, so add it in the UI (or point AGENT_STICKER_%s at an "
-                "existing state)",
-                AGENT_STICKER_NAME, label, marker.upper(),
+                "add one, so add it in the UI and restart (or rename it in the "
+                "sticker config to an existing state)",
+                AGENT_STICKER_NAME, label,
             )
     return found
 
@@ -3723,6 +3631,7 @@ async def _start_background_tasks() -> None:
     # last one left behind. Off the event loop: it talks to the YouGile API.
     threading.Thread(target=reconcile_open_turns, daemon=True).start()
     threading.Thread(target=_reply_delivery_worker, daemon=True).start()
+    kick_token()  # so the CLI finds it before the first kick
 
 
 _active_lock = threading.Lock()
@@ -3944,6 +3853,40 @@ def _recover_lost_session(chat_id: str, rule: "Rule", payload: Any) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _status_path(chat_id: str) -> Path:
+    """Where the MCP server records the outcome the agent picked this turn."""
+    return TURNS_STATE_DIR / f"{chat_id}.status"
+
+
+def _take_agent_status(chat_id: Optional[str]) -> Optional[str]:
+    """The outcome marker the agent chose for this turn, consumed on read."""
+    if not chat_id:
+        return None
+    path = _status_path(chat_id)
+    try:
+        label = path.read_text(encoding="utf-8").strip()
+        path.unlink()
+    except OSError:
+        return None
+    outcomes = {o.lower() for o in AGENT_STICKER_OUTCOMES}
+    if label.lower() in outcomes:
+        return label.lower()
+    log.warning("chat %s: agent picked unknown status %r — using answered", chat_id, label)
+    return None
+
+
+def render_statuses() -> str:
+    """The outcome list every turn ends by choosing from; empty without one."""
+    if not AGENT_STICKER_OUTCOMES:
+        return ""
+    lines = "\n".join(f"  - {k} — {v}" for k, v in AGENT_STICKER_OUTCOMES.items())
+    return (
+        "CARD STATUS — pass `status` to send_task_message: the one state below that "
+        "says whose move it is now. It goes on the card's sticker when the turn "
+        f"ends; leaving it out shows '{AGENT_STICKER_ANSWERED}'.\n{lines}"
+    )
+
+
 def _mark_turn_finished(chat_id: Optional[str], task_id: Optional[str]) -> None:
     """Flip the card to "answered" now that the agent has stopped — the user's
     cue that the reply is in the chat and it's their turn.
@@ -3958,7 +3901,7 @@ def _mark_turn_finished(chat_id: Optional[str], task_id: Optional[str]) -> None:
         with _active_lock:
             if chat_id in _pending_turns:
                 return
-    set_task_marker(task_id, MARKER_ANSWERED)
+    set_task_marker(task_id, _take_agent_status(chat_id) or MARKER_ANSWERED)
 
 
 def _release_chat(
@@ -4220,6 +4163,7 @@ def _build_prompt(
     rendered = rendered.replace("{session_stats}", session_stats)
     chat_id = extract_chat_id(payload) or ""
     rendered = rendered.replace("{chat_id}", chat_id)
+    rendered = rendered.replace("{statuses}", render_statuses())
     # {event_json} used to interpolate the raw webhook event: ~340 tokens of
     # which half was `prevData`, a byte-for-byte copy of `payload`, wrapped
     # around a message that is already the last line of {chat_history}. Kept as
@@ -4289,6 +4233,8 @@ def _build_prompt(
         if last_reply_cdata and CDATA_NOTICE:
             contract = f"{CDATA_NOTICE}\n\n{contract}"
         rendered = f"{rendered}\n\n---\n{contract}\n"
+    if AGENT_STICKER_OUTCOMES and "{statuses}" not in template:
+        rendered = f"{rendered}\n\n---\n{render_statuses()}\n"
     if interrupted and INTERRUPT_NOTICE:
         rendered = f"{INTERRUPT_NOTICE}\n\n---\n{rendered}"
     if SINGLE_REPLY:
@@ -4896,6 +4842,8 @@ def spawn_claude(
         if chat_id:
             prompt_path = TURNS_STATE_DIR / f"{chat_id}.prompt"
             prompt_path.write_text(prompt, encoding="utf-8")
+            # A status left by an earlier turn must not decide this one's card.
+            _status_path(chat_id).unlink(missing_ok=True)
             write_turn(chat_id, **{k: v for k, v in base_rec.items() if k != "chat_id"},
                        prompt_path=str(prompt_path), pid=None, pending=None)
             if provider == "codex" and codex_reset:
@@ -5025,6 +4973,9 @@ async def healthz():
         # a reply to a colleague and falls back to needing a literal mention.
         "agent_user_id": agent_user_id(),
         "status_sticker": _sticker_snapshot(),
+        "spec_dir": str(SPEC_DIR) if SPEC_DIR else None,
+        "rules_file": str(RULES_FILE),
+        "kick_rule": getattr(kick_rule(), "name", None),
         "tracked_chats": list_known_chats(),
         "webhook": webhook,
         "rules": [
@@ -5041,6 +4992,69 @@ async def healthz():
             for r in RULES
         ],
     }
+
+
+# ---------------------------------------------------------------- kick
+#
+# Starts a turn on a card nobody @-mentioned: the `board-agent kick` CLI behind
+# the board skill. The turn runs in the card's own session exactly as if the
+# owner had written the instruction in its chat, so a later @Agent there
+# continues with full memory. The receiver is reachable from the internet
+# through the webhook tunnel, so the endpoint wants a token only this machine
+# can read.
+
+KICK_TOKEN_FILE = STATE_DIR / "kick.token"
+KICK_RULE = conf("kick.rule", "KICK_RULE", "")
+
+
+def kick_token() -> str:
+    try:
+        token = KICK_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    if not token:
+        token = secrets.token_hex(24)
+        KICK_TOKEN_FILE.write_text(token, encoding="utf-8")
+        KICK_TOKEN_FILE.chmod(0o600)
+    return token
+
+
+def kick_rule() -> Optional[Rule]:
+    """The rule a kicked turn runs under: `kick.rule`, else the first enabled
+    chat-message rule — the one an @Agent mention would have fired."""
+    for r in RULES:
+        if KICK_RULE and r.name == KICK_RULE:
+            return r
+        if not KICK_RULE and r.enabled and "chat_message-created" in r.events:
+            return r
+    return None
+
+
+@app.post("/kick")
+async def kick(req: Request):
+    if not secrets.compare_digest(req.headers.get("x-kick-token", ""), kick_token()):
+        return JSONResponse({"ok": False, "reason": "bad-token"}, status_code=403)
+    body = await req.json()
+    task_id = str(body.get("task_id") or "").strip()
+    text = str(body.get("text") or "").strip()
+    rule = kick_rule()
+    if not (_UUID_RE.match(task_id) and text):
+        return JSONResponse({"ok": False, "reason": "task_id and text required"}, status_code=400)
+    if rule is None:
+        return {"ok": False, "reason": "no-kick-rule"}
+    # A kick never interrupts: a running turn is someone's live conversation.
+    if chat_turn_in_flight(task_id):
+        return {"ok": False, "reason": "busy"}
+    # Signed as the rule's first allowed sender, so the agent reads the
+    # instruction as the owner's, the same as a typed one.
+    payload = {
+        "event": "chat_message-created",
+        "fromUserId": min(rule.allowed_sender_ids) if rule.allowed_sender_ids else None,
+        "payload": {"id": int(time.time() * 1000), "chatId": task_id, "text": text},
+    }
+    ok, why = await asyncio.to_thread(spawn_claude, rule, payload)
+    log.info("kick task=%s rule=%s ok=%s why=%s", task_id, rule.name, ok, why)
+    return {"ok": ok, "reason": why}
 
 
 @app.post("/yougile/webhook")
