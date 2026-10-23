@@ -1,10 +1,11 @@
-"""board-agent CLI — look at the board, hand cards to the agent.
+"""kanban-agent CLI — look at the kanban, hand cards to the agent.
 
-  board-agent cards [COLUMN ...] [--json]   cards of the spec's columns (default: board.scope)
-  board-agent kick TASK ... [--say TEXT]    start a turn on each card, as if @Agent were written there
+  kanban-agent cards [COLUMN ...] [--json]   cards of the given columns (default: kanban.scope)
+  kanban-agent kick TASK ... [--say TEXT]    start a turn on each card, as if @Agent were written there
 
-TASK is a card number (PRO-2062, 2062) or a task UUID. Columns, the scope and
-the default kick text come from the flow spec's config.yaml (see settings.py).
+COLUMN is a role from kanban.columns (bugs) or its title (Bugs). TASK is a card
+number (PRO-2062, 2062) or a task UUID. Columns, the scope and the default kick
+text come from the flow spec's config.yaml (see settings.py).
 """
 from __future__ import annotations
 
@@ -26,8 +27,9 @@ from settings import STATE_DIR, conf  # noqa: E402
 API_BASE = os.environ.get("YOUGILE_API_BASE", "https://yougile.com/api-v2").rstrip("/")
 API_KEY = os.environ.get("YOUGILE_API_KEY", "")
 RECEIVER = f"http://{os.environ.get('HOST', '127.0.0.1')}:{os.environ.get('PORT', '9100')}"
-COLUMNS: Dict[str, str] = conf("board.columns", "BOARD_COLUMNS", {}, dict)
-SCOPE: List[str] = conf("board.scope", "BOARD_SCOPE", list(COLUMNS), list)
+# role -> {title, id}
+COLUMNS: Dict[str, Dict[str, str]] = conf("kanban.columns", "KANBAN_COLUMNS", {}, dict)
+SCOPE: List[str] = conf("kanban.scope", "KANBAN_SCOPE", list(COLUMNS), list)
 KICK_TEXT = conf("kick.text", "KICK_TEXT", "Take this card.")
 STICKER_NAME = conf("sticker.name", "AGENT_STICKER_NAME", "Agent")
 
@@ -38,10 +40,10 @@ def api(path: str) -> Any:
         return json.loads(r.read() or b"null")
 
 
-def column_id(name: str) -> str:
-    for title, cid in COLUMNS.items():
-        if title.lower() == name.lower() or cid == name:
-            return cid
+def column(name: str) -> Dict[str, str]:
+    for role, col in COLUMNS.items():
+        if name.lower() in (role.lower(), col["title"].lower()) or name == col["id"]:
+            return col
     sys.exit(f"unknown column {name!r}; the spec has: {', '.join(COLUMNS)}")
 
 
@@ -91,11 +93,11 @@ def cmd_cards(args: argparse.Namespace) -> None:
     me = agent_user_id()
     cards = []
     for name in args.columns or SCOPE:
-        cid = column_id(name)
-        tasks = api(f"/tasks?columnId={cid}&limit=1000").get("content", [])
+        col = column(name)
+        tasks = api(f"/tasks?columnId={col['id']}&limit=1000").get("content", [])
         for t in tasks:
             if not (t.get("archived") or t.get("deleted")):
-                cards.append(card_facts(t, name, sticker_id, states, me))
+                cards.append(card_facts(t, col["title"], sticker_id, states, me))
     if args.json:
         print(json.dumps(cards, ensure_ascii=False, indent=1))
         return
@@ -109,8 +111,8 @@ def resolve_task(ref: str) -> str:
     if re.fullmatch(r"[0-9a-f-]{36}", ref):
         return ref
     num = re.sub(r"\D", "", ref)
-    for cid in COLUMNS.values():
-        for t in api(f"/tasks?columnId={cid}&limit=1000").get("content", []):
+    for col in COLUMNS.values():
+        for t in api(f"/tasks?columnId={col['id']}&limit=1000").get("content", []):
             if re.sub(r"\D", "", str(t.get("idTaskProject", ""))) == num:
                 return t["id"]
     sys.exit(f"card {ref} not found in the spec's columns")
@@ -131,7 +133,7 @@ def cmd_kick(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(prog="board-agent", description=__doc__,
+    p = argparse.ArgumentParser(prog="kanban-agent", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("cards", help="list cards with the agent's status")

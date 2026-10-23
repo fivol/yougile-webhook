@@ -51,8 +51,8 @@ EVENT_LOG = LOG_DIR / "events.jsonl"
 CLAUDE_LOG = LOG_DIR / "claude.log"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("board-agent")
-log.info("board-agent %s starting from %s", APP_VERSION, ROOT)
+log = logging.getLogger("kanban-agent")
+log.info("kanban-agent %s starting from %s", APP_VERSION, ROOT)
 
 from settings import (  # noqa: E402  (after logging is configured)
     CONFIG, SPEC_DIR, conf,
@@ -538,12 +538,17 @@ AGENT_STICKER_WORKING = conf("sticker.working", "AGENT_STICKER_WORKING", "workin
 AGENT_STICKER_ANSWERED = conf("sticker.answered", "AGENT_STICKER_ANSWERED", "answered").strip()
 AGENT_STICKER_WORKING_COLOR = os.environ.get("AGENT_STICKER_WORKING_COLOR", "#8CC2FF").strip()
 AGENT_STICKER_ANSWERED_COLOR = os.environ.get("AGENT_STICKER_ANSWERED_COLOR", "#79CE69").strip()
-# Final states the agent picks itself, {state name: when to pick it}. They say
+# Final states the agent picks itself: {role: {label, color, when}}. They say
 # whose move it is now; "answered" stays the fallback for a turn that names
 # none. Rendered into every prompt via {statuses}.
 _outcomes_raw = (CONFIG.get("sticker") or {}).get("outcomes") or {}
-AGENT_STICKER_OUTCOMES: Dict[str, str] = {
-    str(k).strip(): " ".join(str(v).split()) for k, v in _outcomes_raw.items()
+AGENT_STICKER_OUTCOMES: Dict[str, Dict[str, str]] = {
+    str(role): {
+        "label": str(o.get("label") or role).strip(),
+        "color": str(o.get("color") or AGENT_STICKER_ANSWERED_COLOR).strip(),
+        "when": " ".join(str(o.get("when") or "").split()),
+    }
+    for role, o in _outcomes_raw.items() if isinstance(o, dict)
 } if isinstance(_outcomes_raw, dict) else {}
 
 # --- Session rotation --------------------------------------------------------
@@ -1126,7 +1131,7 @@ MARKER_ANSWERED = "answered"
 _MARKER_SPECS = {
     MARKER_WORKING: (AGENT_STICKER_WORKING, AGENT_STICKER_WORKING_COLOR),
     MARKER_ANSWERED: (AGENT_STICKER_ANSWERED, AGENT_STICKER_ANSWERED_COLOR),
-    **{label.lower(): (label, AGENT_STICKER_ANSWERED_COLOR) for label in AGENT_STICKER_OUTCOMES},
+    **{o["label"].lower(): (o["label"], o["color"]) for o in AGENT_STICKER_OUTCOMES.values()},
 }
 
 _sticker_lock = threading.Lock()
@@ -1150,12 +1155,28 @@ def _sticker_states(raw: dict) -> Dict[str, str]:
             found[marker] = state_id
         else:
             log.warning(
-                "agent sticker: '%s' has no state named '%s' — YouGile's API can't "
-                "add one, so add it in the UI and restart (or rename it in the "
-                "sticker config to an existing state)",
+                "agent sticker: '%s' has no state named '%s' and creating it "
+                "failed — check the sticker in the YouGile UI",
                 AGENT_STICKER_NAME, label,
             )
     return found
+
+
+def _add_missing_states(raw: dict) -> bool:
+    """Create the states the config names but the sticker lacks. True if any
+    was added, so the caller re-reads the sticker for their ids."""
+    have = {(s.get("name") or "").strip().lower() for s in (raw.get("states") or [])
+            if isinstance(s, dict)}
+    added = False
+    for label, color in _MARKER_SPECS.values():
+        if label.strip().lower() in have:
+            continue
+        ok = _api_post(f"/string-stickers/{raw['id']}/states",
+                       {"name": label, "color": color},
+                       retries=YOUGILE_API_BOOT_RETRIES) is not None
+        log.info("agent sticker: added state '%s' ok=%s", label, ok)
+        added = added or ok
+    return added
 
 
 def agent_sticker() -> Optional[Tuple[str, Dict[str, str]]]:
@@ -1209,6 +1230,8 @@ def agent_sticker() -> Optional[Tuple[str, Dict[str, str]]]:
             )
             if raw is None:
                 return None
+        if _add_missing_states(raw):
+            raw = _api_get(f"/string-stickers/{raw['id']}", retries=YOUGILE_API_BOOT_RETRIES) or raw
         states = _sticker_states(raw)
         if not states:
             return None
@@ -3868,9 +3891,10 @@ def _take_agent_status(chat_id: Optional[str]) -> Optional[str]:
         path.unlink()
     except OSError:
         return None
-    outcomes = {o.lower() for o in AGENT_STICKER_OUTCOMES}
-    if label.lower() in outcomes:
-        return label.lower()
+    # The agent may name the label it was shown or the outcome's role.
+    for role, o in AGENT_STICKER_OUTCOMES.items():
+        if label.lower() in (role.lower(), o["label"].lower()):
+            return o["label"].lower()
     log.warning("chat %s: agent picked unknown status %r — using answered", chat_id, label)
     return None
 
@@ -3879,12 +3903,27 @@ def render_statuses() -> str:
     """The outcome list every turn ends by choosing from; empty without one."""
     if not AGENT_STICKER_OUTCOMES:
         return ""
-    lines = "\n".join(f"  - {k} — {v}" for k, v in AGENT_STICKER_OUTCOMES.items())
+    lines = "\n".join(f"  - {o['label']} — {o['when']}" for o in AGENT_STICKER_OUTCOMES.values())
     return (
         "CARD STATUS — pass `status` to send_task_message: the one state below that "
         "says whose move it is now. It goes on the card's sticker when the turn "
         f"ends; leaving it out shows '{AGENT_STICKER_ANSWERED}'.\n{lines}"
     )
+
+
+_CONFIG_REF = re.compile(r"\{([a-z_]+(?:\.[a-z_]+)+)\}")
+
+
+def render_config_refs(text: str) -> str:
+    """Fill `{dotted.path}` placeholders from the merged config, so a spec's
+    prompts name columns and statuses by role and their titles live in one
+    place. A path that isn't a scalar setting is left as written."""
+    def sub(m: re.Match) -> str:
+        node: Any = CONFIG
+        for part in m.group(1).split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        return str(node) if isinstance(node, (str, int, float)) else m.group(0)
+    return _CONFIG_REF.sub(sub, text)
 
 
 def _mark_turn_finished(chat_id: Optional[str], task_id: Optional[str]) -> None:
@@ -4164,6 +4203,7 @@ def _build_prompt(
     chat_id = extract_chat_id(payload) or ""
     rendered = rendered.replace("{chat_id}", chat_id)
     rendered = rendered.replace("{statuses}", render_statuses())
+    rendered = render_config_refs(rendered)
     # {event_json} used to interpolate the raw webhook event: ~340 tokens of
     # which half was `prevData`, a byte-for-byte copy of `payload`, wrapped
     # around a message that is already the last line of {chat_history}. Kept as
@@ -4996,8 +5036,7 @@ async def healthz():
 
 # ---------------------------------------------------------------- kick
 #
-# Starts a turn on a card nobody @-mentioned: the `board-agent kick` CLI behind
-# the board skill. The turn runs in the card's own session exactly as if the
+# Starts a turn on a card nobody @-mentioned: the `kanban-agent kick` CLI. The turn runs in the card's own session exactly as if the
 # owner had written the instruction in its chat, so a later @Agent there
 # continues with full memory. The receiver is reachable from the internet
 # through the webhook tunnel, so the endpoint wants a token only this machine

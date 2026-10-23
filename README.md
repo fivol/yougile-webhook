@@ -1,8 +1,8 @@
-# board-agent
+# kanban-agent
 
 An agent that lives in YouGile cards. Each card gets its own persistent claude
 session; the agent starts only when it is handed a card — `@Agent` in the
-card's chat, or `board-agent kick` — and ends every turn by saying whose move
+card's chat, or `kanban-agent kick` — and ends every turn by saying whose move
 it is now on the card's sticker.
 
 **Engine and flow are separate.** This checkout is the engine. A team's process
@@ -41,16 +41,21 @@ YouGile ──POST──▶ https://your.domain/yougile/webhook
 
 | File | What |
 |---|---|
-| `config.yaml` | Layered between the engine's `config.yaml` and `config.local.yaml`. Holds `board.columns` (title → id), `board.scope` (columns the CLI looks at by default), `sticker` (name, `working`, `answered`, `outcomes`) and `kick.text`. |
+| `config.yaml` | Layered between the engine's `config.yaml` and `config.local.yaml`. Holds `kanban.columns` (role → `{title, id}`), `kanban.scope` (roles the CLI looks at by default), `sticker` (name, `working`, `answered`, `outcomes`) and `kick.text`. |
 | `rules.toml` | The trigger rules. Prompt paths in it are relative to the spec dir. |
 | `prompts/*.txt` | The prompts the rules name. A file missing here falls back to the engine's `prompts/` (e.g. `formatting.txt`). |
+
+Prompts refer to settings by path — `{kanban.columns.review.title}`,
+`{sticker.outcomes.question.label}` — and the receiver fills them from the
+merged config, so a column title or a status name is written once, in
+`config.yaml`. A placeholder that doesn't resolve to a scalar is left as is.
 
 Without `SPEC_DIR` the engine reads `rules.toml` and `prompts/` from this
 checkout, as before. `/healthz` reports `spec_dir`, `rules_file` and `kick_rule`.
 
 ### Card status — the agent says whose move it is
 
-`sticker.outcomes` maps a sticker state to when to pick it:
+`sticker.outcomes` maps a role to a sticker state and when to pick it:
 
 ```yaml
 sticker:
@@ -58,15 +63,15 @@ sticker:
   working: working        # set by the receiver while a turn runs
   answered: answered      # fallback when the agent names no outcome
   outcomes:
-    done: PR is open and you are sure — the owner only has to merge.
-    question: You need the owner's answer to go on; questions are numbered.
+    done:     {label: done, color: "#2EAD5C", when: PR is open and you are sure — the owner only merges.}
+    question: {label: question, color: "#F5544D", when: You need the owner's answer; questions are numbered.}
 ```
 
 The list is rendered into every prompt (`{statuses}`, or appended when the
 template lacks it). The agent passes `status` to `send_task_message`; the MCP
 server records it in `state/turns/<chatId>.status`, and when the turn ends the
-receiver puts that state on the card instead of `answered`. YouGile's API can't
-add states to a sticker — add each outcome in the UI, then restart.
+receiver puts that state on the card instead of `answered`. A state the sticker
+lacks is created on startup (`POST /string-stickers/{id}/states`).
 
 ### Handing over cards without `@Agent` — `kick` and the CLI
 
@@ -78,11 +83,11 @@ the endpoint wants the `X-Kick-Token` header — the token is generated into
 `state/kick.token` (mode 600) on startup. `kick.rule` picks the rule; by default
 the first enabled `chat_message-created` rule.
 
-`bin/board-agent` (symlink it into your `PATH`) wraps both:
+`bin/kanban-agent` (symlink it into your `PATH`) wraps both:
 
 ```bash
-board-agent cards [COLUMN ...] [--json]   # cards with sticker, handed?, running?, unseen messages
-board-agent kick PRO-2062 2065 [--say TEXT]
+kanban-agent cards [COLUMN ...] [--json]   # cards with sticker, handed?, running?, unseen messages
+kanban-agent kick PRO-2062 2065 [--say TEXT]
 ```
 
 ## Automatic Codex fallback
@@ -154,8 +159,8 @@ Restart the receiver after editing; the next launched turn uses the new values,
 including resumed chats. Existing sessions and context are retained. On macOS:
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/org.local.board-agent.plist
-launchctl load -w ~/Library/LaunchAgents/org.local.board-agent.plist
+launchctl unload ~/Library/LaunchAgents/org.local.kanban-agent.plist
+launchctl load -w ~/Library/LaunchAgents/org.local.kanban-agent.plist
 ```
 
 Check `/healthz` for the loaded `claude_model`, `claude_effort`, `codex_model`,
@@ -209,7 +214,7 @@ that schema needs to be one we control.
 
 ```bash
 git clone <this-repo>
-cd board-agent
+cd kanban-agent
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
@@ -271,21 +276,21 @@ going silently dead:
 
 ### Autostart (macOS launchd)
 
-`~/Library/LaunchAgents/org.local.board-agent.plist`:
+`~/Library/LaunchAgents/org.local.kanban-agent.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>org.local.board-agent</string>
+    <key>Label</key><string>org.local.kanban-agent</string>
     <key>ProgramArguments</key>
-    <array><string>/PATH/TO/board-agent/run.sh</string></array>
-    <key>WorkingDirectory</key><string>/PATH/TO/board-agent</string>
+    <array><string>/PATH/TO/kanban-agent/run.sh</string></array>
+    <key>WorkingDirectory</key><string>/PATH/TO/kanban-agent</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/PATH/TO/board-agent/logs/uvicorn.log</string>
-    <key>StandardErrorPath</key><string>/PATH/TO/board-agent/logs/uvicorn.err</string>
+    <key>StandardOutPath</key><string>/PATH/TO/kanban-agent/logs/uvicorn.log</string>
+    <key>StandardErrorPath</key><string>/PATH/TO/kanban-agent/logs/uvicorn.err</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -305,8 +310,8 @@ macOS the moment it opens a Postgres connection, because libpq's Kerberos
 probe is not fork-safe.
 
 ```bash
-launchctl load -w ~/Library/LaunchAgents/org.local.board-agent.plist
-launchctl list | grep board-agent
+launchctl load -w ~/Library/LaunchAgents/org.local.kanban-agent.plist
+launchctl list | grep kanban-agent
 ```
 
 ## Register the YouGile webhook
@@ -528,7 +533,7 @@ a `config.yaml` home are marked in that file.
 | `ATTACHMENT_MAX_RETRIES` | Retry a transient attachment download (network error, timeout, 5xx) this many times before giving up; a 4xx or over-size file is permanent and not retried. Default `3`. |
 | `AGENT_STATUS_STICKER` | Default `true`. Show the agent's state on the task card via a sticker: `working` while a turn runs, `answered` when it stops (see [The status sticker](#the-status-sticker--is-the-agent-still-working)). `false` leaves task cards alone. |
 | `AGENT_STICKER_NAME` / `AGENT_STICKER_ICON` | The sticker is looked up by name and created on first use if missing. Defaults `Agent` / `pin`. |
-| `AGENT_STICKER_WORKING` / `AGENT_STICKER_ANSWERED` | State names, matched exactly (case-insensitively) against the sticker's states. Defaults `working` / `answered`. YouGile's API can rename a sticker but **cannot edit its states**, so changing these after the sticker exists means adding the state by hand in the UI. |
+| `AGENT_STICKER_WORKING` / `AGENT_STICKER_ANSWERED` | State names, matched exactly (case-insensitively) against the sticker's states. Defaults `working` / `answered`. A state missing from the sticker is added on startup. |
 | `AGENT_STICKER_WORKING_COLOR` / `AGENT_STICKER_ANSWERED_COLOR` | Hex colours, used only when the sticker is created. Defaults `#8CC2FF` / `#79CE69`. |
 | `REPLY_TO_AGENT_IS_MENTION` | Default `true`. Treat a reply to (or forward of) one of the agent's own messages as a mention, so `@Agent` rules fire on it without the text containing the mention. |
 | `AGENT_MENTION` | The mention token your rules match on and that YouGile renders for the agent's account. Default `@Agent`. |
@@ -539,8 +544,8 @@ a `config.yaml` home are marked in that file.
 After editing `.env` or `rules.toml`, reload:
 
 ```bash
-launchctl unload  ~/Library/LaunchAgents/org.local.board-agent.plist
-launchctl load -w ~/Library/LaunchAgents/org.local.board-agent.plist
+launchctl unload  ~/Library/LaunchAgents/org.local.kanban-agent.plist
+launchctl load -w ~/Library/LaunchAgents/org.local.kanban-agent.plist
 ```
 
 ## Sessions and chat history
@@ -763,11 +768,9 @@ touch it on tasks nobody is assigned to. Stickers have no such rule.
 
 **Setup.** The sticker is looked up by `AGENT_STICKER_NAME` and created
 on first use if missing, so there's nothing to do beyond enabling it on
-the boards where you want it visible (one-time, in the YouGile UI). Note
-that YouGile's API can rename a sticker but **cannot edit its states**:
-if you rename `AGENT_STICKER_WORKING` / `_ANSWERED` after the sticker
-exists, add the matching state by hand — the receiver logs exactly which
-one it couldn't find.
+the boards where you want it visible (one-time, in the YouGile UI). States
+the config names but the sticker lacks are added to it on startup; renaming a
+state in the config adds a new one rather than renaming the old.
 
 Details worth knowing:
 

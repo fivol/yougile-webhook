@@ -3,8 +3,8 @@
 Two layers live apart on purpose. The engine (this checkout) ships defaults in
 config.yaml and prompts/. The FLOW SPEC is a separate directory, named by
 SPEC_DIR in .env, that holds one team's process: its rules.toml, prompts and a
-config.yaml with board columns and sticker states. Nothing about a particular
-board is hardcoded in the engine; swapping SPEC_DIR swaps the process.
+config.yaml with kanban columns and sticker states. Nothing about a particular
+kanban is hardcoded in the engine; swapping SPEC_DIR swaps the process.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from typing import Any, Dict
 import yaml
 
 ROOT = Path(__file__).resolve().parent
-log = logging.getLogger("board-agent")
+log = logging.getLogger("kanban-agent")
 
 
 def load_dotenv(path: Path) -> None:
