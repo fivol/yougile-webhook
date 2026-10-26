@@ -530,8 +530,8 @@ ACK_REACTION_EMOJI = os.environ.get("ACK_REACTION_EMOJI", "👍").strip()
 AGENT_STATUS_STICKER = os.environ.get("AGENT_STATUS_STICKER", "true").lower() not in ("0", "false", "no")
 # Looked up by name and created on first use if missing. Enable it on the boards
 # you want it visible on (one-time, in the YouGile UI). State names must match
-# exactly — YouGile's API can rename a sticker but cannot edit its states, so a
-# typo here means adding the state by hand in the UI.
+# exactly: a renamed state is not found and a new one is added beside it.
+# Colors must come from YouGile's sticker palette, or the state renders bare.
 AGENT_STICKER_NAME = conf("sticker.name", "AGENT_STICKER_NAME", "Agent").strip()
 AGENT_STICKER_ICON = conf("sticker.icon", "AGENT_STICKER_ICON", "pin").strip()
 AGENT_STICKER_WORKING = conf("sticker.working", "AGENT_STICKER_WORKING", "working").strip()
