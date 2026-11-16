@@ -328,17 +328,6 @@ def mcp_args() -> List[str]:
 # transcript) before escalating to SIGKILL.
 INTERRUPT_SIGKILL_GRACE_TICKS = int(os.environ.get("INTERRUPT_SIGKILL_GRACE_TICKS", "30"))
 
-# Posted into a task chat when a turn can't start because the global
-# concurrency cap (CLAUDE_MAX_CONCURRENT) is saturated by OTHER chats — so the
-# user gets a clear "try again shortly" instead of a silent drop. Plain text +
-# optional HTML, both overridable via env. Empty text disables the notice.
-CONCURRENCY_BUSY_MESSAGE = os.environ.get(
-    "CONCURRENCY_BUSY_MESSAGE",
-    "I'm at capacity right now — too many tasks are running in parallel. "
-    "Please mention @Agent again in a couple of minutes and I'll pick this up.",
-).strip()
-CONCURRENCY_BUSY_MESSAGE_HTML = os.environ.get("CONCURRENCY_BUSY_MESSAGE_HTML", "").strip() or None
-
 # Prepended to the prompt when this turn is replacing a turn we just
 # interrupted, so the resumed agent treats the newest chat message as a live
 # course-correction rather than a routine follow-up.
@@ -3583,7 +3572,7 @@ def handle_command(cmd: str, arg: str, payload: Any) -> Dict[str, Any]:
         text, html = render_message(
             [msg("command.keep_ok", prefix=COMMAND_REPLY_PREFIX)])
     elif cmd == "stop":
-        stopped = _interrupt_chat(chat_id)
+        stopped = _interrupt_chat(chat_id) or _dequeue_capacity(chat_id)
         text, html = render_message(
             [msg("command.stop_ok" if stopped else "command.stop_idle",
                  prefix=COMMAND_REPLY_PREFIX)])
@@ -3654,6 +3643,8 @@ async def _start_background_tasks() -> None:
     # last one left behind. Off the event loop: it talks to the YouGile API.
     threading.Thread(target=reconcile_open_turns, daemon=True).start()
     threading.Thread(target=_reply_delivery_worker, daemon=True).start()
+    _load_capacity_queue()
+    _kick_capacity_queue()
     kick_token()  # so the CLI finds it before the first kick
 
 
@@ -3668,6 +3659,101 @@ _interrupted_pids: Set[int] = set()
 # chat_id -> (rule, payload) queued to run the instant the current turn dies.
 # Set when we interrupt a busy chat; consumed by _release_chat. Guarded by _active_lock.
 _pending_turns: Dict[str, Tuple[Rule, Any]] = {}
+# chat_id -> (rule, payload, spawn kwargs) waiting for a slot under
+# CLAUDE_MAX_CONCURRENT. Insertion order is the line; a newer message for a chat
+# already waiting replaces its payload but keeps its place. Drained whenever a
+# turn ends (_release_chat). Guarded by _active_lock; mirrored to disk so a
+# receiver restart doesn't drop a request the chat was told is queued.
+_capacity_queue: "OrderedDict[str, Tuple[Rule, Any, Dict[str, Any]]]" = OrderedDict()
+CAPACITY_QUEUE_FILE = STATE_DIR / "capacity_queue.json"
+
+
+def _save_capacity_queue_locked() -> None:
+    """Write the queue to disk. Caller holds _active_lock."""
+    items = [
+        {"chat_id": c, "rule": r.name, "payload": p, "kwargs": kw}
+        for c, (r, p, kw) in _capacity_queue.items()
+    ]
+    try:
+        tmp = CAPACITY_QUEUE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(CAPACITY_QUEUE_FILE)
+    except OSError:
+        log.exception("could not persist capacity queue")
+
+
+def _load_capacity_queue() -> None:
+    try:
+        items = json.loads(CAPACITY_QUEUE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError):
+        log.exception("capacity queue file unreadable — starting empty")
+        return
+    with _active_lock:
+        for it in items:
+            rule = next((r for r in RULES if r.name == it.get("rule")), None)
+            if rule is None or not it.get("chat_id"):
+                continue
+            _capacity_queue[it["chat_id"]] = (rule, it.get("payload"), it.get("kwargs") or {})
+        _save_capacity_queue_locked()
+    if _capacity_queue:
+        log.info("capacity queue: restored %d waiting chat(s)", len(_capacity_queue))
+
+
+def _enqueue_for_capacity_locked(
+    chat_id: str, rule: Rule, payload: Any, kwargs: Dict[str, Any], front: bool,
+) -> Tuple[int, bool]:
+    """Put a chat in line. Returns (1-based position, was it already waiting).
+    Caller holds _active_lock."""
+    already = chat_id in _capacity_queue
+    _capacity_queue[chat_id] = (rule, payload, kwargs)
+    if front:
+        _capacity_queue.move_to_end(chat_id, last=False)
+    _save_capacity_queue_locked()
+    return list(_capacity_queue).index(chat_id) + 1, already
+
+
+def _dequeue_capacity(chat_id: str) -> bool:
+    """Drop a chat from the line (/stop). True if it was waiting."""
+    with _active_lock:
+        if _capacity_queue.pop(chat_id, None) is None:
+            return False
+        _save_capacity_queue_locked()
+    log.info("capacity queue: chat %s removed", chat_id)
+    return True
+
+
+def _drain_capacity_queue() -> None:
+    """Start waiting turns, oldest first, while there are free slots."""
+    while True:
+        with _active_lock:
+            if not _capacity_queue or len(_active_procs) >= CLAUDE_MAX_CONCURRENT:
+                return
+            chat_id, (rule, payload, kwargs) = _capacity_queue.popitem(last=False)
+            _save_capacity_queue_locked()
+        log.info("capacity queue: starting chat %s (%d still waiting)",
+                 chat_id, len(_capacity_queue))
+        try:
+            ok, why = spawn_claude(rule, payload, from_queue=True, **kwargs)
+        except Exception:
+            log.exception("capacity queue: chat %s failed to start", chat_id)
+            continue
+        if why == "queued-capacity":
+            return  # another turn took the slot first; it is back at the front
+        if not ok and why in ("spawn-failed", "exception"):
+            _post_turn_failure(
+                chat_id,
+                msg("turn_failure.not_started", why=why),
+                footer=msg("turn_failure.not_started_footer", mention=AGENT_MENTION),
+            )
+
+
+def _kick_capacity_queue() -> None:
+    # Off the caller's thread: spawning reads chat history over the network, and
+    # _release_chat runs inside spawn_claude's own error paths.
+    if _capacity_queue:
+        threading.Thread(target=_drain_capacity_queue, daemon=True).start()
 
 _chat_locks_mutex = threading.Lock()
 _chat_busy: Dict[str, threading.Lock] = {}
@@ -3741,16 +3827,17 @@ def _interrupt_chat(chat_id: str) -> bool:
     return True
 
 
-def _post_capacity_message(chat_id: Optional[str]) -> None:
-    """Tell the chat we're at the global concurrency cap (fire-and-forget)."""
-    if not (chat_id and CONCURRENCY_BUSY_MESSAGE):
+def _post_queued_message(chat_id: str, position: int) -> None:
+    """Tell the chat its turn waits for a free slot (fire-and-forget)."""
+    text = msg("capacity.queued", position=position, limit=CLAUDE_MAX_CONCURRENT)
+    if not text:
         return
 
     def _send() -> None:
         try:
-            send_chat_message(chat_id, CONCURRENCY_BUSY_MESSAGE, CONCURRENCY_BUSY_MESSAGE_HTML)
+            send_chat_message(chat_id, text, f"<p>{_inline_html(text)}</p>")
         except Exception:
-            log.exception("capacity message send failed chat=%s", chat_id)
+            log.exception("queued message send failed chat=%s", chat_id)
 
     threading.Thread(target=_send, daemon=True).start()
 
@@ -3953,28 +4040,31 @@ def _release_chat(
     Single exit point for every turn (normal completion, spawn failure, or
     exception), so an interrupting instruction recorded in _pending_turns is
     never orphaned. The queued turn starts here — chained off the dying turn —
-    which is why interrupting never blocks the webhook handler.
+    which is why interrupting never blocks the webhook handler. Then whatever
+    slot is left goes to the chats waiting in the capacity queue.
     """
     if chat_lock is not None:
         try:
             chat_lock.release()
         except RuntimeError:
             pass  # already released — finishing twice must not raise
-    if not chat_id:
-        return
-    with _active_lock:
-        pending = _pending_turns.pop(chat_id, None)
-    if pending is None:
-        return
-    p_rule, p_payload = pending
-    ok, why = spawn_claude(p_rule, p_payload, interrupted=True)
-    if ok:
-        return
-    # The queued turn is the reason _mark_turn_finished left the card on
-    # "working". It never started, so nothing else will ever clear it.
-    set_task_marker(task_id, MARKER_ANSWERED)
-    if why == "global-max-concurrent":
-        _post_capacity_message(chat_id)
+    try:
+        if not chat_id:
+            return
+        with _active_lock:
+            pending = _pending_turns.pop(chat_id, None)
+        if pending is None:
+            return
+        # Before the queue on purpose: the interrupting turn replaces this one
+        # 1-for-1, so the slot this turn held is rightfully its.
+        p_rule, p_payload = pending
+        ok, _why = spawn_claude(p_rule, p_payload, interrupted=True)
+        if not ok:
+            # The queued turn is the reason _mark_turn_finished left the card on
+            # "working". It never started, so nothing else will ever clear it.
+            set_task_marker(task_id, MARKER_ANSWERED)
+    finally:
+        _kick_capacity_queue()
 
 
 def finish_turn(
@@ -4556,6 +4646,7 @@ def spawn_claude(
     payload,
     interrupted: bool = False,
     allow_session_recovery: bool = True,
+    from_queue: bool = False,
 ) -> Tuple[bool, str]:
     turn_started_at = datetime.now(timezone.utc).isoformat()
     chat_id = extract_chat_id(payload) if rule.session_per_chat else None
@@ -4624,13 +4715,29 @@ def spawn_claude(
         return False, "chat-already-has-llm-session"
 
     # No per-chat session, or the chat is idle and we now hold its lock. Enforce
-    # the global concurrency cap for genuinely new turns — an interrupt replaces
-    # an existing turn (1-for-1) and never reaches here.
+    # the global concurrency cap for genuinely new turns. A chat turn over the
+    # cap waits in line instead of being dropped; _release_chat starts it.
+    position, already = 0, False
     with _active_lock:
         if len(_active_procs) >= CLAUDE_MAX_CONCURRENT:
             if chat_lock is not None:
                 chat_lock.release()
-            return False, "global-max-concurrent"
+            if not chat_id:
+                return False, "global-max-concurrent"
+            kwargs = {"interrupted": interrupted,
+                      "allow_session_recovery": allow_session_recovery}
+            position, already = _enqueue_for_capacity_locked(
+                chat_id, rule, payload, kwargs, front=from_queue)
+        elif chat_id and _capacity_queue.pop(chat_id, None) is not None:
+            # Got a slot on a fresh message while still listed — run it now,
+            # with the newest payload, and don't start it a second time later.
+            _save_capacity_queue_locked()
+    if position:
+        log.info("rule %s: chat %s queued for capacity at #%d", rule.name, chat_id, position)
+        # One notice per wait: a follow-up while waiting just updates the line.
+        if not (already or from_queue):
+            _post_queued_message(chat_id, position)
+        return True, "queued-capacity"
 
     try:
         provider = select_provider() if chat_id else "claude"
@@ -5009,6 +5116,7 @@ async def healthz():
         "claude_effort": CLAUDE_EFFORT or "(settings.json)",
         "default_workdir": CLAUDE_DEFAULT_WORKDIR,
         "active_claude_procs": len(_active_procs),
+        "capacity_queue": list(_capacity_queue),
         # Armed once known: without it, a reply to the agent can't be told from
         # a reply to a colleague and falls back to needing a literal mention.
         "agent_user_id": agent_user_id(),
@@ -5188,9 +5296,6 @@ async def yougile_webhook(req: Request):
         spawn_reason = why
         if ok:
             fired_rule = rule.name
-        elif why == "global-max-concurrent":
-            # Saturated by OTHER chats — tell the user instead of dropping silently.
-            _post_capacity_message(extract_chat_id(payload))
         elif why in ("spawn-failed", "exception"):
             # The turn never got off the ground (claude binary missing, history
             # fetch blew up, …). The trigger message is already 👍'd, so say so

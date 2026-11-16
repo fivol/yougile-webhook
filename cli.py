@@ -129,7 +129,9 @@ def cmd_kick(args: argparse.Namespace) -> None:
                 out = json.loads(r.read())
         except urllib.error.HTTPError as e:
             out = {"ok": False, "reason": f"http {e.code}: {e.read().decode()[:200]}"}
-        print(f"{ref}: {'started' if out.get('ok') else 'NOT started'} ({out.get('reason')})")
+        state = ("queued" if out.get("reason") == "queued-capacity"
+                 else "started" if out.get("ok") else "NOT started")
+        print(f"{ref}: {state} ({out.get('reason')})")
 
 
 def main() -> None:

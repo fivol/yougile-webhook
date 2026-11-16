@@ -163,6 +163,12 @@ stop_idle = "{prefix} Сейчас по этой задаче ничего не 
 not_allowed = "{prefix} Команда /{command} доступна только тем, кому разрешено обращаться к агенту (COMMAND_ALLOWED_EMAILS или allowed_sender_emails в rules.toml)."
 
 
+# Posted once when a turn waits for a free slot (claude.max_concurrent). Empty =
+# stay silent. Placeholders: {position} in line, {limit} the cap.
+[capacity]
+queued = "Сейчас все слоты агента заняты — поставил задачу в очередь (№{position}). Начну сам, как только один освободится, упоминать ещё раз не нужно."
+
+
 # A turn that died without the agent answering. `reason` is claude's own error
 # line, quoted as-is — it is not translated.
 [turn_failure]
