@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 import uuid
 from unittest.mock import patch
@@ -142,6 +143,22 @@ class CapacityQueueTests(unittest.TestCase):
             app._release_chat(None, None)
             app._release_chat(str(uuid.uuid4()), None)
         self.assertEqual(kick.call_count, 2)
+
+    def test_adopted_turn_holds_a_slot_until_it_exits(self):
+        alive = {"v": True}
+        with patch.object(app, "_pid_alive", side_effect=lambda _p: alive["v"]), \
+                patch.object(app, "TURN_ADOPT_POLL_SECONDS", 0.01), \
+                patch.object(app, "finish_turn"), \
+                patch.object(app, "read_turn", return_value={}), \
+                patch.object(app, "_read_turn_output", return_value=""):
+            app._supervise_adopted({"chat_id": str(uuid.uuid4()), "pid": 4242})
+            self.assertIn(4242, app._active_procs)
+            alive["v"] = False
+            for _ in range(200):
+                if 4242 not in app._active_procs:
+                    break
+                time.sleep(0.01)
+        self.assertNotIn(4242, app._active_procs)
 
 
 if __name__ == "__main__":

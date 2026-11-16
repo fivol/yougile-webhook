@@ -3641,10 +3641,8 @@ async def _start_background_tasks() -> None:
         )
     # Turns outlive this process, so a fresh one starts by finding out what the
     # last one left behind. Off the event loop: it talks to the YouGile API.
-    threading.Thread(target=reconcile_open_turns, daemon=True).start()
+    threading.Thread(target=_reconcile_then_resume_queue, daemon=True).start()
     threading.Thread(target=_reply_delivery_worker, daemon=True).start()
-    _load_capacity_queue()
-    _kick_capacity_queue()
     kick_token()  # so the CLI finds it before the first kick
 
 
@@ -3747,6 +3745,15 @@ def _drain_capacity_queue() -> None:
                 msg("turn_failure.not_started", why=why),
                 footer=msg("turn_failure.not_started_footer", mention=AGENT_MENTION),
             )
+
+
+def _reconcile_then_resume_queue() -> None:
+    # Adopted turns must hold their slots before the queue claims any.
+    try:
+        reconcile_open_turns()
+    finally:
+        _load_capacity_queue()
+        _kick_capacity_queue()
 
 
 def _kick_capacity_queue() -> None:
@@ -4554,12 +4561,17 @@ def _supervise_adopted(rec: Dict[str, Any]) -> None:
     """
     chat_id = rec.get("chat_id")
     pid = rec.get("pid")
+    # Still a running claude, so it holds a slot under CLAUDE_MAX_CONCURRENT;
+    # otherwise every restart would quietly lift the cap.
+    with _active_lock:
+        _active_procs.add(pid)
 
     def _watch() -> None:
         while _pid_alive(pid):
             time.sleep(TURN_ADOPT_POLL_SECONDS)
         log.info("chat %s: adopted turn pid=%s has exited", chat_id, pid)
         with _active_lock:
+            _active_procs.discard(pid)
             was_interrupted = pid in _interrupted_pids
             _interrupted_pids.discard(pid)
         if was_interrupted and chat_id:
