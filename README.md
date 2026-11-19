@@ -92,6 +92,7 @@ kanban-agent kick PRO-2062 2065 [--say TEXT]
 kanban-agent find PRO-2062 "S-02 ·" [--json]   # anywhere on the board: number or words in the title
 kanban-agent move PRO-2062 --to review         # a column role or title from the spec
 kanban-agent say PRO-2062 --html-file - < report.html   # chat post as the API key's user, repaired by chatmd
+kanban-agent show PRO-2062 [--json]            # title, column, description and the whole chat
 ```
 
 ## Automatic Codex fallback
