@@ -5,6 +5,7 @@
   kanban-agent find QUERY ... [--json]       cards anywhere on the board: by number, or words in the title
   kanban-agent move TASK ... --to COLUMN     move cards to a column of the spec
   kanban-agent say TASK (--html H | --html-file F) [--text T]   post to the card's chat
+  kanban-agent show TASK [--json]            the card: title, column, description, whole chat
 
 COLUMN is a role from kanban.columns (bugs) or its title (Bugs). TASK is a card
 number (PRO-2062, 2062) or a task UUID. Columns, the scope and the default kick
@@ -187,6 +188,33 @@ def cmd_say(args: argparse.Namespace) -> None:
           + (f" (repaired: {'; '.join(notes)})" if notes else ""))
 
 
+def cmd_show(args: argparse.Namespace) -> None:
+    import chatmd
+    task_id = resolve_task(args.task)
+    task = api(f"/tasks/{task_id}")
+    titles = {c["id"]: c["title"] for c in board_columns()}
+    users = {u["id"]: u.get("realName") or u.get("email") or u["id"][:8]
+             for u in api("/users?limit=1000").get("content", [])}
+    msgs = api(f"/chats/{task_id}/messages?limit=1000").get("content", [])
+    chat = []
+    for m in sorted((m for m in msgs if not m.get("deleted")), key=lambda m: int(m["id"])):
+        # `text` can be empty when only textHtml was sent; the id is the post time in ms.
+        body = (m.get("text") or "").strip() or chatmd.html_to_text(m.get("textHtml") or "")
+        chat.append({"at": datetime.fromtimestamp(int(m["id"]) / 1000, timezone.utc)
+                     .strftime("%Y-%m-%d %H:%M"),
+                     "from": users.get(m.get("fromUserId"), m.get("fromUserId")),
+                     "text": body})
+    card = {"pro": task.get("idTaskProject"), "id": task_id, "title": task.get("title", ""),
+            "column": titles.get(task.get("columnId"), "?"),
+            "description": chatmd.html_to_text(task.get("description") or ""), "chat": chat}
+    if args.json:
+        print(json.dumps(card, ensure_ascii=False, indent=1))
+        return
+    print(f"{card['pro']} · {card['column']} · {card['title']}\n\n{card['description']}\n")
+    for m in chat:
+        print(f"--- {m['at']} UTC · {m['from']}\n{m['text']}\n")
+
+
 def cmd_kick(args: argparse.Namespace) -> None:
     token = (STATE_DIR / "kick.token").read_text().strip()
     for ref in args.tasks:
@@ -225,9 +253,12 @@ def main() -> None:
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--html", help="raw HTML (<h4>, <p>, <ul><li>, <code>, <a href>)")
     g.add_argument("--html-file", help="file with the raw HTML; - reads stdin")
+    w = sub.add_parser("show", help="print a card with its description and whole chat")
+    w.add_argument("task")
+    w.add_argument("--json", action="store_true")
     args = p.parse_args()
     {"cards": cmd_cards, "kick": cmd_kick, "find": cmd_find, "move": cmd_move,
-     "say": cmd_say}[args.cmd](args)
+     "say": cmd_say, "show": cmd_show}[args.cmd](args)
 
 
 if __name__ == "__main__":
