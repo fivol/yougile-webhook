@@ -173,7 +173,11 @@ def cmd_move(args: argparse.Namespace) -> None:
 
 def cmd_say(args: argparse.Namespace) -> None:
     import chatmd  # the MCP server's repair: raw markup never reaches the reader
-    html_in = Path(args.html_file).read_text(encoding="utf-8") if args.html_file else args.html
+    # "-" reads stdin: the Mac wrapper runs this over ssh, where a local file path means nothing.
+    if args.html_file == "-":
+        html_in = sys.stdin.read()
+    else:
+        html_in = Path(args.html_file).read_text(encoding="utf-8") if args.html_file else args.html
     text, text_html, notes = chatmd.normalize_message(args.text, html_in)
     if not (text or text_html):
         sys.exit("refusing to post an empty message")
@@ -220,7 +224,7 @@ def main() -> None:
     s.add_argument("--text", help="plain-text fallback; built from the HTML when omitted")
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--html", help="raw HTML (<h4>, <p>, <ul><li>, <code>, <a href>)")
-    g.add_argument("--html-file", help="file with the raw HTML")
+    g.add_argument("--html-file", help="file with the raw HTML; - reads stdin")
     args = p.parse_args()
     {"cards": cmd_cards, "kick": cmd_kick, "find": cmd_find, "move": cmd_move,
      "say": cmd_say}[args.cmd](args)
