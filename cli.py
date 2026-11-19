@@ -2,10 +2,14 @@
 
   kanban-agent cards [COLUMN ...] [--json]   cards of the given columns (default: kanban.scope)
   kanban-agent kick TASK ... [--say TEXT]    start a turn on each card, as if @Agent were written there
+  kanban-agent find QUERY ... [--json]       cards anywhere on the board: by number, or words in the title
+  kanban-agent move TASK ... --to COLUMN     move cards to a column of the spec
+  kanban-agent say TASK (--html H | --html-file F) [--text T]   post to the card's chat
 
 COLUMN is a role from kanban.columns (bugs) or its title (Bugs). TASK is a card
 number (PRO-2062, 2062) or a task UUID. Columns, the scope and the default kick
-text come from the flow spec's config.yaml (see settings.py).
+text come from the flow spec's config.yaml (see settings.py). `say` posts as the
+API key's user and runs the message through chatmd like the MCP server does.
 """
 from __future__ import annotations
 
@@ -34,10 +38,33 @@ KICK_TEXT = conf("kick.text", "KICK_TEXT", "Take this card.")
 STICKER_NAME = conf("sticker.name", "AGENT_STICKER_NAME", "Agent")
 
 
-def api(path: str) -> Any:
-    req = urllib.request.Request(API_BASE + path, headers={"Authorization": f"Bearer {API_KEY}"})
+def api(path: str, method: str = "GET", body: Optional[dict] = None) -> Any:
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    data = None
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(API_BASE + path, data=data, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read() or b"null")
+
+
+def board_columns() -> List[Dict[str, Any]]:
+    """Every column of the board the spec's columns live on, not only the spec's own."""
+    first = next(iter(COLUMNS.values()))
+    board = api(f"/columns/{first['id']}")["boardId"]
+    return [c for c in api(f"/columns?boardId={board}&limit=1000").get("content", [])
+            if not c.get("deleted")]
+
+
+def board_tasks() -> List[tuple[Dict[str, Any], str]]:
+    """(task, column title) for every live card on the board."""
+    out = []
+    for col in board_columns():
+        for t in api(f"/tasks?columnId={col['id']}&limit=1000").get("content", []):
+            if not (t.get("archived") or t.get("deleted")):
+                out.append((t, col["title"]))
+    return out
 
 
 def column(name: str) -> Dict[str, str]:
@@ -111,11 +138,49 @@ def resolve_task(ref: str) -> str:
     if re.fullmatch(r"[0-9a-f-]{36}", ref):
         return ref
     num = re.sub(r"\D", "", ref)
-    for col in COLUMNS.values():
-        for t in api(f"/tasks?columnId={col['id']}&limit=1000").get("content", []):
-            if re.sub(r"\D", "", str(t.get("idTaskProject", ""))) == num:
-                return t["id"]
-    sys.exit(f"card {ref} not found in the spec's columns")
+    for t, _ in board_tasks():
+        if re.sub(r"\D", "", str(t.get("idTaskProject", ""))) == num:
+            return t["id"]
+    sys.exit(f"card {ref} not found on the board")
+
+
+def cmd_find(args: argparse.Namespace) -> None:
+    found = []
+    for t, col in board_tasks():
+        pro = str(t.get("idTaskProject", ""))
+        title = t.get("title", "")
+        for q in args.query:
+            num = re.sub(r"\D", "", q) if re.fullmatch(r"(?i)(pro-?)?\d+", q) else ""
+            if (num and re.sub(r"\D", "", pro) == num) or (not num and q.lower() in title.lower()):
+                found.append({"pro": pro, "id": t["id"], "column": col, "title": title})
+                break
+    if args.json:
+        print(json.dumps(found, ensure_ascii=False, indent=1))
+        return
+    for c in found:
+        print(f"{c['pro']:<9} {c['column']:<16} {c['title'][:90]}")
+
+
+def cmd_move(args: argparse.Namespace) -> None:
+    target = column(args.to)
+    titles = {c["id"]: c["title"] for c in board_columns()}
+    for ref in args.tasks:
+        task_id = resolve_task(ref)
+        before = titles.get(api(f"/tasks/{task_id}").get("columnId"), "?")
+        api(f"/tasks/{task_id}", "PUT", {"columnId": target["id"]})
+        print(f"{ref}: {before} -> {target['title']}")
+
+
+def cmd_say(args: argparse.Namespace) -> None:
+    import chatmd  # the MCP server's repair: raw markup never reaches the reader
+    html_in = Path(args.html_file).read_text(encoding="utf-8") if args.html_file else args.html
+    text, text_html, notes = chatmd.normalize_message(args.text, html_in)
+    if not (text or text_html):
+        sys.exit("refusing to post an empty message")
+    res = api(f"/chats/{resolve_task(args.task)}/messages", "POST",
+              {"text": text, "textHtml": text_html or ""})
+    print(f"{args.task}: posted {(res or {}).get('id')}"
+          + (f" (repaired: {'; '.join(notes)})" if notes else ""))
 
 
 def cmd_kick(args: argparse.Namespace) -> None:
@@ -144,8 +209,21 @@ def main() -> None:
     k = sub.add_parser("kick", help="hand cards to the agent")
     k.add_argument("tasks", nargs="+")
     k.add_argument("--say", help="the instruction, instead of kick.text")
+    f = sub.add_parser("find", help="find cards anywhere on the board")
+    f.add_argument("query", nargs="+", help="PRO-2062 / 2062, or words in the title")
+    f.add_argument("--json", action="store_true")
+    m = sub.add_parser("move", help="move cards to a column of the spec")
+    m.add_argument("tasks", nargs="+")
+    m.add_argument("--to", required=True, help="column role (review) or title (On review)")
+    s = sub.add_parser("say", help="post a message to a card's chat")
+    s.add_argument("task")
+    s.add_argument("--text", help="plain-text fallback; built from the HTML when omitted")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--html", help="raw HTML (<h4>, <p>, <ul><li>, <code>, <a href>)")
+    g.add_argument("--html-file", help="file with the raw HTML")
     args = p.parse_args()
-    {"cards": cmd_cards, "kick": cmd_kick}[args.cmd](args)
+    {"cards": cmd_cards, "kick": cmd_kick, "find": cmd_find, "move": cmd_move,
+     "say": cmd_say}[args.cmd](args)
 
 
 if __name__ == "__main__":

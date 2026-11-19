@@ -83,11 +83,15 @@ the endpoint wants the `X-Kick-Token` header — the token is generated into
 `state/kick.token` (mode 600) on startup. `kick.rule` picks the rule; by default
 the first enabled `chat_message-created` rule.
 
-`bin/kanban-agent` (symlink it into your `PATH`) wraps both:
+`bin/kanban-agent` (symlink it into your `PATH`) wraps both, plus the moves a
+terminal session needs to report its own work on a card:
 
 ```bash
 kanban-agent cards [COLUMN ...] [--json]   # cards with sticker, handed?, running?, unseen messages
 kanban-agent kick PRO-2062 2065 [--say TEXT]
+kanban-agent find PRO-2062 "S-02 ·" [--json]   # anywhere on the board: number or words in the title
+kanban-agent move PRO-2062 --to review         # a column role or title from the spec
+kanban-agent say PRO-2062 --html-file report.html   # chat post as the API key's user, repaired by chatmd
 ```
 
 ## Automatic Codex fallback
