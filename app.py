@@ -2014,10 +2014,11 @@ def _download_attachment(url: str, chat_id: Optional[str]) -> Optional[Path]:
         if existing.is_file() and existing.stat().st_size > 0:
             return existing
 
-    headers: Dict[str, str] = {"User-Agent": "yougile-webhook/1.0"}
+    req = urllib.request.Request(url, headers={"User-Agent": "yougile-webhook/1.0"})
     if YOUGILE_API_KEY and "yougile" in (parsed.netloc or ""):
-        headers["Authorization"] = f"Bearer {YOUGILE_API_KEY}"
-    req = urllib.request.Request(url, headers=headers)
+        # Unredirected: /user-data/ 302s to the S3 host user-data.yougile.com,
+        # which answers 400 "Unsupported Authorization Type" to a forwarded Bearer.
+        req.add_unredirected_header("Authorization", f"Bearer {YOUGILE_API_KEY}")
 
     def _cleanup_tmp() -> None:
         try:
