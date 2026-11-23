@@ -2151,11 +2151,61 @@ def download_message_attachments(
     if not ATTACHMENTS_ENABLED:
         return {}
     out: Dict[str, Path] = {}
+    failed: List[str] = []
     for url in _extract_attachment_urls(message):
         path = _download_attachment(url, chat_id)
         if path is not None:
             out[url] = path
+        else:
+            failed.append(url)
+    if chat_id and (failed or out):
+        _note_attachment_outcomes(chat_id, failed, list(out))
     return out
+
+
+# A resumed session only fetches messages past the watermark, so a file that
+# failed once would never be offered again. Failed URLs are kept in the chat
+# state and retried on the chat's next turns, up to this many times.
+ATTACHMENT_RETRY_TURNS = int(os.environ.get("ATTACHMENT_RETRY_TURNS", "5"))
+
+
+def _note_attachment_outcomes(chat_id: str, failed: List[str], ok: List[str]) -> None:
+    pending: Dict[str, int] = dict(get_chat_state(chat_id).get("failed_attachments") or {})
+    changed = False
+    for url in ok:
+        changed |= pending.pop(url, None) is not None
+    for url in failed:
+        if url not in pending:
+            pending[url] = 0
+            changed = True
+    if changed:
+        update_chat_state(chat_id, failed_attachments=pending)
+
+
+def retry_failed_attachments(chat_id: str, pending: Dict[str, int]) -> List[Path]:
+    """Retry attachments that failed on earlier turns (`pending` is the
+    chat state's snapshot from the start of this turn). Returns local paths
+    of the ones that came through; gives up on a URL after
+    ATTACHMENT_RETRY_TURNS tries.
+    """
+    if not (ATTACHMENTS_ENABLED and pending):
+        return []
+    got: List[Path] = []
+    left: Dict[str, int] = dict(get_chat_state(chat_id).get("failed_attachments") or {})
+    for url, tries in pending.items():
+        if url not in left:
+            continue  # already fetched earlier in this turn
+        path = _download_attachment(url, chat_id)
+        if path is not None:
+            got.append(path)
+            left.pop(url)
+        elif tries + 1 >= ATTACHMENT_RETRY_TURNS:
+            log.warning("attachment retry giving up chat=%s url=%s", chat_id, url)
+            left.pop(url)
+        else:
+            left[url] = tries + 1
+    update_chat_state(chat_id, failed_attachments=left)
+    return got
 
 
 # ---------------------------------------------------------------- chat history
@@ -4893,8 +4943,10 @@ def spawn_claude(
         # early to be in the history fetch above.
         trigger_message = payload.get("payload") if isinstance(payload, dict) else None
         trigger_urls = download_message_attachments(trigger_message, chat_id)
+        retried = (retry_failed_attachments(
+            chat_id, chat_state.get("failed_attachments") or {}) if chat_id else [])
         seen_paths = {str(p) for p in attachment_paths}
-        for p in trigger_urls.values():
+        for p in [*trigger_urls.values(), *retried]:
             if str(p) not in seen_paths:
                 seen_paths.add(str(p))
                 attachment_paths.append(p)
