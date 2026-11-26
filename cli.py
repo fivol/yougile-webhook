@@ -6,6 +6,8 @@
   kanban-agent move TASK ... --to COLUMN     move cards to a column of the spec
   kanban-agent say TASK (--html H | --html-file F) [--text T]   post to the card's chat
   kanban-agent show TASK [--json]            the card: title, column, description, whole chat
+  kanban-agent status TASK ... STATE         set the «Agent» sticker: working, answered, an outcome
+                                             role (done, question, …) or its label; clear removes it
 
 COLUMN is a role from kanban.columns (bugs) or its title (Bugs). TASK is a card
 number (PRO-2062, 2062) or a task UUID. Columns, the scope and the default kick
@@ -37,6 +39,12 @@ COLUMNS: Dict[str, Dict[str, str]] = conf("kanban.columns", "KANBAN_COLUMNS", {}
 SCOPE: List[str] = conf("kanban.scope", "KANBAN_SCOPE", list(COLUMNS), list)
 KICK_TEXT = conf("kick.text", "KICK_TEXT", "Take this card.")
 STICKER_NAME = conf("sticker.name", "AGENT_STICKER_NAME", "Agent")
+# role -> state label, the same names the receiver drives and the agent picks from.
+STICKER_LABELS: Dict[str, str] = {
+    "working": conf("sticker.working", "AGENT_STICKER_WORKING", "working"),
+    "answered": conf("sticker.answered", "AGENT_STICKER_ANSWERED", "answered"),
+    **{role: o["label"] for role, o in (conf("sticker.outcomes", "", {}, dict) or {}).items()},
+}
 
 
 def api(path: str, method: str = "GET", body: Optional[dict] = None) -> Any:
@@ -215,6 +223,26 @@ def cmd_show(args: argparse.Namespace) -> None:
         print(f"--- {m['at']} UTC · {m['from']}\n{m['text']}\n")
 
 
+def cmd_status(args: argparse.Namespace) -> None:
+    sticker_id, states = sticker()
+    if not sticker_id:
+        sys.exit(f"no sticker {STICKER_NAME!r} in the workspace")
+    want = args.state.strip().lower()
+    if want in ("clear", "-"):
+        state_id, label = "-", "—"   # YouGile's "no value" sentinel
+    else:
+        label = STICKER_LABELS.get(want, want)
+        state_id = next((i for i, n in states.items() if n.strip().lower() == label.lower()), None)
+        if not state_id:
+            sys.exit(f"unknown state {args.state!r}; the sticker has: {', '.join(states.values())}"
+                     f" (roles: {', '.join(STICKER_LABELS)})")
+    for ref in args.tasks:
+        task_id = resolve_task(ref)
+        before = states.get((api(f"/tasks/{task_id}").get("stickers") or {}).get(sticker_id), "—")
+        api(f"/tasks/{task_id}", "PUT", {"stickers": {sticker_id: state_id}})
+        print(f"{ref}: {before} -> {states.get(state_id, label)}")
+
+
 def cmd_kick(args: argparse.Namespace) -> None:
     token = (STATE_DIR / "kick.token").read_text().strip()
     for ref in args.tasks:
@@ -256,9 +284,12 @@ def main() -> None:
     w = sub.add_parser("show", help="print a card with its description and whole chat")
     w.add_argument("task")
     w.add_argument("--json", action="store_true")
+    t = sub.add_parser("status", help="set the agent's status sticker on cards")
+    t.add_argument("tasks", nargs="+")
+    t.add_argument("state", help="working, answered, an outcome role or label, or clear")
     args = p.parse_args()
     {"cards": cmd_cards, "kick": cmd_kick, "find": cmd_find, "move": cmd_move,
-     "say": cmd_say, "show": cmd_show}[args.cmd](args)
+     "say": cmd_say, "show": cmd_show, "status": cmd_status}[args.cmd](args)
 
 
 if __name__ == "__main__":
